@@ -2,3 +2,31 @@
 __pycache__/
 *.pyc
 *.wsdl
+
+# Claude / AI context
+CLAUDE*.md
+.claude/
+.task/
+
+# Temp files
+*.tmp.*
+
+# OS junk
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE
+.idea/
+*.iml
+.vscode/
+
+# Secrets
+.env
+
+# Python
+.pytest_cache/
+.coverage
+dist/
+build/
+*.egg-info/
