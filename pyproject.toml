@@ -1,0 +1,59 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "PyIncucyteGUI"
+version = "0.1.0"
+description = "Python CLI and Tkinter GUI for downloading Incucyte live-cell imaging TIFFs."
+readme = "README.md"
+license = "BSD-3-Clause"
+license-files = ["LICENSE"]
+requires-python = ">=3.10"
+authors = [
+    { name = "Jamie Malcolm" }
+]
+keywords = [
+    "incucyte",
+    "PyIncucyteGUI",
+    "microscopy",
+    "live-cell imaging",
+    "imagej",
+    "tiff",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Environment :: Win32 (MS Windows)",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Image Processing",
+]
+dependencies = [
+    "requests>=2.31",
+    "urllib3>=2.0",
+    "pythonnet>=3.0",
+    "Pillow>=10.0",
+    "numpy>=1.24",
+    "tifffile>=2023.7.10",
+    "zeep>=4.2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "build>=1.2",
+    "twine>=5.0",
+]
+
+[project.scripts]
+py-incucyte = "incucyte_downloader:main"
+py-incucyte-gui = "incucyte_gui:main"
+py_incucyte_gui = "incucyte_gui:main"
+incucyte-downloader = "incucyte_downloader:main"
+
+[tool.setuptools]
+py-modules = ["incucyte_downloader", "incucyte_gui"]
+packages = ["py_incucyte_gui"]

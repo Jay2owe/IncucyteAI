@@ -24,7 +24,7 @@ Usage:
     python incucyte_downloader.py watch -v 38 -o ./images -i 10
 
 Requirements:
-    pip install requests pythonnet Pillow
+    pip install requests pythonnet Pillow numpy tifffile
 """
 
 import argparse
@@ -45,15 +45,40 @@ API_BASE_TEMPLATE = "https://{host}/IncucyteWSs"
 
 # State/config files
 SCRIPT_DIR = Path(__file__).parent
-STATE_FILE = SCRIPT_DIR / ".tmp" / "download_state.json"
-CONFIG_FILE = SCRIPT_DIR / ".tmp" / "incucyte_config.json"
+LEGACY_APP_DIR = SCRIPT_DIR / ".tmp"
+
+
+def default_app_dir():
+    """Return the per-user folder for saved tokens, GUI state, and download state."""
+    env_dir = os.environ.get("PYINCUCYTEGUI_HOME")
+    if env_dir:
+        return Path(env_dir).expanduser()
+
+    legacy_files = ("incucyte_config.json", "download_state.json", "gui_state.json")
+    if any((LEGACY_APP_DIR / name).exists() for name in legacy_files):
+        return LEGACY_APP_DIR
+
+    if os.name == "nt":
+        base = Path(os.environ.get("APPDATA", Path.home() / "AppData" / "Roaming"))
+        return base / "PyIncucyteGUI"
+
+    base = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+    return base / "pyincucytegui"
+
+
+APP_DIR = default_app_dir()
+STATE_FILE = APP_DIR / "download_state.json"
+CONFIG_FILE = APP_DIR / "incucyte_config.json"
 
 # Suppress SSL warnings (Incucyte uses self-signed cert)
 import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 
-IMAGE_TYPE_MAP = {"phase": 1, "color1": 2, "color2": 3}
+IMAGE_TYPE_MAP = {"phase": 1, "color1": 2, "green": 2, "color2": 3, "red": 3}
+IMAGE_TYPE_LABELS = {1: "Phase", 2: "Green", 3: "Red"}
+IMAGE_TYPE_SHORT_LABELS = {1: "phase", 2: "green", 3: "red"}
+CHANNEL_HELP = "phase, green/color1, red/color2, all"
 
 
 def parse_wells(spec):
@@ -100,7 +125,8 @@ def parse_wells(spec):
 def parse_channels(spec):
     """Parse a channel specification string into a set of image type ints.
 
-    Supports: "phase", "color1", "color2", "phase,color1", "all" or None.
+    Supports: "phase", "green"/"color1", "red"/"color2",
+    comma-separated combinations, "all", or None.
     Returns a set of ints, or None for "all".
     """
     if spec is None or spec.strip().lower() == "all":
@@ -109,7 +135,7 @@ def parse_channels(spec):
     for name in spec.split(","):
         name = name.strip().lower()
         if name not in IMAGE_TYPE_MAP:
-            raise ValueError(f"Unknown channel '{name}'. Use: phase, color1, color2, all")
+            raise ValueError(f"Unknown channel '{name}'. Use: {CHANNEL_HELP}")
         channels.add(IMAGE_TYPE_MAP[name])
     return channels
 
@@ -124,7 +150,7 @@ def parse_filter_arg(filter_str):
 
 
 def ensure_tmp():
-    (SCRIPT_DIR / ".tmp").mkdir(exist_ok=True)
+    APP_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def load_state():
@@ -211,6 +237,115 @@ def unpack_values(obj):
     elif isinstance(obj, list):
         return [unpack_values(v) for v in obj]
     return obj
+
+
+def channel_name_from_channels(channels, img_type):
+    """Return an Incucyte channel display name from vessel channel metadata."""
+    if img_type == 1:
+        return "Phase"
+
+    color_key = {2: "Color1", 3: "Color2"}.get(img_type)
+    default = IMAGE_TYPE_LABELS.get(img_type, f"ImageType{img_type}")
+    if not color_key or not isinstance(channels, dict):
+        return default
+
+    colors = channels.get("Colors", {})
+    candidates = [
+        channels.get(f"{color_key}Name"),
+        colors.get(f"{color_key}Name") if isinstance(colors, dict) else None,
+    ]
+    for container in (colors, channels):
+        if isinstance(container, dict):
+            state = container.get(color_key, {})
+            if isinstance(state, dict):
+                candidates.extend([
+                    state.get("ColorName"),
+                    state.get("Name"),
+                    state.get("DisplayName"),
+                ])
+
+    for value in candidates:
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return default
+
+
+def vessel_id_from_record(vessel):
+    """Return a numeric vessel id from Incucyte vessel/search-vessel records."""
+    if not isinstance(vessel, dict):
+        return None
+    for key in ("VesselID", "VesselId", "vesselId", "ID", "Id", "id"):
+        value = vessel.get(key)
+        if value is None:
+            continue
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            continue
+    nested = vessel.get("Vessel")
+    if isinstance(nested, dict) and nested is not vessel:
+        return vessel_id_from_record(nested)
+    return None
+
+
+def _looks_like_search_vessel(record):
+    """Return True when a dict is an Incucyte search-vessel record."""
+    if not isinstance(record, dict) or vessel_id_from_record(record) is None:
+        return False
+    vessel_keys = (
+        "VesselTypeID", "VesselTypeName", "VesselDocumentation",
+        "FirstScanDateTime", "LastScanDateTime", "HasBeenScanned",
+        "ScanTypeDisplayText", "Channels",
+    )
+    return any(key in record for key in vessel_keys)
+
+
+def _valid_search_vessel_list(candidate):
+    """Normalize a possible vessel collection and return only real vessel records."""
+    values = unpack_values(candidate)
+    if not isinstance(values, list):
+        return []
+    return [item for item in values if _looks_like_search_vessel(item)]
+
+
+def extract_search_vessels(response):
+    """Extract real Incucyte search-vessel records from API response variants."""
+    data = response.get("Data", response) if isinstance(response, dict) else response
+
+    direct_candidates = [data]
+    if isinstance(data, dict):
+        for key in ("SearchVessels", "Vessels", "Items", "Results"):
+            if key in data:
+                direct_candidates.append(data[key])
+
+        unpacked_data = unpack_values(data)
+        direct_candidates.append(unpacked_data)
+        if isinstance(unpacked_data, dict):
+            for key in ("SearchVessels", "Vessels", "Items", "Results"):
+                if key in unpacked_data:
+                    direct_candidates.append(unpacked_data[key])
+
+    best = []
+    for candidate in direct_candidates:
+        vessels = _valid_search_vessel_list(candidate)
+        if len(vessels) > len(best):
+            best = vessels
+
+    def walk(obj):
+        nonlocal best
+        vessels = _valid_search_vessel_list(obj)
+        if len(vessels) > len(best):
+            best = vessels
+        if isinstance(obj, dict):
+            for value in obj.values():
+                walk(value)
+        elif isinstance(obj, list):
+            for value in obj:
+                walk(value)
+
+    if not best:
+        walk(data)
+    return best
 
 
 def authenticate(args):
@@ -324,22 +459,22 @@ def cmd_vessels(args):
 
     print("\n=== Vessels ===\n")
     data = api_post(host, token, "Vessels/GetAllSearchVessels")
-    vessels = unpack_values(data.get("Data", {}))
-    if not isinstance(vessels, list):
-        vessels = []
+    vessels = extract_search_vessels(data)
 
     if not vessels:
         print("  No vessels found.")
         return
 
     for v in vessels:
-        vid = v.get("VesselID", "?")
+        vid = vessel_id_from_record(v)
+        if vid is None:
+            continue
         vtype = v.get("VesselTypeName", "?")
         channels = v.get("Channels", {})
         phase = "Ph" if channels.get("Phase", {}).get("On") else ""
         colors = channels.get("Colors", {})
-        c1 = "C1" if colors.get("Color1", {}).get("On") else ""
-        c2 = "C2" if colors.get("Color2", {}).get("On") else ""
+        c1 = channel_name_from_channels(channels, 2) if colors.get("Color1", {}).get("On") else ""
+        c2 = channel_name_from_channels(channels, 3) if colors.get("Color2", {}).get("On") else ""
         ch_str = "+".join(filter(None, [phase, c1, c2]))
         print(f"  ID={vid:3d}  Type={vtype:25s}  Channels={ch_str}")
 
@@ -426,16 +561,33 @@ def cmd_download(args):
 
     wells = parse_wells(getattr(args, "wells", None))
     channels = parse_channels(getattr(args, "channels", None))
+    hyperstack = getattr(args, "hyperstack", False)
+    time_stack = getattr(args, "time_stack", False)
 
     well_desc = args.wells if args.wells else "all"
     print(f"\n=== Downloading vessel {vessel_id} ({well_desc}) from {len(scans)} scans ===\n")
+    if time_stack:
+        mode = "ImageJ time+channel hyperstack" if hyperstack else "ImageJ time stack"
+    else:
+        mode = "ImageJ hyperstack" if hyperstack else "separate TIFFs"
+    print(f"Output mode: {mode}\n")
+
+    if time_stack:
+        state = load_state()
+        download_time_stacks(host, token, vessel_id, scans, output,
+                             state=state, wells=wells, channels=channels,
+                             reference_time=reference_time,
+                             max_workers=getattr(args, "max_workers", 2),
+                             channel_hyperstack=hyperstack)
+        return
 
     for scan_time in scans:
         download_scan_images(host, token, vessel_id, scan_time, output,
                              wells=wells, channels=channels,
                              reference_time=reference_time,
                              max_workers=getattr(args, "max_workers", 4),
-                             green_phase=getattr(args, "green_phase", True))
+                             green_phase=getattr(args, "green_phase", False),
+                             hyperstack=hyperstack)
 
 
 def parse_scan_datetime(scan_time):
@@ -488,7 +640,8 @@ def find_first_scan_time(host, token, max_days_back=90):
     return earliest
 
 
-def collect_scans_in_range(host, token, start_date, end_date=None):
+def collect_scans_in_range(host, token, start_date, end_date=None,
+                           progress_callback=None, stop_event=None):
     """Fetch all scan times from start_date through end_date (inclusive).
 
     Args:
@@ -502,7 +655,14 @@ def collect_scans_in_range(host, token, start_date, end_date=None):
     scans = []
     d = start_date
     one_day = __import__("datetime").timedelta(days=1)
+    total_days = (end_date - start_date).days + 1
+    done = 0
     while d <= end_date:
+        if stop_event and stop_event.is_set():
+            break
+        done += 1
+        if progress_callback:
+            progress_callback(d, done, total_days)
         try:
             data = api_post(host, token, "Scans/AllScanTimes", {
                 "Year": d.year, "Month": d.month, "Day": d.day,
@@ -531,6 +691,47 @@ def apply_green_lut(tif_bytes):
     return out.getvalue()
 
 
+def image_type_sort_key(img_type):
+    """Return the channel order used in ImageJ hyperstacks."""
+    return {1: 0, 2: 1, 3: 2}.get(img_type, img_type)
+
+
+def image_type_label(img_type):
+    """Return a readable channel label for ImageJ metadata and filenames."""
+    return IMAGE_TYPE_LABELS.get(img_type, f"ImageType{img_type}")
+
+
+def channel_tag(img_types):
+    """Return a compact, stable filename tag for a set/list of image types."""
+    names = [
+        IMAGE_TYPE_SHORT_LABELS.get(img_type, f"type{img_type}")
+        for img_type in sorted(img_types, key=image_type_sort_key)
+    ]
+    return "-".join(names)
+
+
+def well_site_name(row, col, site=0):
+    """Return a well name, adding a site suffix only for multi-site scans."""
+    name = f"{chr(65 + row)}{col + 1}"
+    if site:
+        name = f"{name}_s{site + 1}"
+    return name
+
+
+def is_missing_scan_vessel_error(error):
+    """Return True when a global scan exists but does not contain this vessel."""
+    msg = str(error)
+    return (
+        "ScanNotFoundException" in msg
+        or "Did not look for scan" in msg
+        or (
+            "Vessel ID='" in msg
+            and "existing scan" in msg
+            and "was not found" in msg
+        )
+    )
+
+
 def collect_scan_images(host, token, vessel_id, scan_time, output_dir,
                         state=None, wells=None, channels=None,
                         reference_time=None):
@@ -546,7 +747,7 @@ def collect_scan_images(host, token, vessel_id, scan_time, output_dir,
             "IncludeDiagnosticMetrics": False,
         })
     except RuntimeError as e:
-        if "ScanNotFoundException" in str(e) or "Did not look for scan" in str(e):
+        if is_missing_scan_vessel_error(e):
             return []
         raise
 
@@ -598,9 +799,320 @@ def collect_scan_images(host, token, vessel_id, scan_time, output_dir,
     return to_download
 
 
-def _download_single_image(host, token, item, state, state_lock, green_phase=True,
-                           max_retries=3):
-    """Download a single image with retry. Returns (fname, size) on success, None on failure."""
+def collect_scan_hyperstacks(host, token, vessel_id, scan_time, output_dir,
+                             state=None, wells=None, channels=None,
+                             reference_time=None):
+    """Collect ImageJ hyperstacks to create for a scan.
+
+    A hyperstack item groups all selected channel payloads for one
+    vessel/well/site/scan time into a single output TIFF.
+    """
+    try:
+        sv_data = api_post(host, token, "Vessels/GetScanVessel", {
+            "VesselID": vessel_id,
+            "DateTime": scan_time,
+            "IncludeDiagnosticMetrics": False,
+        })
+    except RuntimeError as e:
+        if is_missing_scan_vessel_error(e):
+            return []
+        raise
+
+    sv = unpack_values(sv_data.get("Data", {}))
+    images = sv.get("ImageInfos", [])
+    if not isinstance(images, list):
+        images = []
+
+    grouped = {}
+    for img in images:
+        swell = img.get("Swell", {})
+        swell_site = img.get("SwellSite", {})
+        img_type = img.get("ImageType", 1)
+        row = swell.get("RowZeroBased", 0)
+        col = swell.get("ColumnZeroBased", 0)
+        site = swell_site.get("ValueZeroBased", 0)
+
+        if wells is not None and (row, col) not in wells:
+            continue
+        if channels is not None and img_type not in channels:
+            continue
+
+        key = (row, col, site)
+        grouped.setdefault(key, {})[img_type] = {
+            "row": row, "col": col, "site": site, "img_type": img_type,
+            "vessel_id": vessel_id, "scan_time": scan_time,
+        }
+
+    scan_dt_obj = parse_scan_datetime(scan_time)
+    elapsed = format_elapsed(scan_dt_obj - reference_time) if reference_time else None
+
+    to_download = []
+    for (row, col, site), by_type in grouped.items():
+        selected_types = set(channels) if channels is not None else set(by_type)
+        if not selected_types:
+            continue
+        if not selected_types.issubset(by_type):
+            continue
+
+        ordered_types = sorted(selected_types, key=image_type_sort_key)
+        ch_tag = channel_tag(ordered_types)
+        well_letter = chr(65 + row)
+        well_name = f"{well_letter}{col + 1}"
+        if elapsed:
+            fname = f"VID{vessel_id}_{well_name}_{ch_tag}_{elapsed}.tif"
+        else:
+            scan_dt = scan_time.replace(":", "").replace("-", "").split("+")[0].split("T")
+            scan_tag = f"{scan_dt[0]}_{scan_dt[1]}" if len(scan_dt) == 2 else scan_time
+            fname = f"VID{vessel_id}_{well_name}_{ch_tag}_{scan_tag}.tif"
+        fpath = output_dir / fname
+
+        if fpath.exists():
+            continue
+
+        state_key = f"hyperstack_{vessel_id}_{scan_time}_{row}_{col}_{site}_{ch_tag}"
+        if state and state_key in state.get("downloaded", {}):
+            continue
+
+        to_download.append({
+            "fname": fname, "fpath": fpath, "state_key": state_key,
+            "row": row, "col": col, "site": site, "vessel_id": vessel_id,
+            "scan_time": scan_time,
+            "channels": [by_type[img_type] for img_type in ordered_types],
+            "channel_types": ordered_types,
+        })
+
+    return to_download
+
+
+def collect_time_stacks(host, token, vessel_id, scan_times, output_dir,
+                        state=None, wells=None, channels=None,
+                        reference_time=None, channel_hyperstack=False,
+                        progress_callback=None, stop_event=None, max_workers=1):
+    """Collect time stacks to create across multiple scan times.
+
+    When channel_hyperstack is False, returns one stack per well/site/channel.
+    When True, returns one ImageJ C+T hyperstack per well/site.
+    """
+    scan_times = sorted(scan_times, key=parse_scan_datetime)
+    grouped = {}
+
+    total_scans = len(scan_times)
+    completed_scans = 0
+
+    def fetch_images(scan_time):
+        if stop_event and stop_event.is_set():
+            return scan_time, []
+        try:
+            sv_data = api_post(host, token, "Vessels/GetScanVessel", {
+                "VesselID": vessel_id,
+                "DateTime": scan_time,
+                "IncludeDiagnosticMetrics": False,
+            })
+        except RuntimeError as e:
+            if is_missing_scan_vessel_error(e):
+                return scan_time, []
+            raise
+
+        sv = unpack_values(sv_data.get("Data", {}))
+        images = sv.get("ImageInfos", [])
+        if not isinstance(images, list):
+            images = []
+        return scan_time, images
+
+    def add_images(scan_time, images):
+        for img in images:
+            swell = img.get("Swell", {})
+            swell_site = img.get("SwellSite", {})
+            img_type = img.get("ImageType", 1)
+            row = swell.get("RowZeroBased", 0)
+            col = swell.get("ColumnZeroBased", 0)
+            site = swell_site.get("ValueZeroBased", 0)
+
+            if wells is not None and (row, col) not in wells:
+                continue
+            if channels is not None and img_type not in channels:
+                continue
+
+            key = (row, col, site)
+            grouped.setdefault(key, {}).setdefault(scan_time, {})[img_type] = {
+                "row": row, "col": col, "site": site, "img_type": img_type,
+                "vessel_id": vessel_id, "scan_time": scan_time,
+            }
+
+    if total_scans:
+        try:
+            workers = int(max_workers or 1)
+        except (TypeError, ValueError):
+            workers = 1
+        workers = max(1, min(workers, total_scans))
+    else:
+        workers = 1
+
+    if workers == 1:
+        for scan_time in scan_times:
+            if stop_event and stop_event.is_set():
+                break
+            scan_time, images = fetch_images(scan_time)
+            completed_scans += 1
+            if progress_callback:
+                progress_callback(vessel_id, scan_time, completed_scans, total_scans)
+            add_images(scan_time, images)
+    else:
+        executor = ThreadPoolExecutor(max_workers=workers)
+        try:
+            futures = {executor.submit(fetch_images, scan_time): scan_time
+                       for scan_time in scan_times}
+            for future in as_completed(futures):
+                if stop_event and stop_event.is_set():
+                    for pending in futures:
+                        pending.cancel()
+                    break
+                scan_time, images = future.result()
+                completed_scans += 1
+                if progress_callback:
+                    progress_callback(vessel_id, scan_time, completed_scans, total_scans)
+                add_images(scan_time, images)
+        finally:
+            executor.shutdown(wait=True, cancel_futures=True)
+
+    to_download = []
+    downloaded_state = state.get("downloaded", {}) if state else {}
+
+    for (row, col, site), by_time in grouped.items():
+        available_types = set()
+        for by_type in by_time.values():
+            available_types.update(by_type)
+        selected_types = sorted(
+            set(channels) if channels is not None else available_types,
+            key=image_type_sort_key,
+        )
+        if not selected_types:
+            continue
+
+        well_name = well_site_name(row, col, site)
+        if channel_hyperstack:
+            frames = []
+            for scan_time in scan_times:
+                by_type = by_time.get(scan_time, {})
+                if all(img_type in by_type for img_type in selected_types):
+                    frames.append({
+                        "scan_time": scan_time,
+                        "channels": [by_type[img_type] for img_type in selected_types],
+                    })
+            if not frames:
+                continue
+
+            ch_tag = channel_tag(selected_types)
+            fname = f"VID{vessel_id}_{well_name}_{ch_tag}_timestack.tif"
+            state_key = f"timestack_hyper_{vessel_id}_{row}_{col}_{site}_{ch_tag}"
+            labels = [image_type_label(img_type) for img_type in selected_types]
+            frame_times = [frame["scan_time"] for frame in frames]
+            fpath = output_dir / fname
+            state_info = downloaded_state.get(state_key, {})
+            if fpath.exists() and state_info.get("scan_times") == frame_times:
+                continue
+            to_download.append({
+                "fname": fname, "fpath": fpath, "state_key": state_key,
+                "row": row, "col": col, "site": site, "vessel_id": vessel_id,
+                "frames": frames, "scan_times": frame_times, "labels": labels,
+                "channel_hyperstack": True,
+            })
+            continue
+
+        for img_type in selected_types:
+            frames = []
+            for scan_time in scan_times:
+                by_type = by_time.get(scan_time, {})
+                if img_type in by_type:
+                    frames.append(by_type[img_type])
+            if not frames:
+                continue
+
+            ch_tag = IMAGE_TYPE_SHORT_LABELS.get(img_type, f"type{img_type}")
+            fname = f"VID{vessel_id}_{well_name}_{ch_tag}_timestack.tif"
+            state_key = f"timestack_{vessel_id}_{row}_{col}_{site}_{ch_tag}"
+            frame_times = [frame["scan_time"] for frame in frames]
+            fpath = output_dir / fname
+            state_info = downloaded_state.get(state_key, {})
+            if fpath.exists() and state_info.get("scan_times") == frame_times:
+                continue
+            to_download.append({
+                "fname": fname, "fpath": fpath, "state_key": state_key,
+                "row": row, "col": col, "site": site, "vessel_id": vessel_id,
+                "frames": frames, "scan_times": frame_times,
+                "labels": [image_type_label(img_type)],
+                "channel_hyperstack": False,
+            })
+
+    return to_download
+
+
+def collect_scan_items_parallel(host, token, vessel_id, scan_times, output_dir,
+                                state=None, wells=None, channels=None,
+                                reference_time=None, hyperstack=False,
+                                max_workers=4, progress_callback=None,
+                                stop_event=None):
+    """Collect per-scan image or hyperstack download items using parallel scan checks."""
+    scan_times = sorted(scan_times, key=parse_scan_datetime)
+    total_scans = len(scan_times)
+    if not total_scans:
+        return []
+
+    try:
+        workers = int(max_workers or 1)
+    except (TypeError, ValueError):
+        workers = 1
+    workers = max(1, min(workers, total_scans))
+
+    collector = collect_scan_hyperstacks if hyperstack else collect_scan_images
+
+    def collect_one(scan_time):
+        if stop_event and stop_event.is_set():
+            return scan_time, []
+        items = collector(
+            host, token, vessel_id, scan_time, output_dir,
+            state=state, wells=wells, channels=channels,
+            reference_time=reference_time)
+        return scan_time, items
+
+    completed = 0
+    results = {}
+
+    if workers == 1:
+        for scan_time in scan_times:
+            if stop_event and stop_event.is_set():
+                break
+            scan_time, items = collect_one(scan_time)
+            completed += 1
+            if progress_callback:
+                progress_callback(vessel_id, scan_time, completed, total_scans)
+            results[scan_time] = items
+    else:
+        executor = ThreadPoolExecutor(max_workers=workers)
+        try:
+            futures = {executor.submit(collect_one, scan_time): scan_time
+                       for scan_time in scan_times}
+            for future in as_completed(futures):
+                if stop_event and stop_event.is_set():
+                    for pending in futures:
+                        pending.cancel()
+                    break
+                scan_time, items = future.result()
+                completed += 1
+                if progress_callback:
+                    progress_callback(vessel_id, scan_time, completed, total_scans)
+                results[scan_time] = items
+        finally:
+            executor.shutdown(wait=True, cancel_futures=True)
+
+    to_download = []
+    for scan_time in scan_times:
+        to_download.extend(results.get(scan_time, []))
+    return to_download
+
+
+def _fetch_scan_vessel_image_bytes(host, token, item, max_retries=3):
+    """Fetch one image payload from the REST API and return raw TIFF bytes."""
     last_error = None
     for attempt in range(max_retries):
         try:
@@ -626,6 +1138,16 @@ def _download_single_image(host, token, item, state, state_lock, green_phase=Tru
     if not img_bytes:
         return None, f"SKIP {item['fname']}: no image data in response"
 
+    return img_bytes, None
+
+
+def _download_single_image(host, token, item, state, state_lock, green_phase=False,
+                           max_retries=3):
+    """Download a single image with retry. Returns (fname, size) on success, None on failure."""
+    img_bytes, error = _fetch_scan_vessel_image_bytes(host, token, item, max_retries)
+    if error:
+        return None, error
+
     # Apply green LUT for Phase images (ImageType == 1)
     if green_phase and item["img_type"] == 1:
         try:
@@ -647,11 +1169,246 @@ def _download_single_image(host, token, item, state, state_lock, green_phase=Tru
     return item["fname"], len(img_bytes)
 
 
+def _tiff_bytes_to_array(tif_bytes):
+    """Read the first TIFF plane from Incucyte payload bytes as a NumPy array."""
+    from PIL import Image
+    import numpy as np
+
+    img = Image.open(io.BytesIO(tif_bytes))
+    arr = np.array(img)
+    if arr.ndim == 3:
+        arr = arr[..., 0]
+    return arr
+
+
+def _common_hyperstack_dtype(arrays):
+    """Choose a stack dtype that preserves all selected channel values."""
+    import numpy as np
+
+    if any(np.issubdtype(arr.dtype, np.floating) for arr in arrays):
+        return np.float32
+    if any(np.issubdtype(arr.dtype, np.signedinteger) for arr in arrays):
+        return np.int32 if any(arr.dtype.itemsize > 2 for arr in arrays) else np.int16
+    return np.uint16 if any(arr.dtype.itemsize > 1 for arr in arrays) else np.uint8
+
+
+def write_imagej_hyperstack(path, channel_arrays, labels):
+    """Write channel arrays as an ImageJ-compatible CYX TIFF hyperstack."""
+    import numpy as np
+    import tifffile
+
+    if not channel_arrays:
+        raise ValueError("No channel arrays provided")
+
+    shape = channel_arrays[0].shape
+    if any(arr.shape != shape for arr in channel_arrays):
+        shapes = ", ".join(str(arr.shape) for arr in channel_arrays)
+        raise ValueError(f"Channel dimensions do not match: {shapes}")
+
+    dtype = _common_hyperstack_dtype(channel_arrays)
+    stack = np.stack([arr.astype(dtype, copy=False) for arr in channel_arrays], axis=0)
+    metadata = {
+        "axes": "CYX",
+        "mode": "grayscale",
+        "Labels": labels,
+    }
+    tifffile.imwrite(str(path), stack, imagej=True, metadata=metadata,
+                     photometric="minisblack")
+
+
+def write_imagej_time_stack(path, frame_arrays):
+    """Write one channel over time as an ImageJ TYX TIFF stack."""
+    import numpy as np
+    import tifffile
+
+    if not frame_arrays:
+        raise ValueError("No time frames provided")
+
+    shape = frame_arrays[0].shape
+    if any(arr.shape != shape for arr in frame_arrays):
+        shapes = ", ".join(str(arr.shape) for arr in frame_arrays)
+        raise ValueError(f"Frame dimensions do not match: {shapes}")
+
+    dtype = _common_hyperstack_dtype(frame_arrays)
+    stack = np.stack([arr.astype(dtype, copy=False) for arr in frame_arrays], axis=0)
+    metadata = {
+        "axes": "TYX",
+        "mode": "grayscale",
+    }
+    tifffile.imwrite(str(path), stack, imagej=True, metadata=metadata,
+                     photometric="minisblack")
+
+
+def write_imagej_time_hyperstack(path, timepoint_channel_arrays, labels):
+    """Write selected channels over time as an ImageJ TCYX TIFF hyperstack."""
+    import numpy as np
+    import tifffile
+
+    if not timepoint_channel_arrays:
+        raise ValueError("No time frames provided")
+    if not timepoint_channel_arrays[0]:
+        raise ValueError("No channel arrays provided")
+
+    n_channels = len(timepoint_channel_arrays[0])
+    if any(len(channels) != n_channels for channels in timepoint_channel_arrays):
+        raise ValueError("Time points do not all contain the same number of channels")
+
+    all_arrays = [arr for channels in timepoint_channel_arrays for arr in channels]
+    shape = all_arrays[0].shape
+    if any(arr.shape != shape for arr in all_arrays):
+        shapes = ", ".join(str(arr.shape) for arr in all_arrays)
+        raise ValueError(f"Frame dimensions do not match: {shapes}")
+
+    dtype = _common_hyperstack_dtype(all_arrays)
+    stack = np.stack([
+        np.stack([arr.astype(dtype, copy=False) for arr in channels], axis=0)
+        for channels in timepoint_channel_arrays
+    ], axis=0)
+    metadata = {
+        "axes": "TCYX",
+        "mode": "grayscale",
+        "Labels": labels,
+    }
+    tifffile.imwrite(str(path), stack, imagej=True, metadata=metadata,
+                     photometric="minisblack")
+
+
+def _download_hyperstack(host, token, item, state, state_lock, max_retries=3):
+    """Download selected channels and write a single ImageJ hyperstack TIFF."""
+    arrays = []
+    labels = []
+    for channel_item in item["channels"]:
+        channel_item = dict(channel_item)
+        channel_item["fname"] = f"{item['fname']}:{image_type_label(channel_item['img_type'])}"
+        img_bytes, error = _fetch_scan_vessel_image_bytes(host, token, channel_item, max_retries)
+        if error:
+            return None, error.replace(channel_item["fname"], item["fname"], 1)
+        try:
+            arrays.append(_tiff_bytes_to_array(img_bytes))
+            labels.append(image_type_label(channel_item["img_type"]))
+        except Exception as e:
+            return None, f"SKIP {item['fname']}: could not read channel TIFF ({e})"
+
+    try:
+        write_imagej_hyperstack(item["fpath"], arrays, labels)
+    except ImportError as e:
+        return None, f"SKIP {item['fname']}: missing dependency ({e}); install tifffile"
+    except Exception as e:
+        _cleanup_partial_file(item["fpath"])
+        return None, f"SKIP {item['fname']}: could not write hyperstack ({e})"
+
+    size = item["fpath"].stat().st_size
+    if state is not None:
+        with state_lock:
+            state.setdefault("downloaded", {})[item["state_key"]] = {
+                "file": str(item["fpath"]),
+                "time": datetime.now().isoformat(),
+                "size": size,
+                "hyperstack": True,
+                "channels": labels,
+            }
+            save_state(state)
+
+    return item["fname"], size
+
+
+def _cleanup_partial_file(path):
+    try:
+        if path.exists():
+            path.unlink()
+    except OSError:
+        pass
+
+
+def count_time_stack_payloads(items):
+    """Count source image payloads needed for collected time stack items."""
+    total = 0
+    for item in items:
+        if item.get("channel_hyperstack"):
+            total += sum(len(frame["channels"]) for frame in item["frames"])
+        else:
+            total += len(item["frames"])
+    return total
+
+
+def _download_time_stack(host, token, item, state, state_lock, max_retries=3,
+                         unit_progress_callback=None):
+    """Download all frames for one time stack output file."""
+    if item.get("channel_hyperstack"):
+        timepoint_arrays = []
+        for frame in item["frames"]:
+            channel_arrays = []
+            for channel_item in frame["channels"]:
+                channel_item = dict(channel_item)
+                channel_item["fname"] = (
+                    f"{item['fname']}:{frame['scan_time']}:"
+                    f"{image_type_label(channel_item['img_type'])}"
+                )
+                img_bytes, error = _fetch_scan_vessel_image_bytes(
+                    host, token, channel_item, max_retries)
+                if error:
+                    return None, error.replace(channel_item["fname"], item["fname"], 1)
+                if unit_progress_callback:
+                    unit_progress_callback(channel_item["fname"], len(img_bytes))
+                try:
+                    channel_arrays.append(_tiff_bytes_to_array(img_bytes))
+                except Exception as e:
+                    return None, f"SKIP {item['fname']}: could not read channel TIFF ({e})"
+            timepoint_arrays.append(channel_arrays)
+
+        try:
+            write_imagej_time_hyperstack(item["fpath"], timepoint_arrays, item["labels"])
+        except ImportError as e:
+            return None, f"SKIP {item['fname']}: missing dependency ({e}); install tifffile"
+        except Exception as e:
+            _cleanup_partial_file(item["fpath"])
+            return None, f"SKIP {item['fname']}: could not write time hyperstack ({e})"
+    else:
+        frame_arrays = []
+        for frame_item in item["frames"]:
+            frame_item = dict(frame_item)
+            frame_item["fname"] = f"{item['fname']}:{frame_item['scan_time']}"
+            img_bytes, error = _fetch_scan_vessel_image_bytes(
+                host, token, frame_item, max_retries)
+            if error:
+                return None, error.replace(frame_item["fname"], item["fname"], 1)
+            if unit_progress_callback:
+                unit_progress_callback(frame_item["fname"], len(img_bytes))
+            try:
+                frame_arrays.append(_tiff_bytes_to_array(img_bytes))
+            except Exception as e:
+                return None, f"SKIP {item['fname']}: could not read frame TIFF ({e})"
+
+        try:
+            write_imagej_time_stack(item["fpath"], frame_arrays)
+        except ImportError as e:
+            return None, f"SKIP {item['fname']}: missing dependency ({e}); install tifffile"
+        except Exception as e:
+            _cleanup_partial_file(item["fpath"])
+            return None, f"SKIP {item['fname']}: could not write time stack ({e})"
+
+    size = item["fpath"].stat().st_size
+    if state is not None:
+        with state_lock:
+            state.setdefault("downloaded", {})[item["state_key"]] = {
+                "file": str(item["fpath"]),
+                "time": datetime.now().isoformat(),
+                "size": size,
+                "time_stack": True,
+                "channel_hyperstack": bool(item.get("channel_hyperstack")),
+                "channels": item["labels"],
+                "scan_times": item["scan_times"],
+            }
+            save_state(state)
+
+    return item["fname"], size
+
+
 def download_scan_images(host, token, vessel_id, scan_time, output_dir,
                          state=None, wells=None, channels=None,
                          reference_time=None, max_workers=4,
-                         green_phase=True, progress_callback=None,
-                         stop_event=None):
+                         green_phase=False, progress_callback=None,
+                         stop_event=None, hyperstack=False):
     """Download images for a vessel at a given scan time.
 
     Args:
@@ -660,13 +1417,15 @@ def download_scan_images(host, token, vessel_id, scan_time, output_dir,
         reference_time: datetime for elapsed time calculation (experiment start).
         max_workers: number of parallel download threads (default 4).
         green_phase: if True, apply green LUT to Phase (ImageType 1) images.
+        hyperstack: if True, save selected channels as one ImageJ TIFF per well/site/time.
         progress_callback: callable(fname, size, downloaded_count, total_count)
                           called after each successful download.
         stop_event: threading.Event — if set, abort remaining downloads.
     """
-    to_download = collect_scan_images(host, token, vessel_id, scan_time,
-                                      output_dir, state, wells, channels,
-                                      reference_time)
+    collector = collect_scan_hyperstacks if hyperstack else collect_scan_images
+    to_download = collector(host, token, vessel_id, scan_time,
+                            output_dir, state, wells, channels,
+                            reference_time)
     if not to_download:
         return 0
 
@@ -678,6 +1437,8 @@ def download_scan_images(host, token, vessel_id, scan_time, output_dir,
     def do_one(item):
         if stop_event and stop_event.is_set():
             return None, None
+        if hyperstack:
+            return _download_hyperstack(host, token, item, state, state_lock)
         return _download_single_image(host, token, item, state, state_lock, green_phase)
 
     workers = min(max_workers, total)
@@ -689,6 +1450,121 @@ def download_scan_images(host, token, vessel_id, scan_time, output_dir,
             fname, result = future.result()
             if fname is None:
                 if result:  # error message
+                    with print_lock:
+                        print(f"  {result}")
+            else:
+                downloaded += 1
+                with print_lock:
+                    print(f"  {fname} ({result:,} bytes)")
+                if progress_callback:
+                    progress_callback(fname, result, downloaded, total)
+
+    return downloaded
+
+
+def download_collected_scan_items(host, token, to_download, state=None,
+                                  max_workers=4, green_phase=False,
+                                  progress_callback=None, stop_event=None,
+                                  hyperstack=False):
+    """Download already-collected scan image or hyperstack items."""
+    if not to_download:
+        return 0
+
+    state_lock = threading.Lock()
+    downloaded = 0
+    total = len(to_download)
+    print_lock = threading.Lock()
+
+    def do_one(item):
+        if stop_event and stop_event.is_set():
+            return None, None
+        if hyperstack or "channels" in item:
+            return _download_hyperstack(host, token, item, state, state_lock)
+        return _download_single_image(host, token, item, state, state_lock, green_phase)
+
+    workers = min(max_workers, total)
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {executor.submit(do_one, item): item for item in to_download}
+        for future in as_completed(futures):
+            if stop_event and stop_event.is_set():
+                break
+            fname, result = future.result()
+            if fname is None:
+                if result:
+                    with print_lock:
+                        print(f"  {result}")
+            else:
+                downloaded += 1
+                with print_lock:
+                    print(f"  {fname} ({result:,} bytes)")
+                if progress_callback:
+                    progress_callback(fname, result, downloaded, total)
+
+    return downloaded
+
+
+def download_time_stacks(host, token, vessel_id, scan_times, output_dir,
+                         state=None, wells=None, channels=None,
+                         reference_time=None, max_workers=2,
+                         progress_callback=None, stop_event=None,
+                         channel_hyperstack=False,
+                         collection_callback=None,
+                         unit_progress_callback=None):
+    """Download selected scans as one or more ImageJ time stacks."""
+    to_download = collect_time_stacks(
+        host, token, vessel_id, scan_times, output_dir,
+        state=state, wells=wells, channels=channels,
+        reference_time=reference_time, channel_hyperstack=channel_hyperstack,
+        progress_callback=collection_callback, stop_event=stop_event,
+        max_workers=max_workers)
+    return download_collected_time_stack_items(
+        host, token, to_download, state=state, max_workers=max_workers,
+        progress_callback=progress_callback, stop_event=stop_event,
+        unit_progress_callback=unit_progress_callback)
+
+
+def download_collected_time_stack_items(host, token, to_download,
+                                        state=None, max_workers=2,
+                                        progress_callback=None,
+                                        stop_event=None,
+                                        unit_progress_callback=None):
+    """Download already-collected time stack items."""
+    if not to_download:
+        return 0
+
+    state_lock = threading.Lock()
+    unit_lock = threading.Lock()
+    downloaded = 0
+    total = len(to_download)
+    total_units = count_time_stack_payloads(to_download)
+    completed_units = 0
+    print_lock = threading.Lock()
+
+    def emit_unit_progress(label, size):
+        nonlocal completed_units
+        if not unit_progress_callback:
+            return
+        with unit_lock:
+            completed_units += 1
+            done = completed_units
+        unit_progress_callback(label, size, done, total_units)
+
+    def do_one(item):
+        if stop_event and stop_event.is_set():
+            return None, None
+        return _download_time_stack(
+            host, token, item, state, state_lock,
+            unit_progress_callback=emit_unit_progress)
+
+    workers = min(max_workers, total)
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {executor.submit(do_one, item): item for item in to_download}
+        for future in as_completed(futures):
+            if stop_event and stop_event.is_set():
+                break
+            fname, result = future.result()
+            if fname is None:
+                if result:
                     with print_lock:
                         print(f"  {result}")
             else:
@@ -779,12 +1655,19 @@ def cmd_watch(args):
 
     print(f"\n=== Watch Mode ===")
     print(f"  Host: {host}")
+    time_stack = getattr(args, "time_stack", False)
+    hyperstack = getattr(args, "hyperstack", False)
     for t in targets:
         well_desc = "all" if t["wells"] is None else f"{len(t['wells'])} wells"
         ch_desc = "all" if t["channels"] is None else ",".join(
-            k for k, v in IMAGE_TYPE_MAP.items() if v in t["channels"])
+            IMAGE_TYPE_SHORT_LABELS[v] for v in sorted(t["channels"], key=image_type_sort_key))
         print(f"  Vessel {t['vessel_id']}: {well_desc}, channels={ch_desc}")
     print(f"  Output: {output}")
+    if time_stack:
+        mode = "ImageJ time+channel hyperstack" if hyperstack else "ImageJ time stack"
+    else:
+        mode = "ImageJ hyperstack" if hyperstack else "separate TIFFs"
+    print(f"  Output mode: {mode}")
     print(f"  Polling every {args.interval} minutes")
     print(f"  Press Ctrl+C to stop\n")
 
@@ -823,21 +1706,33 @@ def cmd_watch(args):
                 print("  No scans found.")
             else:
                 new_count = 0
-                for scan_time in scans:
+                if time_stack:
                     for t in targets:
-                        n = download_scan_images(
-                            host, token, t["vessel_id"], scan_time, output,
+                        n = download_time_stacks(
+                            host, token, t["vessel_id"], scans, output,
                             state, wells=t["wells"], channels=t["channels"],
                             reference_time=reference_time,
-                            max_workers=getattr(args, "max_workers", 4),
-                            green_phase=getattr(args, "green_phase", True))
+                            max_workers=getattr(args, "max_workers", 2),
+                            channel_hyperstack=hyperstack)
                         if n:
                             new_count += n
+                else:
+                    for scan_time in scans:
+                        for t in targets:
+                            n = download_scan_images(
+                                host, token, t["vessel_id"], scan_time, output,
+                                state, wells=t["wells"], channels=t["channels"],
+                                reference_time=reference_time,
+                                max_workers=getattr(args, "max_workers", 4),
+                                green_phase=getattr(args, "green_phase", False),
+                                hyperstack=hyperstack)
+                            if n:
+                                new_count += n
 
                 if new_count:
-                    print(f"  Downloaded {new_count} new images")
+                    print(f"  Downloaded {new_count} new files")
                 else:
-                    print(f"  No new images ({len(scans)} scans checked)")
+                    print(f"  No new files ({len(scans)} scans checked)")
 
         except KeyboardInterrupt:
             print("\nStopped.")
@@ -898,17 +1793,28 @@ def main():
                        help="Start date: 'first' for first scan, or YYYY-MM-DD (downloads all scans from this date to today)")
     p_dl.add_argument("--scan-time", "-t", help="Filter to specific scan time")
     p_dl.add_argument("--wells", "-w", help="Well filter (e.g. A1, A1,B3, A1-D4, all)")
-    p_dl.add_argument("--channels", help="Channel filter (phase, color1, color2, all)")
+    p_dl.add_argument("--channels", "-c", help=f"Channel filter ({CHANNEL_HELP})")
+    p_dl.add_argument("--hyperstack", action="store_true",
+                       help="Save selected channels as one ImageJ hyperstack TIFF per well/site/time")
+    p_dl.add_argument("--time-stack", action="store_true",
+                       help="Save individual wells as ImageJ time stacks across selected scans")
     p_dl.add_argument("--workers", type=int, default=4, dest="max_workers",
                        help="Parallel download threads (default: 4)")
+    p_dl.add_argument("--green-lut", action="store_true", dest="green_phase",
+                       help="Apply green LUT to Phase images")
     p_dl.add_argument("--no-green-lut", action="store_false", dest="green_phase",
-                       help="Disable green LUT for Phase images")
+                       help="Keep Phase images as returned by the API (default)")
+    p_dl.set_defaults(green_phase=False)
 
     # watch
     p_watch = sub.add_parser("watch", help="Poll and auto-download new images")
     p_watch.add_argument("--vessel", "-v", type=int, help="Vessel ID")
     p_watch.add_argument("--wells", "-w", help="Well filter (e.g. A1, A1,B3, A1-D4, all)")
-    p_watch.add_argument("--channels", help="Channel filter (phase, color1, color2, all)")
+    p_watch.add_argument("--channels", "-c", help=f"Channel filter ({CHANNEL_HELP})")
+    p_watch.add_argument("--hyperstack", action="store_true",
+                         help="Save selected channels as one ImageJ hyperstack TIFF per well/site/time")
+    p_watch.add_argument("--time-stack", action="store_true",
+                         help="Save individual wells as ImageJ time stacks across selected scans")
     p_watch.add_argument("--filter", "-f", action="append",
                          help="Vessel:wells filter (e.g. 38:A1,B3 or 39:D1-D4). Repeatable.")
     p_watch.add_argument("--config", help="JSON config file with vessel/well filters")
@@ -917,8 +1823,11 @@ def main():
                          help="Poll interval in minutes (default: 10)")
     p_watch.add_argument("--workers", type=int, default=4, dest="max_workers",
                          help="Parallel download threads (default: 4)")
+    p_watch.add_argument("--green-lut", action="store_true", dest="green_phase",
+                         help="Apply green LUT to Phase images")
     p_watch.add_argument("--no-green-lut", action="store_false", dest="green_phase",
-                         help="Disable green LUT for Phase images")
+                         help="Keep Phase images as returned by the API (default)")
+    p_watch.set_defaults(green_phase=False)
     p_watch.add_argument("--start-from", "-s", dest="start_from",
                          help="Start date: 'first' for first scan, or YYYY-MM-DD (default: today)")
 
