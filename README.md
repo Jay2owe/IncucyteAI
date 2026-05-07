@@ -13,8 +13,10 @@ Automatically download TIF images from the Incucyte live-cell imaging system via
 From PyPI:
 
 ```bash
-pip install PyIncucyteGUI
+pip install py-incucyte-gui
 ```
+
+The human-facing project name is PyIncucyteGUI. The PyPI distribution and command-line launch name are both `py-incucyte-gui`.
 
 From this source checkout:
 
