@@ -795,7 +795,8 @@ class IncucyteClient:
                     state=state_dict, wells=selection, channels=channel_set,
                     reference_time=reference, channel_hyperstack=hyperstack,
                     progress_callback=on_item, stop_event=cancel,
-                    max_workers=options.workers, recipe=recipe)
+                    max_workers=options.workers, recipe=recipe,
+                    append=options.append_stacks)
             else:
                 items += engine.collect_scan_items_parallel(
                     self.host, token, vessel.id, vessel_scans, output_dir,

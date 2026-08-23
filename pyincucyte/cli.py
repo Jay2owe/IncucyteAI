@@ -169,6 +169,8 @@ def options_from_args(args, *, require_output=True):
         changes["state_scope"] = args.state_scope
     if getattr(args, "no_manifest", False):
         changes["write_manifest"] = False
+    if getattr(args, "no_append", False):
+        changes["append_stacks"] = False
     if getattr(args, "cache_payloads", None):
         changes["cache_payloads"] = args.cache_payloads
     if getattr(args, "host", None):
@@ -762,6 +764,9 @@ def add_selection_args(parser, *, watch=False):
     parser.add_argument("--state-scope",
                         choices=["auto", "folder", "global", "none"],
                         help="Where the resume ledger lives (default: auto)")
+    parser.add_argument("--no-append", action="store_true",
+                        help="rewrite every time stack whole, instead of adding "
+                             "new frames to the file already on disk")
     parser.add_argument("--no-manifest", action="store_true",
                         help="Do not write pyincucyte-manifest.json")
     parser.add_argument("--cache", dest="cache_payloads",

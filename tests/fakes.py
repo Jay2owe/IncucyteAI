@@ -73,7 +73,7 @@ class FakeDevice:
     def __init__(self, vessels=None, scans=None, wells=((0, 0), (0, 1)),
                  channels=(1, 2), missing_scans=(), calibration=None,
                  unmixes=None, pixels=None, activity="Idle", drawer="Closed",
-                 user_id=7, next_scan=None, refuse=None):
+                 user_id=7, next_scan=None, refuse=None, pixel_for=None):
         self.vessels = list(vessels or [vessel_record()])
         self.scans = list(scans or ["2026-03-01T09:00:00", "2026-03-01T12:00:00"])
         self.wells = list(wells)
@@ -85,6 +85,9 @@ class FakeDevice:
         self.unmixes = list(unmixes or [])
         #: channel number -> the value every pixel of that channel holds.
         self.pixels = dict(pixels or {})
+        #: optional (img_type, scan_time) -> pixel value, so the frames of one
+        #: time stack can be told apart by looking at them.
+        self.pixel_for = pixel_for
         #: what the instrument says it is doing, by DeviceActivityTypeCode name.
         self.activity = activity
         self.drawer = drawer
@@ -189,7 +192,11 @@ class FakeDevice:
     def fetch_image(self, host, token, item, max_retries=3):
         self.fetches.append(item.get("fname"))
         img_type = item.get("img_type", 1)
-        return tiff_bytes(value=self.pixels.get(img_type, img_type)), None
+        if self.pixel_for is not None:
+            value = self.pixel_for(img_type, item.get("scan_time"))
+        else:
+            value = self.pixels.get(img_type, img_type)
+        return tiff_bytes(value=value), None
 
 
 @contextmanager

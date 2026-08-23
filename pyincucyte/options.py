@@ -213,6 +213,10 @@ class ExportOptions:
     wells_by_vessel: dict = field(default_factory=dict)
     state_scope: str = "auto"
     cache_payloads: str = "auto"
+    # A time stack has to hold every frame, so a new scan invalidates the file.
+    # Adding the new frames in place beats rewriting gigabytes to gain one;
+    # turn this off to go back to writing every stack whole.
+    append_stacks: bool = True
     write_manifest: bool = True
     name: str = ""
     notes: str = ""
@@ -531,6 +535,7 @@ class ExportOptions:
             "batch_after": self.batch_after,
             "state_scope": self.state_scope,
             "cache_payloads": self.cache_payloads,
+            "append_stacks": self.append_stacks,
             "write_manifest": self.write_manifest,
         }
 
@@ -621,6 +626,8 @@ class ExportOptions:
             args.append("--no-manifest")
         if self.cache_payloads != "auto":
             args += ["--cache", self.cache_payloads]
+        if not self.append_stacks:
+            args.append("--no-append")
         return args
 
     def cli_command(self, command="download"):

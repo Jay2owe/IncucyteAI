@@ -39,6 +39,7 @@ from .errors import (  # noqa: E402
     EncryptionUnavailableError,
     ExportCancelled,
     ExportError,
+    StackNotExtendable,
     IncucyteError,
     NotLoggedInError,
     TokenExpiredError,
@@ -123,6 +124,7 @@ __all__ = [
     "VesselNotFoundError",
     "ExportError",
     "ExportCancelled",
+    "StackNotExtendable",
     "ConfirmationRequiredError",
     "DeviceBusyError",
 ]

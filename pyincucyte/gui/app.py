@@ -540,6 +540,16 @@ class App:
             "pixel values, so leave it off for anything you will analyse.",
             self.theme)
 
+        self.append_var = tk.BooleanVar(value=True)
+        self.append_check = ttk.Checkbutton(
+            toggles, text="Extend stacks", variable=self.append_var)
+        self.append_check.pack(side="left", padx=(0, theme_mod.PAD_M))
+        tip(self.append_check,
+            "A time stack has to hold every frame, so a new scan would normally "
+            "mean rewriting the whole file. This adds the new frames to the end "
+            "of the file already on disk instead. Turn it off to write every "
+            "stack whole.", self.theme)
+
         self.manifest_var = tk.BooleanVar(value=True)
         manifest_check = ttk.Checkbutton(
             toggles, text="Write manifest", variable=self.manifest_var)
@@ -1069,10 +1079,15 @@ class App:
         self.plate.set_selection(available)
 
     def _on_layout_change(self):
-        stacked = self.layout_var.get() != "separate"
+        layout = self.layout_var.get()
+        stacked = layout != "separate"
         if stacked:
             self.green_lut_var.set(False)
         self.green_lut_check.configure(state="disabled" if stacked else "normal")
+        # Only a time stack is ever rewritten to gain a frame; the per-scan
+        # layouts write one file per moment and simply skip the ones they have.
+        self.append_check.configure(
+            state="normal" if "time" in layout else "disabled")
         self._refresh_summary()
 
     def _on_window_change(self):
@@ -1223,6 +1238,7 @@ class App:
             batch_after=self.batch_after_var.get().strip(),
             host=self.host_var.get().strip() or DEFAULT_HOST,
             write_manifest=bool(self.manifest_var.get()),
+            append_stacks=bool(self.append_var.get()),
         )
 
     def _apply_options(self, options):
@@ -1243,6 +1259,7 @@ class App:
         self.unmix_var.set(options.unmix or PROCESSING_OFF)
         self.background_var.set(options.background or PROCESSING_OFF)
         self.manifest_var.set(options.write_manifest)
+        self.append_var.set(options.append_stacks)
 
         self._set_choice(self.start_var, self.custom_date_var,
                          START_VALUES, options.start_from)

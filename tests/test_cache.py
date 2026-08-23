@@ -110,23 +110,35 @@ class WatchEconomyTests(unittest.TestCase):
             self.client.download(self.options())
             first_pass = len(self.device.fetches)
 
-            # A third scan lands; the stacks must be rebuilt to include it.
+            # A third scan lands.  Each stack is extended in place, so the two
+            # frames already in the file are not read from anywhere at all.
             self.device.scans.append("2026-03-02T09:00:00")
             self.device.fetches.clear()
             second = self.client.download(self.options())
 
         self.assertEqual(first_pass, 4)          # 2 wells x 2 scan times
-        self.assertEqual(second.file_count, 2)   # both stacks rewritten
-        # Only the two genuinely new frames crossed the network.
+        self.assertEqual(second.file_count, 2)   # both stacks grew
         self.assertEqual(len(self.device.fetches), 2)
-        self.assertEqual(second.cache.hits, 4)
+        self.assertEqual(second.cache.hits, 0)
 
-    def test_without_the_cache_every_frame_is_fetched_again(self):
+    def test_the_cache_carries_a_stack_that_has_to_be_rewritten(self):
+        """With appending off, the cache is what stops the re-download."""
         with patched(self.device):
-            self.client.download(self.options(cache_payloads="never"))
+            self.client.download(self.options(append_stacks=False))
             self.device.scans.append("2026-03-02T09:00:00")
             self.device.fetches.clear()
-            self.client.download(self.options(cache_payloads="never"))
+            second = self.client.download(self.options(append_stacks=False))
+        self.assertEqual(len(self.device.fetches), 2)
+        self.assertEqual(second.cache.hits, 4)   # the old frames, off disk
+
+    def test_without_either_every_frame_is_fetched_again(self):
+        with patched(self.device):
+            self.client.download(self.options(cache_payloads="never",
+                                              append_stacks=False))
+            self.device.scans.append("2026-03-02T09:00:00")
+            self.device.fetches.clear()
+            self.client.download(self.options(cache_payloads="never",
+                                              append_stacks=False))
         self.assertEqual(len(self.device.fetches), 6)   # all of them, again
 
     def test_cached_bytes_produce_the_same_stack(self):

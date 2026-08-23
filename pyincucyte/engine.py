@@ -25,7 +25,8 @@ from pathlib import Path
 
 from .errors import (
     ApiError, AuthenticationError, DeviceUnreachableError,
-    EncryptionUnavailableError, NotLoggedInError, TokenExpiredError,
+    EncryptionUnavailableError, ExportError, NotLoggedInError,
+    StackNotExtendable, TokenExpiredError,
 )
 
 # Incucyte device defaults
@@ -875,11 +876,15 @@ def collect_time_stacks(host, token, vessel_id, scan_times, output_dir,
                         state=None, wells=None, channels=None,
                         reference_time=None, channel_hyperstack=False,
                         progress_callback=None, stop_event=None, max_workers=1,
-                        recipe=None):
+                        recipe=None, append=True):
     """Collect time stacks to create across multiple scan times.
 
     When channel_hyperstack is False, returns one stack per well/site/channel.
     When True, returns one ImageJ C+T hyperstack per well/site.
+
+    Each item carries ``have``: how many of its leading frames are already in
+    the file on disk, so the download can add the rest in place rather than
+    rewrite the whole stack.  ``append=False`` forces the whole rewrite.
     """
     scan_times = sorted(scan_times, key=parse_scan_datetime)
     grouped = {}
@@ -1004,11 +1009,13 @@ def collect_time_stacks(host, token, vessel_id, scan_times, output_dir,
             state_info = downloaded_state.get(state_key, {})
             if fpath.exists() and state_info.get("scan_times") == frame_times:
                 continue
+            have = appendable_prefix(fpath, state_info, frame_times, labels,
+                                     channel_hyperstack=True) if append else 0
             to_download.append({
                 "fname": fname, "fpath": fpath, "state_key": state_key,
                 "row": row, "col": col, "site": site, "vessel_id": vessel_id,
                 "frames": frames, "scan_times": frame_times, "labels": labels,
-                "channel_hyperstack": True,
+                "channel_hyperstack": True, "have": have,
             })
             continue
 
@@ -1030,12 +1037,15 @@ def collect_time_stacks(host, token, vessel_id, scan_times, output_dir,
             state_info = downloaded_state.get(state_key, {})
             if fpath.exists() and state_info.get("scan_times") == frame_times:
                 continue
+            labels = [image_type_label(img_type)]
+            have = appendable_prefix(fpath, state_info, frame_times, labels,
+                                     channel_hyperstack=False) if append else 0
             to_download.append({
                 "fname": fname, "fpath": fpath, "state_key": state_key,
                 "row": row, "col": col, "site": site, "vessel_id": vessel_id,
                 "frames": frames, "scan_times": frame_times,
-                "labels": [image_type_label(img_type)],
-                "channel_hyperstack": False,
+                "labels": labels,
+                "channel_hyperstack": False, "have": have,
             })
 
     return to_download
@@ -1405,13 +1415,18 @@ def _cleanup_partial_file(path):
 
 
 def count_time_stack_payloads(items):
-    """Count source image payloads needed for collected time stack items."""
+    """Count source image payloads needed for collected time stack items.
+
+    A stack being extended rather than rewritten only fetches the frames it is
+    missing, so the frames already in the file do not count towards progress.
+    """
     total = 0
     for item in items:
+        frames = item["frames"][int(item.get("have") or 0):]
         if item.get("channel_hyperstack"):
-            total += sum(len(frame["channels"]) for frame in item["frames"])
+            total += sum(len(frame["channels"]) for frame in frames)
         else:
-            total += len(item["frames"])
+            total += len(frames)
     return total
 
 
@@ -1473,10 +1488,155 @@ def _stream_time_hyperstack(first_channels, remaining_timepoints,
                         dtype, "TCYX", labels=labels)
 
 
+def appendable_prefix(fpath, state_info, frame_times, labels,
+                      channel_hyperstack=False):
+    """How many leading frames of this stack are already correct on disk.
+
+    Zero unless the resume ledger says the file holds exactly the *first* N of
+    the frames about to be written, the file is there, and it is a stack that
+    can be extended.  Anything else - a wider time window that puts new frames
+    in front of old ones, a different channel set, a file written by something
+    else - and the answer is zero, which means write the whole file.
+    """
+    from pyincucyte.tiffstack import read_layout
+
+    recorded = list(state_info.get("scan_times") or [])
+    if not recorded or len(recorded) >= len(frame_times):
+        return 0
+    if list(frame_times[:len(recorded)]) != recorded:
+        return 0
+    if bool(state_info.get("channel_hyperstack")) != bool(channel_hyperstack):
+        return 0
+    if list(state_info.get("channels") or []) != list(labels):
+        return 0
+    if not fpath.exists():
+        return 0
+    try:
+        layout = read_layout(fpath)
+    except StackNotExtendable:
+        return 0
+    channels = len(labels) if channel_hyperstack else 1
+    if layout.channels != channels or layout.frames != len(recorded):
+        return 0
+    if not layout.room_for((len(frame_times) - len(recorded)) * channels):
+        return 0
+    return len(recorded)
+
+
+def _stack_source_planes(host, token, item, frames, max_retries=3,
+                         unit_progress_callback=None, stop_event=None,
+                         cache=None):
+    """Yield 2-D planes for these frames, in the order the file stores them."""
+    hyper = bool(item.get("channel_hyperstack"))
+    for frame in frames:
+        if stop_event and stop_event.is_set():
+            raise _StackDownloadCancelled
+        sources = frame["channels"] if hyper else [frame]
+        for source in sources:
+            if stop_event and stop_event.is_set():
+                raise _StackDownloadCancelled
+            source = dict(source)
+            if hyper:
+                source["fname"] = (f"{item['fname']}:{frame['scan_time']}:"
+                                   f"{image_type_label(source['img_type'])}")
+            else:
+                source["fname"] = f"{item['fname']}:{source['scan_time']}"
+            img_bytes, error = _fetch_payload(host, token, source, max_retries,
+                                              cache=cache)
+            if error:
+                raise _StackDownloadError(
+                    error.replace(source["fname"], item["fname"], 1))
+            if unit_progress_callback:
+                unit_progress_callback(source["fname"], len(img_bytes))
+            try:
+                array = _payload_array(host, token, source, img_bytes,
+                                       max_retries, cache=cache)
+            except Exception as e:
+                raise _StackDownloadError(
+                    f"SKIP {item['fname']}: could not read frame TIFF ({e})"
+                ) from e
+            finally:
+                img_bytes = None
+            yield array
+
+
+def _record_time_stack(item, state, state_lock):
+    """Write this stack's ledger entry and return the file size."""
+    size = item["fpath"].stat().st_size
+    if state is not None:
+        with state_lock:
+            state.setdefault("downloaded", {})[item["state_key"]] = {
+                "file": str(item["fpath"]),
+                "time": datetime.now().isoformat(),
+                "size": size,
+                "time_stack": True,
+                "channel_hyperstack": bool(item.get("channel_hyperstack")),
+                "channels": item["labels"],
+                "scan_times": item["scan_times"],
+            }
+            persist_state(state)
+    return size
+
+
+def extend_time_stack(host, token, item, state, state_lock, max_retries=3,
+                      unit_progress_callback=None, stop_event=None, cache=None):
+    """Add the frames this stack is missing without rewriting the whole file.
+
+    Returns ``(fname, size)`` exactly as :func:`_download_time_stack` does.
+    Raises :class:`StackNotExtendable` when the file on disk turns out not to
+    be the earlier part of this same stack, which is never fatal - the caller
+    writes the file whole instead.
+
+    Every new plane is fetched and checked before a single byte is written, so
+    a download that fails or is cancelled leaves the existing file untouched.
+    """
+    from pyincucyte.tiffstack import append_planes
+
+    have = int(item.get("have") or 0)
+    frames = item["frames"][have:]
+    if not have or not frames:
+        raise StackNotExtendable("nothing to add")
+
+    planes = _stack_source_planes(
+        host, token, item, frames, max_retries=max_retries,
+        unit_progress_callback=unit_progress_callback,
+        stop_event=stop_event, cache=cache)
+    labels = item["labels"] if item.get("channel_hyperstack") else None
+
+    try:
+        append_planes(item["fpath"], planes, labels=labels)
+    except _StackDownloadCancelled:
+        return None, None
+    except _StackDownloadError as e:
+        return None, str(e)
+    except ImportError as e:
+        raise StackNotExtendable(f"missing dependency ({e})") from e
+
+    return item["fname"], _record_time_stack(item, state, state_lock)
+
+
 def _download_time_stack(host, token, item, state, state_lock, max_retries=3,
                          unit_progress_callback=None, stop_event=None,
                          cache=None):
     """Download all frames for one time stack output file."""
+    if item.get("have"):
+        # The file already holds the first N of these frames.  Adding the rest
+        # in place beats rewriting gigabytes to gain one frame - but only if
+        # the file really is what the ledger says, so any doubt falls straight
+        # through to the whole-file write below.
+        try:
+            return extend_time_stack(
+                host, token, item, state, state_lock, max_retries=max_retries,
+                unit_progress_callback=unit_progress_callback,
+                stop_event=stop_event, cache=cache)
+        except StackNotExtendable as exc:
+            log.debug("%s: writing whole (%s)", item["fname"], exc)
+        except ExportError as exc:
+            # The write had already begun, so the file is suspect.
+            log.warning("%s: could not be extended (%s); writing it whole",
+                        item["fname"], exc)
+            _cleanup_partial_file(item["fpath"])
+
     if item.get("channel_hyperstack"):
         def timepoint_arrays():
             for frame in item["frames"]:
@@ -1574,21 +1734,7 @@ def _download_time_stack(host, token, item, state, state_lock, max_retries=3,
             _cleanup_partial_file(item["fpath"])
             return None, f"SKIP {item['fname']}: could not write time stack ({e})"
 
-    size = item["fpath"].stat().st_size
-    if state is not None:
-        with state_lock:
-            state.setdefault("downloaded", {})[item["state_key"]] = {
-                "file": str(item["fpath"]),
-                "time": datetime.now().isoformat(),
-                "size": size,
-                "time_stack": True,
-                "channel_hyperstack": bool(item.get("channel_hyperstack")),
-                "channels": item["labels"],
-                "scan_times": item["scan_times"],
-            }
-            persist_state(state)
-
-    return item["fname"], size
+    return item["fname"], _record_time_stack(item, state, state_lock)
 
 
 def download_scan_images(host, token, vessel_id, scan_time, output_dir,
@@ -1701,14 +1847,14 @@ def download_time_stacks(host, token, vessel_id, scan_times, output_dir,
                          progress_callback=None, stop_event=None,
                          channel_hyperstack=False,
                          collection_callback=None,
-                         unit_progress_callback=None, cache=None):
+                         unit_progress_callback=None, cache=None, append=True):
     """Download selected scans as one or more ImageJ time stacks."""
     to_download = collect_time_stacks(
         host, token, vessel_id, scan_times, output_dir,
         state=state, wells=wells, channels=channels,
         reference_time=reference_time, channel_hyperstack=channel_hyperstack,
         progress_callback=collection_callback, stop_event=stop_event,
-        max_workers=max_workers)
+        max_workers=max_workers, append=append)
     return download_collected_time_stack_items(
         host, token, to_download, state=state, max_workers=max_workers,
         progress_callback=progress_callback, stop_event=stop_event,

@@ -169,6 +169,7 @@ still works.
 | `--background` | `device`, or a number of raw counts |
 | `--state-scope` | `auto` (default), `folder`, `global`, `none` |
 | `--cache` | `auto` (default), `always`, `never` — cache source payloads |
+| `--no-append` | Rewrite every time stack whole, instead of extending it |
 | `--no-manifest` | Skip writing the manifest and CSV index |
 | `-i`, `--interval` | `watch` only: poll interval in minutes |
 | `--batch-frames` | `watch` only: hold new frames until N are waiting |
@@ -471,12 +472,29 @@ print(options.cli_command())                     # the equivalent CLI line
 ### Why watch mode stays cheap
 
 A time stack has to contain every frame, so one new scan invalidates the whole
-file. Rebuilt naively, every poll would re-download the entire experiment — and
-the cost grows with each hour of the run. PyIncucyte keeps the source payloads
-in `.pyincucyte-cache/` inside the output folder the first time it fetches them,
-so a rebuild is a disk read and only genuinely new frames touch the instrument.
+file. Done naively that means re-downloading and rewriting the entire
+experiment on every poll, and it gets worse with every hour of the run. Two
+things stop it.
 
-It is on automatically for the time layouts, which are the ones that rebuild.
+**New frames are added to the file, not rewritten into a new one.** An ImageJ
+stack keeps its directory of frames *after* the pixel data — like a book with
+its index at the back — so PyIncucyte writes the new frames on the end and
+reprints the index, leaving the existing pixels exactly where they are. On a
+144-frame stack of 1408×1040 images that is 2.9 MB written instead of 422 MB,
+and unlike a rewrite the cost does not grow as the experiment does.
+
+It happens only when the file on disk is provably the earlier part of the same
+stack: the resume ledger has to say so, the frames already there have to be the
+*first* of the ones being written, and the geometry, channels and processing
+recipe all have to match. Any doubt at all — a widened time window that puts
+new frames in front of old ones, a stack written by something else, a file that
+will not open — and the whole file is written instead. `--no-append`
+(`append_stacks=False`) forces that everywhere.
+
+**Source payloads are cached.** `.pyincucyte-cache/` inside the output folder
+keeps each image the first time it is fetched, so the rewrites that do happen
+are a disk read rather than a fresh download, and only genuinely new frames
+touch the instrument. It is on automatically for the time layouts.
 `--cache always` / `--cache never` (or `cache_payloads=` in `ExportOptions`)
 override that; deleting the folder only costs time. `result.cache.summary()`
 reports the hit rate.
@@ -493,8 +511,12 @@ old shared file; `"none"` disables resume entirely.
 Everything derives from `IncucyteError`, so a pipeline can wrap a whole run in
 one `except`: `DeviceUnreachableError`, `AuthenticationError`,
 `NotLoggedInError`, `TokenExpiredError`, `ApiError`, `VesselNotFoundError`,
-`EncryptionUnavailableError`, `ExportError`, `ConfirmationRequiredError`,
-`DeviceBusyError`.
+`EncryptionUnavailableError`, `ExportError`, `StackNotExtendable`,
+`ConfirmationRequiredError`, `DeviceBusyError`.
+
+`StackNotExtendable` is the odd one out: it is never raised at you. It is
+how the download says a time stack has to be written whole rather than
+extended, and it is always handled internally.
 
 ---
 
@@ -509,6 +531,7 @@ PyIncucyte/
     manifest.py     the JSON manifest and CSV index
     state.py        resume ledger, scoped to the output folder
     cache.py        source-payload cache, so rebuilt stacks do not re-download
+    tiffstack.py    add frames to an ImageJ stack without rewriting it
     preview.py      find a vessel by name, and look at its wells
     processing.py   optional preprocessing: calibration, background, unmixing
     watch.py        Watcher - poll and download in a background thread,

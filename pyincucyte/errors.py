@@ -50,6 +50,16 @@ class ExportError(IncucyteError):
     """An output file could not be written (bad dimensions, dtype, disk)."""
 
 
+class StackNotExtendable(ExportError):
+    """An existing time stack cannot have the new frames appended to it.
+
+    Never fatal, and never a reason to stop: it means the file on disk is not
+    the earlier part of the stack being written — different frames, different
+    geometry, or not a stack this package wrote — so the caller writes the
+    whole file instead, exactly as it did before appending existed.
+    """
+
+
 class ExportCancelled(IncucyteError):
     """A download was stopped by its cancel event before finishing."""
 
@@ -78,6 +88,7 @@ __all__ = [
     "EncryptionUnavailableError",
     "VesselNotFoundError",
     "ExportError",
+    "StackNotExtendable",
     "ExportCancelled",
     "ConfirmationRequiredError",
     "DeviceBusyError",
