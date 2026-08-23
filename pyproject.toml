@@ -51,9 +51,9 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/Jay2owe/PyIncucyteGUI"
-Source = "https://github.com/Jay2owe/PyIncucyteGUI"
-Issues = "https://github.com/Jay2owe/PyIncucyteGUI/issues"
+Homepage = "https://github.com/Jay2owe/PyIncucyte"
+Source = "https://github.com/Jay2owe/PyIncucyte"
+Issues = "https://github.com/Jay2owe/PyIncucyte/issues"
 
 [project.scripts]
 pyincucyte = "pyincucyte.cli:main"
