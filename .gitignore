@@ -1,0 +1,19 @@
+# Build artefacts
+build/
+dist/
+*.egg-info/
+
+# Environments and caches
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Scratch folder: local settings, sample payloads, throwaway downloads
+.tmp/
+
+# Instrument data and vendor service descriptions - never in the repository
+*.tif
+*.tiff
+*.wsdl
