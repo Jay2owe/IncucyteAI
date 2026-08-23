@@ -9,6 +9,7 @@ holding somebody's saved login.
 import importlib
 import importlib.util
 import os
+import re
 import sys
 import tomllib
 import unittest
@@ -17,7 +18,9 @@ from tempfile import TemporaryDirectory
 from unittest import mock
 
 import pyincucyte
-from pyincucyte import cli, compat, engine
+from pyincucyte import IncucyteClient, cli, compat, engine
+from pyincucyte.config import ConfigStore, Credentials
+from pyincucyte.errors import HostNotSetError
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -134,6 +137,90 @@ class SettingsFolderTests(unittest.TestCase):
     def test_an_empty_old_folder_does_not_count(self):
         (self.tmp / "config" / self.OLD_NAME).mkdir(parents=True)
         self.assertEqual(self.app_dir().name, self.NEW_NAME)
+
+
+class NothingPrivateShipsTests(unittest.TestCase):
+    """Whatever is in a release is on PyPI and GitHub, and stays there.
+
+    An instrument's address is site-specific. One written into the source is
+    published with every wheel, rendered on the project page if it reaches the
+    README, and preserved in every clone of the history. It has happened once;
+    this is the test that stops it happening again.
+    """
+
+    #: Four dot-separated numbers - an address, wherever it turns up.
+    ADDRESS = re.compile(r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b")
+
+    def shipped(self):
+        """Every file that goes into the distribution."""
+        return sorted((ROOT / "pyincucyte").rglob("*.py")) + [ROOT / "README.md",
+                                                              ROOT / "pyproject.toml"]
+
+    def test_no_address_is_written_into_anything_that_ships(self):
+        found = []
+        for path in self.shipped():
+            if not path.exists():
+                continue
+            for number, line in enumerate(
+                    path.read_text(encoding="utf-8").splitlines(), 1):
+                if self.ADDRESS.search(line):
+                    found.append(f"{path.relative_to(ROOT)}:{number}: {line.strip()}")
+        self.assertEqual(found, [], "an address here is published for good")
+
+    def test_there_is_no_address_to_fall_back_on(self):
+        with mock.patch.dict("os.environ", {"PYINCUCYTE_HOST": ""}):
+            self.assertEqual(engine.default_host(), "")
+
+    def test_the_environment_can_supply_one(self):
+        with mock.patch.dict("os.environ", {"PYINCUCYTE_HOST": "10.0.0.7"}):
+            self.assertEqual(engine.default_host(), "10.0.0.7")
+
+
+class HostIsRequiredTests(unittest.TestCase):
+    """Nothing reaches the network until somebody says where the device is."""
+
+    def setUp(self):
+        self._tmp = TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+        self.store = ConfigStore(Path(self.tmp) / "credentials.json")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def client(self, host=None):
+        with mock.patch.object(engine, "DEFAULT_HOST", ""):
+            return IncucyteClient(host, store=self.store)
+
+    def test_asking_without_an_address_says_how_to_set_one(self):
+        client = self.client()
+        with self.assertRaises(HostNotSetError) as caught:
+            client.require_host()
+        message = str(caught.exception)
+        for how in ("--host", "PYINCUCYTE_HOST", "login"):
+            self.assertIn(how, message)
+
+    def test_a_call_refuses_before_it_reaches_the_network(self):
+        client = self.client()
+        with mock.patch.object(engine, "api_post",
+                               side_effect=AssertionError("should not be sent")):
+            with self.assertRaises(HostNotSetError):
+                client.call("Vessels/GetAllSearchVessels")
+
+    def test_a_probe_refuses_too(self):
+        with self.assertRaises(HostNotSetError):
+            self.client().probe()
+
+    def test_an_address_passed_in_is_enough(self):
+        self.assertEqual(self.client("10.0.0.7").require_host(), "10.0.0.7")
+
+    def test_the_environment_reaches_the_client(self):
+        with mock.patch.dict("os.environ", {"PYINCUCYTE_HOST": "10.0.0.9"}):
+            self.assertEqual(self.client().require_host(), "10.0.0.9")
+
+    def test_a_saved_login_carries_its_own_address(self):
+        self.store.save(Credentials(host="10.0.0.8", username="tester",
+                                    encrypted_password="hashed"))
+        self.assertEqual(self.client().require_host(), "10.0.0.8")
 
 
 if __name__ == "__main__":

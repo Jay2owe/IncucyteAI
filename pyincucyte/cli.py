@@ -835,7 +835,8 @@ def build_parser():
         prog="pyincucyte",
         description="Download Incucyte live-cell images: plan, fetch, watch.")
     parser.add_argument("--host", default=None,
-                        help=f"Device address (default: {engine.DEFAULT_HOST})")
+                        help="Device address. No default - set PYINCUCYTE_HOST, "
+                             "or `login --host <address>` saves it")
     parser.add_argument("--config-file", help="Path to the saved-credentials file")
     parser.add_argument("--json", action="store_true",
                         help="Emit machine-readable JSON")

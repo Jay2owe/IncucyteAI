@@ -12,6 +12,16 @@ class IncucyteError(RuntimeError):
     """Base class for every PyIncucyte failure."""
 
 
+class HostNotSetError(IncucyteError):
+    """No instrument address has been given.
+
+    There is deliberately no address in the source.  An instrument's address is
+    site-specific, and one written into a published package is on PyPI and on
+    GitHub for good.  It comes from the environment, the saved login, the
+    ``--host`` flag or the address box in the app.
+    """
+
+
 class DeviceUnreachableError(IncucyteError):
     """The Incucyte device could not be reached (network, DNS, firewall)."""
 
@@ -80,6 +90,7 @@ class DeviceBusyError(IncucyteError):
 
 __all__ = [
     "IncucyteError",
+    "HostNotSetError",
     "DeviceUnreachableError",
     "ApiError",
     "AuthenticationError",

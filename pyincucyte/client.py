@@ -30,7 +30,7 @@ from . import processing
 from . import manifest as manifest_mod
 from . import wells as wl
 from .config import ConfigStore, Credentials
-from .errors import NotLoggedInError, VesselNotFoundError
+from .errors import HostNotSetError, NotLoggedInError, VesselNotFoundError
 from .models import (
     DownloadResult, ExportPlan, OutputFile, ProgressEvent, Vessel, VesselScan,
     LAYOUT_AXES, layout_flags, resolve_layout,
@@ -113,9 +113,25 @@ class IncucyteClient:
         encrypted = engine.encrypt_password(password)
         return self.login_encrypted(username, encrypted, save=save)
 
+    def require_host(self):
+        """Return the instrument's address, or explain how to set one.
+
+        Nothing that touches the network goes ahead without this, so a missing
+        address fails with instructions rather than a request to ``https:///``.
+        """
+        host = (self.host or "").strip() or engine.default_host()
+        if not host:
+            raise HostNotSetError(
+                "No Incucyte address set. Pass --host on the command line, "
+                "type it into the app, set the PYINCUCYTE_HOST environment "
+                "variable, or run `pyincucyte login --host <address>` once to "
+                "save it.")
+        return host
+
     def login_encrypted(self, username, encrypted_password, *, save=True):
         """Authenticate with an already-encrypted password."""
-        token, expires_in = engine.get_token(self.host, username, encrypted_password)
+        token, expires_in = engine.get_token(self.require_host(), username,
+                                             encrypted_password)
         credentials = Credentials(
             host=self.host, username=username,
             encrypted_password=encrypted_password,
@@ -136,7 +152,7 @@ class IncucyteClient:
                 raise NotLoggedInError(
                     "No saved credentials to refresh - log in first.")
             token, expires_in = engine.get_token(
-                self.host, self._credentials.username,
+                self.require_host(), self._credentials.username,
                 self._credentials.encrypted_password)
             self._credentials = self._credentials.with_token(token, expires_in)
             self.store.save(self._credentials)
@@ -154,7 +170,8 @@ class IncucyteClient:
 
     def call(self, route, payload=None, *, unpack=True):
         """POST to an arbitrary API route and return its ``Data`` payload."""
-        data = engine.api_post(self.host, self.ensure_token(), route, payload)
+        data = engine.api_post(self.require_host(), self.ensure_token(),
+                               route, payload)
         if not unpack:
             return data
         return engine.unpack_values(data.get("Data", data))
@@ -163,7 +180,7 @@ class IncucyteClient:
         """Check reachability and report which login modes the device allows."""
         import socket
 
-        report = {"host": self.host, "ports": {}, "api": False,
+        report = {"host": self.require_host(), "ports": {}, "api": False,
                   "device_login": None, "windows_login": None}
         for port in (80, 443, 808):
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)

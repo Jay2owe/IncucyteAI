@@ -29,8 +29,22 @@ from .errors import (
     StackNotExtendable, TokenExpiredError,
 )
 
-# Incucyte device defaults
-DEFAULT_HOST = "incucyte.invalid"
+# Incucyte device defaults.
+#
+# There is no address here on purpose.  An instrument lives on somebody's
+# internal network, and an address written into the source is published with
+# every release - to PyPI, to GitHub, and into every clone.  Set PYINCUCYTE_HOST
+# once, pass --host, or let `pyincucyte login --host <address>` save it.
+def default_host():
+    """The address to fall back on when nobody gave one, or "" if there is none.
+
+    Read at call time, not at import, so setting the variable in a running
+    session takes effect.
+    """
+    return os.environ.get("PYINCUCYTE_HOST", "").strip()
+
+
+DEFAULT_HOST = default_host()
 API_BASE_TEMPLATE = "https://{host}/IncucyteWSs"
 
 # State/config files

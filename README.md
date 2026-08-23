@@ -37,6 +37,23 @@ Installing does not replace `py-incucyte-gui`, the name this was published
 under before 0.3. Uninstall that one if it is still on the machine:
 `pip uninstall py-incucyte-gui`.
 
+### Pointing it at your instrument
+
+There is no address built in. An Incucyte sits on somebody's internal network,
+and an address written into the source would be published with every release,
+so you supply it. Any one of these is enough:
+
+```bash
+export PYINCUCYTE_HOST=incucyte.your-lab       # once per machine
+pyincucyte --host incucyte.your-lab probe      # per command (--host is global)
+pyincucyte --host incucyte.your-lab login      # saves it with the credentials
+```
+
+In the app, type it into the **Host** box. In Python,
+`IncucyteClient("incucyte.your-lab")`
+or let it read the saved login. Without one you get `HostNotSetError` before
+anything reaches the network, not a failed request.
+
 ---
 
 ## The desktop app
@@ -512,7 +529,7 @@ Everything derives from `IncucyteError`, so a pipeline can wrap a whole run in
 one `except`: `DeviceUnreachableError`, `AuthenticationError`,
 `NotLoggedInError`, `TokenExpiredError`, `ApiError`, `VesselNotFoundError`,
 `EncryptionUnavailableError`, `ExportError`, `StackNotExtendable`,
-`ConfirmationRequiredError`, `DeviceBusyError`.
+`ConfirmationRequiredError`, `DeviceBusyError`, `HostNotSetError`.
 
 `StackNotExtendable` is the odd one out: it is never raised at you. It is
 how the download says a time stack has to be written whole rather than
