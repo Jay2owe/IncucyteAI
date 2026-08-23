@@ -1,0 +1,157 @@
+"""Command line parsing, including every flag the old script accepted."""
+
+import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
+
+from pyincucyte import ExportOptions
+from pyincucyte.cli import options_from_args, parse_args
+
+
+def parse(argv):
+    return parse_args(argv)
+
+
+def resolve(argv):
+    return options_from_args(parse(argv))
+
+
+class LegacyFlagTests(unittest.TestCase):
+    """Commands people already have in scripts and scheduled tasks."""
+
+    def test_the_original_download_invocation_still_works(self):
+        options = resolve(["download", "-v", "38", "-o", "./images",
+                           "--start-from", "first"])
+        self.assertEqual(options.vessels, [38])
+        self.assertEqual(options.output, "./images")
+        self.assertEqual(options.start_from, "first")
+        self.assertEqual(options.layout, "separate")
+
+    def test_hyperstack_and_time_stack_flags_map_onto_layouts(self):
+        self.assertEqual(
+            resolve(["download", "-v", "1", "-o", "o", "--hyperstack"]).layout,
+            "channel_stack")
+        self.assertEqual(
+            resolve(["download", "-v", "1", "-o", "o", "--time-stack"]).layout,
+            "time_stack")
+        self.assertEqual(
+            resolve(["download", "-v", "1", "-o", "o",
+                     "--hyperstack", "--time-stack"]).layout,
+            "time_channel_stack")
+
+    def test_green_lut_can_be_switched_both_ways(self):
+        self.assertTrue(
+            resolve(["download", "-v", "1", "-o", "o", "--green-lut"]).green_lut)
+        self.assertFalse(
+            resolve(["download", "-v", "1", "-o", "o", "--no-green-lut"]).green_lut)
+
+    def test_date_is_shorthand_for_a_single_day(self):
+        options = resolve(["download", "-v", "1", "-o", "o",
+                           "-d", "2026-03-01"])
+        self.assertEqual(options.start_from, "2026-03-01")
+        self.assertEqual(options.end_at, "2026-03-01")
+
+    def test_repeatable_filter_builds_per_vessel_well_lists(self):
+        options = resolve(["watch", "-o", "o", "-f", "38:A1,B3", "-f", "39"])
+        self.assertEqual(options.vessels, [38, 39])
+        self.assertEqual(options.wells_for(38), {(0, 0), (1, 2)})
+        self.assertIsNone(options.wells_for(39))
+
+    def test_legacy_json_config_is_still_read(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "vessels.json"
+            path.write_text('{"vessels": [{"id": 38, "wells": ["A1", "A2"], '
+                            '"channels": "phase"}]}')
+            options = resolve(["watch", "-o", "o", "--config", str(path)])
+        self.assertEqual(options.vessels, [38])
+        self.assertEqual(options.wells_for(38), {(0, 0), (0, 1)})
+        self.assertEqual(options.channels, "phase")
+
+
+class NewFlagTests(unittest.TestCase):
+    def test_several_vessels_can_be_given(self):
+        options = resolve(["download", "-v", "38", "-v", "41", "-o", "o"])
+        self.assertEqual(options.vessels, [38, 41])
+
+    def test_layout_can_be_named_directly(self):
+        options = resolve(["download", "-v", "1", "-o", "o",
+                           "--layout", "time_channel_stack"])
+        self.assertEqual(options.layout, "time_channel_stack")
+
+    def test_per_vessel_wells_flag(self):
+        options = resolve(["download", "-v", "38", "-o", "o",
+                           "--vessel-wells", "38:C1-C4"])
+        self.assertEqual(options.wells_for(38),
+                         {(2, 0), (2, 1), (2, 2), (2, 3)})
+
+    def test_manifest_can_be_switched_off(self):
+        self.assertFalse(
+            resolve(["download", "-v", "1", "-o", "o", "--no-manifest"])
+            .write_manifest)
+
+    def test_state_scope_is_selectable(self):
+        self.assertEqual(
+            resolve(["download", "-v", "1", "-o", "o",
+                     "--state-scope", "global"]).state_scope, "global")
+
+
+class PresetTests(unittest.TestCase):
+    def test_a_preset_supplies_the_defaults(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "preset.json"
+            ExportOptions(output="X:/out", vessels=[38], channels="phase,green",
+                          layout="time_stack", workers=8).save(path)
+            options = resolve(["download", "--preset", str(path)])
+        self.assertEqual(options.vessels, [38])
+        self.assertEqual(options.layout, "time_stack")
+        self.assertEqual(options.workers, 8)
+
+    def test_command_line_flags_win_over_the_preset(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "preset.json"
+            ExportOptions(output="X:/out", vessels=[38], channels="phase",
+                          layout="time_stack", workers=8).save(path)
+            options = resolve(["download", "--preset", str(path),
+                               "-o", "Y:/other", "--workers", "2",
+                               "--layout", "separate"])
+        self.assertEqual(options.output, "Y:/other")
+        self.assertEqual(options.workers, 2)
+        self.assertEqual(options.layout, "separate")
+
+
+class NegativeValueTests(unittest.TestCase):
+    """argparse would otherwise read -48h as an unknown flag."""
+
+    def test_a_relative_start_survives_a_space(self):
+        self.assertEqual(
+            resolve(["download", "-v", "1", "-o", "o",
+                     "--start-from", "-48h"]).start_from, "-48h")
+
+    def test_a_frame_count_survives_a_space(self):
+        self.assertEqual(
+            resolve(["download", "-v", "1", "-o", "o",
+                     "-s", "-100f"]).start_from, "-100f")
+
+    def test_the_equals_form_still_works(self):
+        self.assertEqual(
+            resolve(["download", "-v", "1", "-o", "o",
+                     "--start-from=-7d"]).start_from, "-7d")
+
+    def test_real_flags_after_the_option_are_left_alone(self):
+        args = parse(["download", "-v", "1", "-o", "o", "--dry-run"])
+        self.assertTrue(args.dry_run)
+        self.assertIsNone(args.start_from)
+
+
+class ValidationTests(unittest.TestCase):
+    def test_no_vessel_is_a_clear_error_not_a_traceback(self):
+        with self.assertRaises(SystemExit):
+            resolve(["download", "-o", "o"])
+
+    def test_no_output_is_a_clear_error(self):
+        with self.assertRaises(SystemExit):
+            resolve(["download", "-v", "1"])
+
+
+if __name__ == "__main__":
+    unittest.main()

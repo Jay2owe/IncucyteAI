@@ -1,36 +1,20 @@
-#!/usr/bin/env python3
-"""
-Incucyte Auto-Downloader
-========================
-Polls the Incucyte REST API for new scan images and downloads them as TIFs.
+"""Wire-level engine for the Incucyte REST API.
 
-Usage:
-    # First time — test connection:
-    python incucyte_downloader.py probe
+This module holds the proven request/response and TIFF-writing code that talks
+to the Incucyte device.  It is deliberately low level: everything takes an
+explicit ``host`` and bearer ``token``.  Application code should prefer
+:class:`pyincucyte.client.IncucyteClient`, which wraps these functions in a
+session object with typed results, structured errors, and a manifest.
 
-    # Login (saves encrypted credentials):
-    python incucyte_downloader.py login
-
-    # List vessels (experiments):
-    python incucyte_downloader.py vessels
-
-    # List today's scans:
-    python incucyte_downloader.py scans
-
-    # Download all images for a vessel:
-    python incucyte_downloader.py download -v 38 -o ./images
-
-    # Watch mode — poll for new images every N minutes:
-    python incucyte_downloader.py watch -v 38 -o ./images -i 10
-
-Requirements:
-    pip install requests pythonnet Pillow numpy tifffile
+Nothing in here writes to stdout — progress is emitted through the module
+logger (``logging.getLogger("pyincucyte.engine")``) and through the explicit
+``progress_callback`` arguments.
 """
 
-import argparse
 import base64
 import io
 import json
+import logging
 import os
 import sys
 import time
@@ -39,31 +23,86 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, date
 from pathlib import Path
 
+from .errors import (
+    ApiError, AuthenticationError, DeviceUnreachableError,
+    EncryptionUnavailableError, NotLoggedInError, TokenExpiredError,
+)
+
 # Incucyte device defaults
 DEFAULT_HOST = "incucyte.invalid"
 API_BASE_TEMPLATE = "https://{host}/IncucyteWSs"
 
 # State/config files
-SCRIPT_DIR = Path(__file__).parent
+PACKAGE_DIR = Path(__file__).resolve().parent
+SCRIPT_DIR = PACKAGE_DIR.parent          # repository root for a source checkout
 LEGACY_APP_DIR = SCRIPT_DIR / ".tmp"
+
+log = logging.getLogger("pyincucyte.engine")
+
+# Where the vendor .NET client lives.  The password-encryption assembly ships
+# with it, so we need one real install to hash a password.  Version folders
+# change between releases (2021C, 2024B, ...), so discover rather than hardcode.
+INCUCYTE_INSTALL_GLOBS = ("Incucyte*", "IncuCyte*")
+
+
+def find_incucyte_install():
+    """Return the newest installed Incucyte client folder, or None."""
+    override = os.environ.get("PYINCUCYTE_CLIENT_DIR")
+    if override:
+        path = Path(override).expanduser()
+        return path if path.is_dir() else None
+
+    roots = [
+        Path(os.environ.get("ProgramFiles", r"C:\Program Files")),
+        Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")),
+    ]
+    found = []
+    for root in roots:
+        if not root.is_dir():
+            continue
+        for pattern in INCUCYTE_INSTALL_GLOBS:
+            for candidate in root.glob(pattern):
+                if candidate.is_dir() and (candidate / "Dlls").is_dir():
+                    found.append(candidate)
+    if not found:
+        return None
+    # Newest version folder wins ("Incucyte 2024B" sorts after "Incucyte 2021C").
+    return sorted(set(found), key=lambda p: p.name)[-1]
+
+
+INCUCYTE_INSTALL_DIR = find_incucyte_install()
+
+
+#: Files that mark a folder as a real settings folder rather than an empty one.
+SETTINGS_FILES = ("incucyte_config.json", "download_state.json", "gui_state.json")
 
 
 def default_app_dir():
-    """Return the per-user folder for saved tokens, GUI state, and download state."""
-    env_dir = os.environ.get("PYINCUCYTEGUI_HOME")
-    if env_dir:
-        return Path(env_dir).expanduser()
+    """Return the per-user folder for saved tokens, GUI state, and download state.
 
-    legacy_files = ("incucyte_config.json", "download_state.json", "gui_state.json")
-    if any((LEGACY_APP_DIR / name).exists() for name in legacy_files):
+    The project was called PyIncucyteGUI until 0.3, so a settings folder under
+    the old name is preferred when one exists: renaming the package must not
+    log anybody out or lose their well selections.
+    """
+    for variable in ("PYINCUCYTE_HOME", "PYINCUCYTEGUI_HOME"):
+        env_dir = os.environ.get(variable)
+        if env_dir:
+            return Path(env_dir).expanduser()
+
+    if any((LEGACY_APP_DIR / name).exists() for name in SETTINGS_FILES):
         return LEGACY_APP_DIR
 
     if os.name == "nt":
         base = Path(os.environ.get("APPDATA", Path.home() / "AppData" / "Roaming"))
-        return base / "PyIncucyteGUI"
+        candidates = (base / "PyIncucyte", base / "PyIncucyteGUI")
+    else:
+        base = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+        candidates = (base / "pyincucyte", base / "pyincucytegui")
 
-    base = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
-    return base / "pyincucytegui"
+    for candidate in candidates:
+        if any((candidate / name).exists() for name in SETTINGS_FILES):
+            return candidate
+    return candidates[0]
 
 
 APP_DIR = default_app_dir()
@@ -95,6 +134,8 @@ def parse_wells(spec):
     """
     if spec is None or spec.strip().lower() == "all":
         return None
+    if not spec.strip():
+        return set()          # an empty spec selects nothing, the inverse of "all"
 
     def parse_single(w):
         w = w.strip().upper()
@@ -109,6 +150,8 @@ def parse_wells(spec):
     wells = set()
     for part in spec.split(","):
         part = part.strip()
+        if not part:
+            continue
         if "-" in part:
             # Range: "A1-A6" or "A1-D4"
             endpoints = part.split("-", 1)
@@ -164,6 +207,22 @@ def save_state(state):
     STATE_FILE.write_text(json.dumps(state, indent=2, default=str))
 
 
+# Key used to attach a StateStore to the plain dict the download functions pass
+# around.  When present, persistence is delegated to that store (which batches
+# writes and can be scoped to an output folder); when absent, behaviour falls
+# back to the single global state file this script has always used.
+STATE_STORE_KEY = "_store"
+
+
+def persist_state(state):
+    """Persist download state through its attached store, or globally."""
+    store = state.get(STATE_STORE_KEY) if isinstance(state, dict) else None
+    if store is not None:
+        store.mark_dirty()
+        return
+    save_state(state)
+
+
 def load_config():
     if CONFIG_FILE.exists():
         return json.loads(CONFIG_FILE.read_text())
@@ -179,7 +238,12 @@ def encrypt_password(plain_password):
     """Encrypt password using Incucyte's Essen.Security.Encryption via pythonnet."""
     try:
         import clr
-        base = "C:/Program Files/Incucyte 2021C"
+        install = INCUCYTE_INSTALL_DIR or find_incucyte_install()
+        if install is None:
+            raise FileNotFoundError(
+                "no Incucyte client installation found under Program Files; "
+                "set PYINCUCYTE_CLIENT_DIR to its folder")
+        base = str(install)
         if base not in sys.path:
             sys.path.append(base)
             for root, dirs, files in os.walk(os.path.join(base, "Dlls")):
@@ -192,39 +256,94 @@ def encrypt_password(plain_password):
         from Essen.Security import Encryption
         return Encryption.EncryptedString(plain_password)
     except Exception as e:
-        print(f"ERROR: Could not encrypt password: {e}")
-        print("Make sure pythonnet is installed and Incucyte 2021C is at C:/Program Files/Incucyte 2021C/")
-        sys.exit(1)
+        raise EncryptionUnavailableError(
+            f"Could not encrypt password: {e}. Install pythonnet and make sure the "
+            f"Incucyte client is present at {INCUCYTE_INSTALL_DIR}."
+        ) from e
+
+
+# One pooled HTTPS session per host.  Parallel downloads previously opened a
+# fresh TLS connection per image; pooling removes that handshake per request.
+_SESSIONS = {}
+_SESSION_LOCK = threading.Lock()
+API_TIMEOUT = 30
+CONNECTION_POOL_SIZE = 32
+
+
+def session_for(host):
+    """Return the shared, connection-pooled requests.Session for a host."""
+    import requests
+    from requests.adapters import HTTPAdapter
+
+    with _SESSION_LOCK:
+        session = _SESSIONS.get(host)
+        if session is None:
+            session = requests.Session()
+            session.verify = False
+            adapter = HTTPAdapter(pool_connections=4,
+                                  pool_maxsize=CONNECTION_POOL_SIZE)
+            session.mount("https://", adapter)
+            session.mount("http://", adapter)
+            _SESSIONS[host] = session
+        return session
+
+
+def close_sessions():
+    """Close every pooled session (used on shutdown and in tests)."""
+    with _SESSION_LOCK:
+        for session in _SESSIONS.values():
+            try:
+                session.close()
+            except Exception:
+                pass
+        _SESSIONS.clear()
 
 
 def get_token(host, username, encrypted_password):
     """Get an OAuth2 Bearer token from the Incucyte API."""
     import requests
     url = f"{API_BASE_TEMPLATE.format(host=host)}/token"
-    resp = requests.post(url,
-        data=f"grant_type=password&username={username}&password={encrypted_password}",
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
-        timeout=15, verify=False)
+    try:
+        resp = session_for(host).post(url,
+            data=f"grant_type=password&username={username}&password={encrypted_password}",
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            timeout=15)
+    except requests.exceptions.RequestException as e:
+        raise DeviceUnreachableError(
+            f"Could not reach the Incucyte at {host}: {e}. "
+            f"The device is only routable from the site network."
+        ) from e
     if resp.status_code != 200:
-        error = resp.json().get("error_description", resp.text[:200])
-        raise RuntimeError(f"Authentication failed: {error}")
+        try:
+            error = resp.json().get("error_description", resp.text[:200])
+        except ValueError:
+            error = resp.text[:200]
+        raise AuthenticationError(f"Authentication failed: {error}")
     data = resp.json()
     return data["access_token"], data.get("expires_in", 86400)
 
 
-def api_post(host, token, route, payload=None):
+def api_post(host, token, route, payload=None, timeout=None):
     """Make an authenticated POST to the Incucyte REST API."""
     import requests
     url = f"{API_BASE_TEMPLATE.format(host=host)}/api/{route}"
     headers = {"Authorization": f"Bearer {token}"}
-    resp = requests.post(url, json=payload or {}, headers=headers, timeout=30, verify=False)
+    try:
+        resp = session_for(host).post(url, json=payload or {}, headers=headers,
+                                      timeout=timeout or API_TIMEOUT)
+    except requests.exceptions.RequestException as e:
+        raise DeviceUnreachableError(
+            f"Could not reach the Incucyte at {host} ({route}): {e}") from e
     if resp.status_code == 401:
-        raise RuntimeError("Token expired or invalid — re-run login")
+        raise TokenExpiredError("Token expired or invalid — re-run login")
     if resp.status_code != 200:
-        raise RuntimeError(f"API error {resp.status_code}: {resp.text[:200]}")
+        raise ApiError(f"API error {resp.status_code}: {resp.text[:200]}",
+                       status_code=resp.status_code, route=route,
+                       body=resp.text[:2000])
     data = resp.json()
     if data.get("Status") == "Exception":
-        raise RuntimeError(f"API exception: {data.get('ShortMessage', 'unknown')}")
+        raise ApiError(f"API exception: {data.get('ShortMessage', 'unknown')}",
+                       route=route, body=data)
     return data
 
 
@@ -363,8 +482,7 @@ def authenticate(args):
     username = config.get("username")
     encrypted_pw = config.get("encrypted_password")
     if not username or not encrypted_pw:
-        print("ERROR: Not logged in. Run 'login' first.")
-        sys.exit(1)
+        raise NotLoggedInError("Not logged in. Run 'login' first.")
 
     token, expires_in = get_token(host, username, encrypted_pw)
 
@@ -377,217 +495,6 @@ def authenticate(args):
 
 
 # --- Commands ---
-
-def cmd_probe(args):
-    """Test connectivity to the Incucyte device."""
-    import socket
-    import requests
-
-    host = args.host
-    print(f"\n=== Probing Incucyte at {host} ===\n")
-
-    # Port check
-    for port, desc in [(80, "HTTP"), (443, "HTTPS"), (808, "WCF net.tcp")]:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(3)
-        result = sock.connect_ex((host, port))
-        status = "OPEN" if result == 0 else "CLOSED"
-        print(f"  Port {port} ({desc}): {status}")
-        sock.close()
-
-    # HTTPS API check
-    try:
-        url = f"https://{host}/IncucyteWSs/api/Connections/GetDeviceLoginModes"
-        r = requests.post(url, json={}, timeout=10, verify=False)
-        data = r.json()
-        modes = unpack_values(data.get("Data", {}))
-        print(f"\n  API endpoint: OK")
-        print(f"  Device login: {'enabled' if modes.get('IsDeviceLoginAllowed') else 'disabled'}")
-        print(f"  Windows auth: {'enabled' if modes.get('IsWindowsLoginAllowed') else 'disabled'}")
-    except Exception as e:
-        print(f"\n  API check failed: {e}")
-
-    # SOAP version check
-    try:
-        from zeep import Client
-        from zeep.transports import Transport
-        session = requests.Session()
-        transport = Transport(session=session, timeout=10)
-        client = Client(f"http://{host}/IncuCyteWS/FastInitialConnection.asmx?WSDL", transport=transport)
-        version = client.service.GetWebServiceVersion()
-        print(f"  Web service version: {version.Value}")
-    except Exception:
-        pass
-
-    print()
-
-
-def cmd_login(args):
-    """Login and save encrypted credentials."""
-    import getpass
-
-    host = args.host
-    username = args.username or input("Username: ")
-    password = args.password or getpass.getpass("Password: ")
-
-    print(f"Encrypting password...")
-    encrypted = encrypt_password(password)
-
-    print(f"Authenticating as {username}...")
-    try:
-        token, expires_in = get_token(host, username, encrypted)
-    except RuntimeError as e:
-        print(f"Login failed: {e}")
-        sys.exit(1)
-
-    save_config({
-        "host": host,
-        "username": username,
-        "encrypted_password": encrypted,
-        "token": token,
-        "token_expires_at": (datetime.now().replace(microsecond=0) +
-                              __import__("datetime").timedelta(seconds=expires_in - 60)).isoformat(),
-        "login_time": datetime.now().isoformat(),
-    })
-    print(f"Login successful! Token expires in {expires_in // 3600} hours.")
-    print(f"Config saved to {CONFIG_FILE}")
-
-
-def cmd_vessels(args):
-    """List all vessels (experiments) on the Incucyte."""
-    host, token = authenticate(args)
-
-    print("\n=== Vessels ===\n")
-    data = api_post(host, token, "Vessels/GetAllSearchVessels")
-    vessels = extract_search_vessels(data)
-
-    if not vessels:
-        print("  No vessels found.")
-        return
-
-    for v in vessels:
-        vid = vessel_id_from_record(v)
-        if vid is None:
-            continue
-        vtype = v.get("VesselTypeName", "?")
-        channels = v.get("Channels", {})
-        phase = "Ph" if channels.get("Phase", {}).get("On") else ""
-        colors = channels.get("Colors", {})
-        c1 = channel_name_from_channels(channels, 2) if colors.get("Color1", {}).get("On") else ""
-        c2 = channel_name_from_channels(channels, 3) if colors.get("Color2", {}).get("On") else ""
-        ch_str = "+".join(filter(None, [phase, c1, c2]))
-        print(f"  ID={vid:3d}  Type={vtype:25s}  Channels={ch_str}")
-
-    print(f"\n  Total: {len(vessels)} vessels")
-
-
-def cmd_scans(args):
-    """List scan times for a given date."""
-    host, token = authenticate(args)
-
-    # Parse date
-    if args.date:
-        d = datetime.strptime(args.date, "%Y-%m-%d").date()
-    else:
-        d = date.today()
-
-    print(f"\n=== Scans for {d} ===\n")
-    data = api_post(host, token, "Scans/AllScanTimes",
-                    {"Year": d.year, "Month": d.month, "Day": d.day})
-    scans = unpack_values(data.get("Data", []))
-    if not isinstance(scans, list):
-        scans = []
-
-    if not scans:
-        print("  No scans found for this date.")
-        return
-
-    for s in scans:
-        print(f"  {s}")
-    print(f"\n  Total: {len(scans)} scans")
-
-
-def cmd_download(args):
-    """Download images for a vessel at a specific scan time or all scans on a date."""
-    host, token = authenticate(args)
-    output = Path(args.output)
-    output.mkdir(parents=True, exist_ok=True)
-    vessel_id = args.vessel
-
-    # Determine start date
-    start_from = getattr(args, "start_from", None)
-    if start_from and start_from.lower() == "first":
-        print("Finding first scan time...")
-        reference_time = find_first_scan_time(host, token)
-        if reference_time:
-            start_date = reference_time.date()
-            print(f"  First scan: {reference_time}")
-        else:
-            print("Could not find first scan, using today")
-            start_date = date.today()
-    elif start_from:
-        start_date = datetime.strptime(start_from, "%Y-%m-%d").date()
-        reference_time = None
-    elif args.date:
-        start_date = datetime.strptime(args.date, "%Y-%m-%d").date()
-        reference_time = None
-    else:
-        start_date = date.today()
-        reference_time = None
-
-    # Find reference time for elapsed filenames if not already set
-    if reference_time is None:
-        print("Finding experiment start time...")
-        reference_time = find_first_scan_time(host, token)
-        if reference_time:
-            print(f"  First scan: {reference_time}")
-
-    # Collect scans
-    end_date = date.today()
-    if args.date and not start_from:
-        end_date = start_date  # single-day mode
-    print(f"Collecting scans from {start_date} to {end_date}...")
-    scans = collect_scans_in_range(host, token, start_date, end_date)
-
-    if not scans:
-        print(f"No scans found for {start_date} to {end_date}")
-        return
-
-    if args.scan_time:
-        scans = [s for s in scans if args.scan_time in s]
-        if not scans:
-            print(f"No scan matching '{args.scan_time}' found")
-            return
-
-    wells = parse_wells(getattr(args, "wells", None))
-    channels = parse_channels(getattr(args, "channels", None))
-    hyperstack = getattr(args, "hyperstack", False)
-    time_stack = getattr(args, "time_stack", False)
-
-    well_desc = args.wells if args.wells else "all"
-    print(f"\n=== Downloading vessel {vessel_id} ({well_desc}) from {len(scans)} scans ===\n")
-    if time_stack:
-        mode = "ImageJ time+channel hyperstack" if hyperstack else "ImageJ time stack"
-    else:
-        mode = "ImageJ hyperstack" if hyperstack else "separate TIFFs"
-    print(f"Output mode: {mode}\n")
-
-    if time_stack:
-        state = load_state()
-        download_time_stacks(host, token, vessel_id, scans, output,
-                             state=state, wells=wells, channels=channels,
-                             reference_time=reference_time,
-                             max_workers=getattr(args, "max_workers", 2),
-                             channel_hyperstack=hyperstack)
-        return
-
-    for scan_time in scans:
-        download_scan_images(host, token, vessel_id, scan_time, output,
-                             wells=wells, channels=channels,
-                             reference_time=reference_time,
-                             max_workers=getattr(args, "max_workers", 4),
-                             green_phase=getattr(args, "green_phase", False),
-                             hyperstack=hyperstack)
 
 
 def parse_scan_datetime(scan_time):
@@ -641,23 +548,29 @@ def find_first_scan_time(host, token, max_days_back=90):
 
 
 def collect_scans_in_range(host, token, start_date, end_date=None,
-                           progress_callback=None, stop_event=None):
+                           progress_callback=None, stop_event=None,
+                           reverse=False, enough=None):
     """Fetch all scan times from start_date through end_date (inclusive).
 
     Args:
         start_date: date object for the first day to check.
         end_date: date object for the last day (default: today).
+        reverse: walk from end_date backwards - what "the last N frames" needs,
+            because its start date is not known until enough scans are found.
+        enough: optional predicate called with the scans gathered so far; when
+            it returns True the sweep stops early. Saves querying three months
+            of days to satisfy "the first 100 frames".
 
-    Returns a list of scan time strings, chronologically ordered.
+    Returns a list of scan time strings.
     """
     if end_date is None:
         end_date = date.today()
     scans = []
-    d = start_date
     one_day = __import__("datetime").timedelta(days=1)
-    total_days = (end_date - start_date).days + 1
+    total_days = max(1, (end_date - start_date).days + 1)
+    d = end_date if reverse else start_date
     done = 0
-    while d <= end_date:
+    while start_date <= d <= end_date:
         if stop_event and stop_event.is_set():
             break
         done += 1
@@ -672,7 +585,9 @@ def collect_scans_in_range(host, token, start_date, end_date=None,
                 scans.extend(day_scans)
         except Exception:
             pass
-        d += one_day
+        if enough is not None and enough(scans):
+            break
+        d = (d - one_day) if reverse else (d + one_day)
     return scans
 
 
@@ -1141,6 +1056,24 @@ def _fetch_scan_vessel_image_bytes(host, token, item, max_retries=3):
     return img_bytes, None
 
 
+def _fetch_payload(host, token, item, max_retries=3, cache=None):
+    """Fetch one payload, serving it from the local cache when possible.
+
+    Rebuilding a time stack re-reads every frame it contains.  Without the
+    cache that means re-downloading the whole experiment each time a new scan
+    lands; with it, each source image crosses the network exactly once.
+    """
+    if cache is not None:
+        cached = cache.get(item)
+        if cached:
+            return cached, None
+
+    img_bytes, error = _fetch_scan_vessel_image_bytes(host, token, item, max_retries)
+    if cache is not None and img_bytes:
+        cache.put(item, img_bytes)
+    return img_bytes, error
+
+
 def _download_single_image(host, token, item, state, state_lock, green_phase=False,
                            max_retries=3):
     """Download a single image with retry. Returns (fname, size) on success, None on failure."""
@@ -1152,8 +1085,9 @@ def _download_single_image(host, token, item, state, state_lock, green_phase=Fal
     if green_phase and item["img_type"] == 1:
         try:
             img_bytes = apply_green_lut(img_bytes)
-        except Exception as e:
-            pass  # Fall back to raw grayscale on error
+        except Exception as exc:
+            # The LUT is cosmetic; a failure must not cost us the image.
+            log.debug("green LUT failed for %s: %s", item["fname"], exc)
 
     item["fpath"].write_bytes(img_bytes)
 
@@ -1164,7 +1098,7 @@ def _download_single_image(host, token, item, state, state_lock, green_phase=Fal
                 "time": datetime.now().isoformat(),
                 "size": len(img_bytes),
             }
-            save_state(state)
+            persist_state(state)
 
     return item["fname"], len(img_bytes)
 
@@ -1174,8 +1108,8 @@ def _tiff_bytes_to_array(tif_bytes):
     from PIL import Image
     import numpy as np
 
-    img = Image.open(io.BytesIO(tif_bytes))
-    arr = np.array(img)
+    with Image.open(io.BytesIO(tif_bytes)) as img:
+        arr = np.array(img)
     if arr.ndim == 3:
         arr = arr[..., 0]
     return arr
@@ -1192,11 +1126,38 @@ def _common_hyperstack_dtype(arrays):
     return np.uint16 if any(arr.dtype.itemsize > 1 for arr in arrays) else np.uint8
 
 
-def write_imagej_hyperstack(path, channel_arrays, labels):
-    """Write channel arrays as an ImageJ-compatible CYX TIFF hyperstack."""
+def _validate_stack_array(arr, expected_shape, output_dtype, label):
+    """Return one frame/channel array in the exact shape and dtype being written."""
     import numpy as np
+
+    if arr.shape != expected_shape:
+        raise ValueError(
+            f"{label} dimensions do not match: expected {expected_shape}, got {arr.shape}"
+        )
+    output_dtype = np.dtype(output_dtype)
+    if arr.dtype != output_dtype and not np.can_cast(arr.dtype, output_dtype, casting="safe"):
+        raise ValueError(f"{label} dtype {arr.dtype} cannot be safely written as {output_dtype}")
+    return arr.astype(output_dtype, copy=False)
+
+
+def _write_imagej_stack(path, arrays, shape, dtype, axes, labels=None):
+    """Write an ImageJ stack from an array iterator without building a full stack."""
     import tifffile
 
+    metadata = {
+        "axes": axes,
+        "mode": "grayscale",
+    }
+    if labels is not None:
+        metadata["Labels"] = labels
+
+    tifffile.imwrite(str(path), arrays, shape=shape, dtype=dtype,
+                     imagej=True, metadata=metadata,
+                     photometric="minisblack")
+
+
+def write_imagej_hyperstack(path, channel_arrays, labels):
+    """Write channel arrays as an ImageJ-compatible CYX TIFF hyperstack."""
     if not channel_arrays:
         raise ValueError("No channel arrays provided")
 
@@ -1206,21 +1167,16 @@ def write_imagej_hyperstack(path, channel_arrays, labels):
         raise ValueError(f"Channel dimensions do not match: {shapes}")
 
     dtype = _common_hyperstack_dtype(channel_arrays)
-    stack = np.stack([arr.astype(dtype, copy=False) for arr in channel_arrays], axis=0)
-    metadata = {
-        "axes": "CYX",
-        "mode": "grayscale",
-        "Labels": labels,
-    }
-    tifffile.imwrite(str(path), stack, imagej=True, metadata=metadata,
-                     photometric="minisblack")
+    arrays = (
+        _validate_stack_array(arr, shape, dtype, "Channel")
+        for arr in channel_arrays
+    )
+    _write_imagej_stack(path, arrays, (len(channel_arrays), *shape),
+                        dtype, "CYX", labels=labels)
 
 
 def write_imagej_time_stack(path, frame_arrays):
     """Write one channel over time as an ImageJ TYX TIFF stack."""
-    import numpy as np
-    import tifffile
-
     if not frame_arrays:
         raise ValueError("No time frames provided")
 
@@ -1230,19 +1186,17 @@ def write_imagej_time_stack(path, frame_arrays):
         raise ValueError(f"Frame dimensions do not match: {shapes}")
 
     dtype = _common_hyperstack_dtype(frame_arrays)
-    stack = np.stack([arr.astype(dtype, copy=False) for arr in frame_arrays], axis=0)
-    metadata = {
-        "axes": "TYX",
-        "mode": "grayscale",
-    }
-    tifffile.imwrite(str(path), stack, imagej=True, metadata=metadata,
-                     photometric="minisblack")
+    arrays = (
+        _validate_stack_array(arr, shape, dtype, "Frame")
+        for arr in frame_arrays
+    )
+    _write_imagej_stack(path, arrays, (len(frame_arrays), *shape),
+                        dtype, "TYX")
 
 
 def write_imagej_time_hyperstack(path, timepoint_channel_arrays, labels):
     """Write selected channels over time as an ImageJ TCYX TIFF hyperstack."""
     import numpy as np
-    import tifffile
 
     if not timepoint_channel_arrays:
         raise ValueError("No time frames provided")
@@ -1260,27 +1214,28 @@ def write_imagej_time_hyperstack(path, timepoint_channel_arrays, labels):
         raise ValueError(f"Frame dimensions do not match: {shapes}")
 
     dtype = _common_hyperstack_dtype(all_arrays)
-    stack = np.stack([
-        np.stack([arr.astype(dtype, copy=False) for arr in channels], axis=0)
+    arrays = (
+        np.stack([
+            _validate_stack_array(arr, shape, dtype, "Frame")
+            for arr in channels
+        ], axis=0)
         for channels in timepoint_channel_arrays
-    ], axis=0)
-    metadata = {
-        "axes": "TCYX",
-        "mode": "grayscale",
-        "Labels": labels,
-    }
-    tifffile.imwrite(str(path), stack, imagej=True, metadata=metadata,
-                     photometric="minisblack")
+    )
+    _write_imagej_stack(path, arrays,
+                        (len(timepoint_channel_arrays), n_channels, *shape),
+                        dtype, "TCYX", labels=labels)
 
 
-def _download_hyperstack(host, token, item, state, state_lock, max_retries=3):
+def _download_hyperstack(host, token, item, state, state_lock, max_retries=3,
+                         cache=None):
     """Download selected channels and write a single ImageJ hyperstack TIFF."""
     arrays = []
     labels = []
     for channel_item in item["channels"]:
         channel_item = dict(channel_item)
         channel_item["fname"] = f"{item['fname']}:{image_type_label(channel_item['img_type'])}"
-        img_bytes, error = _fetch_scan_vessel_image_bytes(host, token, channel_item, max_retries)
+        img_bytes, error = _fetch_payload(host, token, channel_item, max_retries,
+                                          cache=cache)
         if error:
             return None, error.replace(channel_item["fname"], item["fname"], 1)
         try:
@@ -1307,7 +1262,7 @@ def _download_hyperstack(host, token, item, state, state_lock, max_retries=3):
                 "hyperstack": True,
                 "channels": labels,
             }
-            save_state(state)
+            persist_state(state)
 
     return item["fname"], size
 
@@ -1331,56 +1286,156 @@ def count_time_stack_payloads(items):
     return total
 
 
+class _StackDownloadError(RuntimeError):
+    """Expected stack-building failure with a user-facing message."""
+
+
+class _StackDownloadCancelled(RuntimeError):
+    """Internal signal used to stop a stack between source-image downloads."""
+
+
+def _stack_dtype_from_first(arrays):
+    """Choose the output dtype once a streaming stack has its first plane(s)."""
+    return _common_hyperstack_dtype(arrays)
+
+
+def _stream_time_stack(first_array, remaining_arrays, path, frame_count):
+    """Write a TYX ImageJ stack while keeping only the current frame in memory."""
+    dtype = _stack_dtype_from_first([first_array])
+    frame_shape = first_array.shape
+
+    def arrays():
+        yield _validate_stack_array(first_array, frame_shape, dtype, "Frame")
+        for arr in remaining_arrays:
+            yield _validate_stack_array(arr, frame_shape, dtype, "Frame")
+
+    _write_imagej_stack(path, arrays(), (frame_count, *frame_shape), dtype, "TYX")
+
+
+def _stack_timepoint_channels(channel_arrays, frame_shape, dtype):
+    """Build one CYX timepoint from its channel arrays."""
+    import numpy as np
+
+    return np.stack([
+        _validate_stack_array(arr, frame_shape, dtype, "Frame")
+        for arr in channel_arrays
+    ], axis=0)
+
+
+def _stream_time_hyperstack(first_channels, remaining_timepoints,
+                            path, timepoint_count, labels):
+    """Write a TCYX ImageJ stack while keeping one timepoint in memory."""
+    if not first_channels:
+        raise ValueError("No channel arrays provided")
+
+    dtype = _stack_dtype_from_first(first_channels)
+    frame_shape = first_channels[0].shape
+    channel_count = len(first_channels)
+
+    def arrays():
+        yield _stack_timepoint_channels(first_channels, frame_shape, dtype)
+        for channel_arrays in remaining_timepoints:
+            if len(channel_arrays) != channel_count:
+                raise ValueError("Time points do not all contain the same number of channels")
+            yield _stack_timepoint_channels(channel_arrays, frame_shape, dtype)
+
+    _write_imagej_stack(path, arrays(),
+                        (timepoint_count, channel_count, *frame_shape),
+                        dtype, "TCYX", labels=labels)
+
+
 def _download_time_stack(host, token, item, state, state_lock, max_retries=3,
-                         unit_progress_callback=None):
+                         unit_progress_callback=None, stop_event=None,
+                         cache=None):
     """Download all frames for one time stack output file."""
     if item.get("channel_hyperstack"):
-        timepoint_arrays = []
-        for frame in item["frames"]:
-            channel_arrays = []
-            for channel_item in frame["channels"]:
-                channel_item = dict(channel_item)
-                channel_item["fname"] = (
-                    f"{item['fname']}:{frame['scan_time']}:"
-                    f"{image_type_label(channel_item['img_type'])}"
-                )
-                img_bytes, error = _fetch_scan_vessel_image_bytes(
-                    host, token, channel_item, max_retries)
-                if error:
-                    return None, error.replace(channel_item["fname"], item["fname"], 1)
-                if unit_progress_callback:
-                    unit_progress_callback(channel_item["fname"], len(img_bytes))
-                try:
-                    channel_arrays.append(_tiff_bytes_to_array(img_bytes))
-                except Exception as e:
-                    return None, f"SKIP {item['fname']}: could not read channel TIFF ({e})"
-            timepoint_arrays.append(channel_arrays)
+        def timepoint_arrays():
+            for frame in item["frames"]:
+                if stop_event and stop_event.is_set():
+                    raise _StackDownloadCancelled
+                channel_arrays = []
+                for channel_item in frame["channels"]:
+                    if stop_event and stop_event.is_set():
+                        raise _StackDownloadCancelled
+                    channel_item = dict(channel_item)
+                    channel_item["fname"] = (
+                        f"{item['fname']}:{frame['scan_time']}:"
+                        f"{image_type_label(channel_item['img_type'])}"
+                    )
+                    img_bytes, error = _fetch_payload(
+                        host, token, channel_item, max_retries, cache=cache)
+                    if error:
+                        raise _StackDownloadError(
+                            error.replace(channel_item["fname"], item["fname"], 1)
+                        )
+                    if unit_progress_callback:
+                        unit_progress_callback(channel_item["fname"], len(img_bytes))
+                    try:
+                        channel_arrays.append(_tiff_bytes_to_array(img_bytes))
+                    except Exception as e:
+                        raise _StackDownloadError(
+                            f"SKIP {item['fname']}: could not read channel TIFF ({e})"
+                        ) from e
+                    finally:
+                        img_bytes = None
+                yield channel_arrays
 
         try:
-            write_imagej_time_hyperstack(item["fpath"], timepoint_arrays, item["labels"])
+            timepoints = timepoint_arrays()
+            first_channels = next(timepoints)
+            _stream_time_hyperstack(
+                first_channels, timepoints, item["fpath"],
+                len(item["frames"]), item["labels"])
+        except StopIteration:
+            return None, f"SKIP {item['fname']}: no time frames provided"
+        except _StackDownloadCancelled:
+            _cleanup_partial_file(item["fpath"])
+            return None, None
+        except _StackDownloadError as e:
+            _cleanup_partial_file(item["fpath"])
+            return None, str(e)
         except ImportError as e:
             return None, f"SKIP {item['fname']}: missing dependency ({e}); install tifffile"
         except Exception as e:
             _cleanup_partial_file(item["fpath"])
             return None, f"SKIP {item['fname']}: could not write time hyperstack ({e})"
     else:
-        frame_arrays = []
-        for frame_item in item["frames"]:
-            frame_item = dict(frame_item)
-            frame_item["fname"] = f"{item['fname']}:{frame_item['scan_time']}"
-            img_bytes, error = _fetch_scan_vessel_image_bytes(
-                host, token, frame_item, max_retries)
-            if error:
-                return None, error.replace(frame_item["fname"], item["fname"], 1)
-            if unit_progress_callback:
-                unit_progress_callback(frame_item["fname"], len(img_bytes))
-            try:
-                frame_arrays.append(_tiff_bytes_to_array(img_bytes))
-            except Exception as e:
-                return None, f"SKIP {item['fname']}: could not read frame TIFF ({e})"
+        def frame_arrays():
+            for frame_item in item["frames"]:
+                if stop_event and stop_event.is_set():
+                    raise _StackDownloadCancelled
+                frame_item = dict(frame_item)
+                frame_item["fname"] = f"{item['fname']}:{frame_item['scan_time']}"
+                img_bytes, error = _fetch_payload(
+                    host, token, frame_item, max_retries, cache=cache)
+                if error:
+                    raise _StackDownloadError(
+                        error.replace(frame_item["fname"], item["fname"], 1)
+                    )
+                if unit_progress_callback:
+                    unit_progress_callback(frame_item["fname"], len(img_bytes))
+                try:
+                    arr = _tiff_bytes_to_array(img_bytes)
+                except Exception as e:
+                    raise _StackDownloadError(
+                        f"SKIP {item['fname']}: could not read frame TIFF ({e})"
+                    ) from e
+                finally:
+                    img_bytes = None
+                yield arr
 
         try:
-            write_imagej_time_stack(item["fpath"], frame_arrays)
+            frames = frame_arrays()
+            first_frame = next(frames)
+            _stream_time_stack(first_frame, frames, item["fpath"], len(item["frames"]))
+        except StopIteration:
+            return None, f"SKIP {item['fname']}: no time frames provided"
+        except _StackDownloadCancelled:
+            _cleanup_partial_file(item["fpath"])
+            return None, None
+        except _StackDownloadError as e:
+            _cleanup_partial_file(item["fpath"])
+            return None, str(e)
         except ImportError as e:
             return None, f"SKIP {item['fname']}: missing dependency ({e}); install tifffile"
         except Exception as e:
@@ -1399,7 +1454,7 @@ def _download_time_stack(host, token, item, state, state_lock, max_retries=3,
                 "channels": item["labels"],
                 "scan_times": item["scan_times"],
             }
-            save_state(state)
+            persist_state(state)
 
     return item["fname"], size
 
@@ -1451,11 +1506,11 @@ def download_scan_images(host, token, vessel_id, scan_time, output_dir,
             if fname is None:
                 if result:  # error message
                     with print_lock:
-                        print(f"  {result}")
+                        log.warning("%s", result)
             else:
                 downloaded += 1
                 with print_lock:
-                    print(f"  {fname} ({result:,} bytes)")
+                    log.info("%s (%s bytes)", fname, f"{result:,}")
                 if progress_callback:
                     progress_callback(fname, result, downloaded, total)
 
@@ -1465,7 +1520,8 @@ def download_scan_images(host, token, vessel_id, scan_time, output_dir,
 def download_collected_scan_items(host, token, to_download, state=None,
                                   max_workers=4, green_phase=False,
                                   progress_callback=None, stop_event=None,
-                                  hyperstack=False):
+                                  hyperstack=False, error_callback=None,
+                                  cache=None):
     """Download already-collected scan image or hyperstack items."""
     if not to_download:
         return 0
@@ -1479,7 +1535,8 @@ def download_collected_scan_items(host, token, to_download, state=None,
         if stop_event and stop_event.is_set():
             return None, None
         if hyperstack or "channels" in item:
-            return _download_hyperstack(host, token, item, state, state_lock)
+            return _download_hyperstack(host, token, item, state, state_lock,
+                                        cache=cache)
         return _download_single_image(host, token, item, state, state_lock, green_phase)
 
     workers = min(max_workers, total)
@@ -1492,11 +1549,13 @@ def download_collected_scan_items(host, token, to_download, state=None,
             if fname is None:
                 if result:
                     with print_lock:
-                        print(f"  {result}")
+                        log.warning("%s", result)
+                    if error_callback:
+                        error_callback(result)
             else:
                 downloaded += 1
                 with print_lock:
-                    print(f"  {fname} ({result:,} bytes)")
+                    log.info("%s (%s bytes)", fname, f"{result:,}")
                 if progress_callback:
                     progress_callback(fname, result, downloaded, total)
 
@@ -1509,7 +1568,7 @@ def download_time_stacks(host, token, vessel_id, scan_times, output_dir,
                          progress_callback=None, stop_event=None,
                          channel_hyperstack=False,
                          collection_callback=None,
-                         unit_progress_callback=None):
+                         unit_progress_callback=None, cache=None):
     """Download selected scans as one or more ImageJ time stacks."""
     to_download = collect_time_stacks(
         host, token, vessel_id, scan_times, output_dir,
@@ -1520,14 +1579,15 @@ def download_time_stacks(host, token, vessel_id, scan_times, output_dir,
     return download_collected_time_stack_items(
         host, token, to_download, state=state, max_workers=max_workers,
         progress_callback=progress_callback, stop_event=stop_event,
-        unit_progress_callback=unit_progress_callback)
+        unit_progress_callback=unit_progress_callback, cache=cache)
 
 
 def download_collected_time_stack_items(host, token, to_download,
                                         state=None, max_workers=2,
                                         progress_callback=None,
                                         stop_event=None,
-                                        unit_progress_callback=None):
+                                        unit_progress_callback=None,
+                                        error_callback=None, cache=None):
     """Download already-collected time stack items."""
     if not to_download:
         return 0
@@ -1554,7 +1614,8 @@ def download_collected_time_stack_items(host, token, to_download,
             return None, None
         return _download_time_stack(
             host, token, item, state, state_lock,
-            unit_progress_callback=emit_unit_progress)
+            unit_progress_callback=emit_unit_progress,
+            stop_event=stop_event, cache=cache)
 
     workers = min(max_workers, total)
     with ThreadPoolExecutor(max_workers=workers) as executor:
@@ -1566,11 +1627,13 @@ def download_collected_time_stack_items(host, token, to_download,
             if fname is None:
                 if result:
                     with print_lock:
-                        print(f"  {result}")
+                        log.warning("%s", result)
+                    if error_callback:
+                        error_callback(result)
             else:
                 downloaded += 1
                 with print_lock:
-                    print(f"  {fname} ({result:,} bytes)")
+                    log.info("%s (%s bytes)", fname, f"{result:,}")
                 if progress_callback:
                     progress_callback(fname, result, downloaded, total)
 
@@ -1602,255 +1665,3 @@ def extract_image_bytes(payload_data):
     return find_b64(payload_data)
 
 
-def build_watch_targets(args):
-    """Build list of (vessel_id, wells, channels) from watch args.
-
-    Combines --vessel/-w/--channels with --filter and --config sources.
-    Returns list of dicts: [{"vessel_id": int, "wells": set|None, "channels": set|None}, ...]
-    """
-    targets = []
-    channels = parse_channels(getattr(args, "channels", None))
-
-    # Single vessel from -v/--wells
-    vessel_id = getattr(args, "vessel", None)
-    if vessel_id is not None:
-        wells = parse_wells(getattr(args, "wells", None))
-        targets.append({"vessel_id": vessel_id, "wells": wells, "channels": channels})
-
-    # --filter args: "38:A1,B3" or "38"
-    for f in (getattr(args, "filter", None) or []):
-        vid, wells = parse_filter_arg(f)
-        targets.append({"vessel_id": vid, "wells": wells, "channels": channels})
-
-    # --config file
-    config_path = getattr(args, "config", None)
-    if config_path:
-        with open(config_path) as fh:
-            cfg = json.load(fh)
-        for entry in cfg.get("vessels", []):
-            vid = entry["id"]
-            wells_list = entry.get("wells")
-            if wells_list:
-                wells = parse_wells(",".join(wells_list))
-            else:
-                wells = None
-            ch = parse_channels(entry.get("channels"))
-            targets.append({"vessel_id": vid, "wells": wells, "channels": ch or channels})
-
-    if not targets:
-        print("ERROR: Specify at least one vessel via -v, --filter, or --config")
-        sys.exit(1)
-
-    return targets
-
-
-def cmd_watch(args):
-    """Poll for new images and download them automatically."""
-    host, token = authenticate(args)
-    output = Path(args.output)
-    output.mkdir(parents=True, exist_ok=True)
-    interval = args.interval * 60
-
-    targets = build_watch_targets(args)
-
-    print(f"\n=== Watch Mode ===")
-    print(f"  Host: {host}")
-    time_stack = getattr(args, "time_stack", False)
-    hyperstack = getattr(args, "hyperstack", False)
-    for t in targets:
-        well_desc = "all" if t["wells"] is None else f"{len(t['wells'])} wells"
-        ch_desc = "all" if t["channels"] is None else ",".join(
-            IMAGE_TYPE_SHORT_LABELS[v] for v in sorted(t["channels"], key=image_type_sort_key))
-        print(f"  Vessel {t['vessel_id']}: {well_desc}, channels={ch_desc}")
-    print(f"  Output: {output}")
-    if time_stack:
-        mode = "ImageJ time+channel hyperstack" if hyperstack else "ImageJ time stack"
-    else:
-        mode = "ImageJ hyperstack" if hyperstack else "separate TIFFs"
-    print(f"  Output mode: {mode}")
-    print(f"  Polling every {args.interval} minutes")
-    print(f"  Press Ctrl+C to stop\n")
-
-    state = load_state()
-
-    # Determine start date
-    start_from = getattr(args, "start_from", None)
-    print("Finding experiment start time...")
-    reference_time = find_first_scan_time(host, token)
-    if reference_time:
-        print(f"  First scan: {reference_time}")
-
-    if start_from and start_from.lower() == "first":
-        if reference_time:
-            start_date = reference_time.date()
-        else:
-            start_date = date.today()
-        print(f"  Starting from: {start_date}")
-    elif start_from:
-        start_date = datetime.strptime(start_from, "%Y-%m-%d").date()
-        print(f"  Starting from: {start_date}")
-    else:
-        start_date = date.today()
-
-    while True:
-        try:
-            # Re-authenticate if needed
-            host, token = authenticate(args)
-
-            now = datetime.now()
-            print(f"[{now:%H:%M:%S}] Checking for new scans...")
-
-            scans = collect_scans_in_range(host, token, start_date, now.date())
-
-            if not scans:
-                print("  No scans found.")
-            else:
-                new_count = 0
-                if time_stack:
-                    for t in targets:
-                        n = download_time_stacks(
-                            host, token, t["vessel_id"], scans, output,
-                            state, wells=t["wells"], channels=t["channels"],
-                            reference_time=reference_time,
-                            max_workers=getattr(args, "max_workers", 2),
-                            channel_hyperstack=hyperstack)
-                        if n:
-                            new_count += n
-                else:
-                    for scan_time in scans:
-                        for t in targets:
-                            n = download_scan_images(
-                                host, token, t["vessel_id"], scan_time, output,
-                                state, wells=t["wells"], channels=t["channels"],
-                                reference_time=reference_time,
-                                max_workers=getattr(args, "max_workers", 4),
-                                green_phase=getattr(args, "green_phase", False),
-                                hyperstack=hyperstack)
-                            if n:
-                                new_count += n
-
-                if new_count:
-                    print(f"  Downloaded {new_count} new files")
-                else:
-                    print(f"  No new files ({len(scans)} scans checked)")
-
-        except KeyboardInterrupt:
-            print("\nStopped.")
-            break
-        except Exception as e:
-            print(f"  Error: {e}")
-
-        try:
-            time.sleep(interval)
-        except KeyboardInterrupt:
-            print("\nStopped.")
-            break
-
-
-def cmd_status(args):
-    """Show current device status."""
-    host, token = authenticate(args)
-
-    print("\n=== Device Status ===\n")
-    try:
-        data = api_post(host, token, "Device/Status/GetDeviceStatusUpdate")
-        status = unpack_values(data.get("Data", {}))
-        print(json.dumps(status, indent=2, default=str)[:2000])
-    except Exception as e:
-        print(f"  Error: {e}")
-
-
-def main():
-    parser = argparse.ArgumentParser(
-        description="Incucyte Auto-Downloader — poll and download TIF images"
-    )
-    parser.add_argument("--host", default=DEFAULT_HOST,
-                        help=f"Incucyte device IP (default: {DEFAULT_HOST})")
-
-    sub = parser.add_subparsers(dest="command")
-
-    # probe
-    sub.add_parser("probe", help="Test connection to Incucyte device")
-
-    # login
-    p_login = sub.add_parser("login", help="Login and save credentials")
-    p_login.add_argument("--username", "-u", help="Incucyte username")
-    p_login.add_argument("--password", "-p", help="Incucyte password (plaintext)")
-
-    # vessels
-    sub.add_parser("vessels", help="List available vessels (experiments)")
-
-    # scans
-    p_scans = sub.add_parser("scans", help="List scan times")
-    p_scans.add_argument("--date", "-d", help="Date (YYYY-MM-DD, default: today)")
-
-    # download
-    p_dl = sub.add_parser("download", help="Download images for a vessel")
-    p_dl.add_argument("--vessel", "-v", type=int, required=True, help="Vessel ID")
-    p_dl.add_argument("--output", "-o", required=True, help="Output directory")
-    p_dl.add_argument("--date", "-d", help="Date (YYYY-MM-DD, default: today)")
-    p_dl.add_argument("--start-from", "-s", dest="start_from",
-                       help="Start date: 'first' for first scan, or YYYY-MM-DD (downloads all scans from this date to today)")
-    p_dl.add_argument("--scan-time", "-t", help="Filter to specific scan time")
-    p_dl.add_argument("--wells", "-w", help="Well filter (e.g. A1, A1,B3, A1-D4, all)")
-    p_dl.add_argument("--channels", "-c", help=f"Channel filter ({CHANNEL_HELP})")
-    p_dl.add_argument("--hyperstack", action="store_true",
-                       help="Save selected channels as one ImageJ hyperstack TIFF per well/site/time")
-    p_dl.add_argument("--time-stack", action="store_true",
-                       help="Save individual wells as ImageJ time stacks across selected scans")
-    p_dl.add_argument("--workers", type=int, default=4, dest="max_workers",
-                       help="Parallel download threads (default: 4)")
-    p_dl.add_argument("--green-lut", action="store_true", dest="green_phase",
-                       help="Apply green LUT to Phase images")
-    p_dl.add_argument("--no-green-lut", action="store_false", dest="green_phase",
-                       help="Keep Phase images as returned by the API (default)")
-    p_dl.set_defaults(green_phase=False)
-
-    # watch
-    p_watch = sub.add_parser("watch", help="Poll and auto-download new images")
-    p_watch.add_argument("--vessel", "-v", type=int, help="Vessel ID")
-    p_watch.add_argument("--wells", "-w", help="Well filter (e.g. A1, A1,B3, A1-D4, all)")
-    p_watch.add_argument("--channels", "-c", help=f"Channel filter ({CHANNEL_HELP})")
-    p_watch.add_argument("--hyperstack", action="store_true",
-                         help="Save selected channels as one ImageJ hyperstack TIFF per well/site/time")
-    p_watch.add_argument("--time-stack", action="store_true",
-                         help="Save individual wells as ImageJ time stacks across selected scans")
-    p_watch.add_argument("--filter", "-f", action="append",
-                         help="Vessel:wells filter (e.g. 38:A1,B3 or 39:D1-D4). Repeatable.")
-    p_watch.add_argument("--config", help="JSON config file with vessel/well filters")
-    p_watch.add_argument("--output", "-o", required=True, help="Output directory")
-    p_watch.add_argument("--interval", "-i", type=int, default=10,
-                         help="Poll interval in minutes (default: 10)")
-    p_watch.add_argument("--workers", type=int, default=4, dest="max_workers",
-                         help="Parallel download threads (default: 4)")
-    p_watch.add_argument("--green-lut", action="store_true", dest="green_phase",
-                         help="Apply green LUT to Phase images")
-    p_watch.add_argument("--no-green-lut", action="store_false", dest="green_phase",
-                         help="Keep Phase images as returned by the API (default)")
-    p_watch.set_defaults(green_phase=False)
-    p_watch.add_argument("--start-from", "-s", dest="start_from",
-                         help="Start date: 'first' for first scan, or YYYY-MM-DD (default: today)")
-
-    # status
-    sub.add_parser("status", help="Show device status")
-
-    args = parser.parse_args()
-
-    commands = {
-        "probe": cmd_probe,
-        "login": cmd_login,
-        "vessels": cmd_vessels,
-        "scans": cmd_scans,
-        "download": cmd_download,
-        "watch": cmd_watch,
-        "status": cmd_status,
-    }
-
-    if args.command in commands:
-        commands[args.command](args)
-    else:
-        parser.print_help()
-
-
-if __name__ == "__main__":
-    main()

@@ -3,9 +3,9 @@ requires = ["setuptools>=77", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "py-incucyte-gui"
-version = "0.1.1"
-description = "Python CLI and Tkinter GUI for downloading Incucyte live-cell imaging TIFFs."
+name = "PyIncucyte"
+version = "0.3.0"
+description = "Download Incucyte live-cell imaging TIFFs from Python, a CLI, or a desktop app."
 readme = "README.md"
 license = "BSD-3-Clause"
 license-files = ["LICENSE"]
@@ -15,15 +15,15 @@ authors = [
 ]
 keywords = [
     "incucyte",
-    "PyIncucyteGUI",
-    "py-incucyte-gui",
+    "pyincucyte",
     "microscopy",
     "live-cell imaging",
     "imagej",
     "tiff",
+    "automation",
 ]
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 4 - Beta",
     "Environment :: Console",
     "Environment :: Win32 (MS Windows)",
     "Intended Audience :: Science/Research",
@@ -36,25 +36,32 @@ classifiers = [
 dependencies = [
     "requests>=2.31",
     "urllib3>=2.0",
-    "pythonnet>=3.0",
     "Pillow>=10.0",
     "numpy>=1.24",
     "tifffile>=2023.7.10",
-    "zeep>=4.2",
+    # Only the login step needs the vendor .NET assembly, and only on Windows.
+    "pythonnet>=3.0; sys_platform == 'win32'",
 ]
 
 [project.optional-dependencies]
 dev = [
     "build>=1.2",
     "twine>=5.0",
+    "pytest>=8.0",
 ]
 
-[project.scripts]
-py-incucyte = "incucyte_downloader:main"
-py-incucyte-gui = "incucyte_gui:main"
-py_incucyte_gui = "incucyte_gui:main"
-incucyte-downloader = "incucyte_downloader:main"
+[project.urls]
+Homepage = "https://github.com/Jay2owe/PyIncucyteGUI"
+Source = "https://github.com/Jay2owe/PyIncucyteGUI"
+Issues = "https://github.com/Jay2owe/PyIncucyteGUI/issues"
 
-[tool.setuptools]
-py-modules = ["incucyte_downloader", "incucyte_gui"]
-packages = ["py_incucyte_gui"]
+[project.scripts]
+pyincucyte = "pyincucyte.cli:main"
+# The desktop app is also `pyincucyte gui`; this is the shortcut-friendly name.
+pyincucyte-gui = "pyincucyte.gui:main"
+
+[tool.setuptools.packages.find]
+include = ["pyincucyte*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
