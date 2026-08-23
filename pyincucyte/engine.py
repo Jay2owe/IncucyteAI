@@ -647,9 +647,73 @@ def is_missing_scan_vessel_error(error):
     )
 
 
+def _processing_index(sv, recipe):
+    """Per-location calibration coefficients and unmix pairs for one scan.
+
+    Built from the whole ``ImageInfos`` list, not the selected channels: the
+    channel being unmixed *out* is often one the user did not ask to keep.
+    """
+    if recipe is None or not getattr(recipe, "is_active", False):
+        return None
+    from pyincucyte import processing
+
+    images = sv.get("ImageInfos") or []
+    if not isinstance(images, list):
+        images = []
+    coefficients = {}
+    for img in images:
+        if not isinstance(img, dict):
+            continue
+        swell = img.get("Swell") or {}
+        swell_site = img.get("SwellSite") or {}
+        found = processing.coefficients_from_image(img)
+        if not found:
+            continue
+        key = (swell.get("RowZeroBased", 0), swell.get("ColumnZeroBased", 0),
+               swell_site.get("ValueZeroBased", 0))
+        coefficients.setdefault(key, {})[img.get("ImageType", 1)] = found
+
+    if recipe.uses_device_unmixing:
+        pairs = processing.unmix_pairs_from_scan(sv)
+    else:
+        pairs = processing.parse_unmix(recipe.unmix)
+    return {"coefficients": coefficients, "pairs": pairs, "recipe": recipe}
+
+
+def processing_tag(*plans):
+    """A short filename tag naming the preprocessing a file carries.
+
+    Raw and processed pixels must never share a filename: the tag is what stops
+    a second run with --calibrate from being skipped as "already downloaded",
+    and what stops a processed TIFF being read later as if it were raw.
+    """
+    real = [plan for plan in plans if plan]
+    if not real:
+        return ""
+    parts = []
+    if any(plan.get("calibrate") for plan in real):
+        parts.append("cal")
+    if any(plan.get("background") for plan in real):
+        parts.append("bg")
+    if any(plan.get("unmix") for plan in real):
+        parts.append("unmix")
+    return ("_" + "-".join(parts)) if parts else ""
+
+
+def _processing_plan(index, row, col, site, img_type):
+    """Resolve one image's processing, or None when there is nothing to do."""
+    if not index:
+        return None
+    from pyincucyte import processing
+
+    return processing.plan_for_image(
+        index["recipe"], img_type,
+        index["coefficients"].get((row, col, site), {}), index["pairs"])
+
+
 def collect_scan_images(host, token, vessel_id, scan_time, output_dir,
                         state=None, wells=None, channels=None,
-                        reference_time=None):
+                        reference_time=None, recipe=None):
     """Collect the list of images to download (without downloading them).
 
     Returns a list of dicts with keys: fname, fpath, state_key, row, col, site,
@@ -670,6 +734,7 @@ def collect_scan_images(host, token, vessel_id, scan_time, output_dir,
     images = sv.get("ImageInfos", [])
     if not isinstance(images, list):
         images = []
+    index = _processing_index(sv, recipe)
 
     scan_dt_obj = parse_scan_datetime(scan_time)
     elapsed = format_elapsed(scan_dt_obj - reference_time) if reference_time else None
@@ -690,18 +755,20 @@ def collect_scan_images(host, token, vessel_id, scan_time, output_dir,
 
         well_letter = chr(65 + row)
         well_name = f"{well_letter}{col + 1}"
+        plan = _processing_plan(index, row, col, site, img_type)
+        tag = processing_tag(plan)
         if elapsed:
-            fname = f"VID{vessel_id}_{well_name}_{img_type}_{elapsed}.tif"
+            fname = f"VID{vessel_id}_{well_name}_{img_type}_{elapsed}{tag}.tif"
         else:
             scan_dt = scan_time.replace(":", "").replace("-", "").split("+")[0].split("T")
             scan_tag = f"{scan_dt[0]}_{scan_dt[1]}" if len(scan_dt) == 2 else scan_time
-            fname = f"VID{vessel_id}_{well_name}_{img_type}_{scan_tag}.tif"
+            fname = f"VID{vessel_id}_{well_name}_{img_type}_{scan_tag}{tag}.tif"
         fpath = output_dir / fname
 
         if fpath.exists():
             continue
 
-        state_key = f"{vessel_id}_{scan_time}_{row}_{col}_{site}_{img_type}"
+        state_key = f"{vessel_id}_{scan_time}_{row}_{col}_{site}_{img_type}{tag}"
         if state and state_key in state.get("downloaded", {}):
             continue
 
@@ -709,6 +776,7 @@ def collect_scan_images(host, token, vessel_id, scan_time, output_dir,
             "fname": fname, "fpath": fpath, "state_key": state_key,
             "row": row, "col": col, "site": site, "img_type": img_type,
             "vessel_id": vessel_id, "scan_time": scan_time,
+            "processing": plan,
         })
 
     return to_download
@@ -716,7 +784,7 @@ def collect_scan_images(host, token, vessel_id, scan_time, output_dir,
 
 def collect_scan_hyperstacks(host, token, vessel_id, scan_time, output_dir,
                              state=None, wells=None, channels=None,
-                             reference_time=None):
+                             reference_time=None, recipe=None):
     """Collect ImageJ hyperstacks to create for a scan.
 
     A hyperstack item groups all selected channel payloads for one
@@ -737,6 +805,7 @@ def collect_scan_hyperstacks(host, token, vessel_id, scan_time, output_dir,
     images = sv.get("ImageInfos", [])
     if not isinstance(images, list):
         images = []
+    index = _processing_index(sv, recipe)
 
     grouped = {}
     for img in images:
@@ -756,6 +825,7 @@ def collect_scan_hyperstacks(host, token, vessel_id, scan_time, output_dir,
         grouped.setdefault(key, {})[img_type] = {
             "row": row, "col": col, "site": site, "img_type": img_type,
             "vessel_id": vessel_id, "scan_time": scan_time,
+            "processing": _processing_plan(index, row, col, site, img_type),
         }
 
     scan_dt_obj = parse_scan_datetime(scan_time)
@@ -773,18 +843,20 @@ def collect_scan_hyperstacks(host, token, vessel_id, scan_time, output_dir,
         ch_tag = channel_tag(ordered_types)
         well_letter = chr(65 + row)
         well_name = f"{well_letter}{col + 1}"
+        tag = processing_tag(*(by_type[t].get("processing") for t in ordered_types))
         if elapsed:
-            fname = f"VID{vessel_id}_{well_name}_{ch_tag}_{elapsed}.tif"
+            fname = f"VID{vessel_id}_{well_name}_{ch_tag}_{elapsed}{tag}.tif"
         else:
             scan_dt = scan_time.replace(":", "").replace("-", "").split("+")[0].split("T")
             scan_tag = f"{scan_dt[0]}_{scan_dt[1]}" if len(scan_dt) == 2 else scan_time
-            fname = f"VID{vessel_id}_{well_name}_{ch_tag}_{scan_tag}.tif"
+            fname = f"VID{vessel_id}_{well_name}_{ch_tag}_{scan_tag}{tag}.tif"
         fpath = output_dir / fname
 
         if fpath.exists():
             continue
 
-        state_key = f"hyperstack_{vessel_id}_{scan_time}_{row}_{col}_{site}_{ch_tag}"
+        state_key = (f"hyperstack_{vessel_id}_{scan_time}_{row}_{col}_{site}_"
+                     f"{ch_tag}{tag}")
         if state and state_key in state.get("downloaded", {}):
             continue
 
@@ -802,7 +874,8 @@ def collect_scan_hyperstacks(host, token, vessel_id, scan_time, output_dir,
 def collect_time_stacks(host, token, vessel_id, scan_times, output_dir,
                         state=None, wells=None, channels=None,
                         reference_time=None, channel_hyperstack=False,
-                        progress_callback=None, stop_event=None, max_workers=1):
+                        progress_callback=None, stop_event=None, max_workers=1,
+                        recipe=None):
     """Collect time stacks to create across multiple scan times.
 
     When channel_hyperstack is False, returns one stack per well/site/channel.
@@ -816,7 +889,7 @@ def collect_time_stacks(host, token, vessel_id, scan_times, output_dir,
 
     def fetch_images(scan_time):
         if stop_event and stop_event.is_set():
-            return scan_time, []
+            return scan_time, [], None
         try:
             sv_data = api_post(host, token, "Vessels/GetScanVessel", {
                 "VesselID": vessel_id,
@@ -825,16 +898,16 @@ def collect_time_stacks(host, token, vessel_id, scan_times, output_dir,
             })
         except RuntimeError as e:
             if is_missing_scan_vessel_error(e):
-                return scan_time, []
+                return scan_time, [], None
             raise
 
         sv = unpack_values(sv_data.get("Data", {}))
         images = sv.get("ImageInfos", [])
         if not isinstance(images, list):
             images = []
-        return scan_time, images
+        return scan_time, images, _processing_index(sv, recipe)
 
-    def add_images(scan_time, images):
+    def add_images(scan_time, images, index=None):
         for img in images:
             swell = img.get("Swell", {})
             swell_site = img.get("SwellSite", {})
@@ -852,6 +925,7 @@ def collect_time_stacks(host, token, vessel_id, scan_times, output_dir,
             grouped.setdefault(key, {}).setdefault(scan_time, {})[img_type] = {
                 "row": row, "col": col, "site": site, "img_type": img_type,
                 "vessel_id": vessel_id, "scan_time": scan_time,
+                "processing": _processing_plan(index, row, col, site, img_type),
             }
 
     if total_scans:
@@ -867,11 +941,11 @@ def collect_time_stacks(host, token, vessel_id, scan_times, output_dir,
         for scan_time in scan_times:
             if stop_event and stop_event.is_set():
                 break
-            scan_time, images = fetch_images(scan_time)
+            scan_time, images, index = fetch_images(scan_time)
             completed_scans += 1
             if progress_callback:
                 progress_callback(vessel_id, scan_time, completed_scans, total_scans)
-            add_images(scan_time, images)
+            add_images(scan_time, images, index)
     else:
         executor = ThreadPoolExecutor(max_workers=workers)
         try:
@@ -882,11 +956,11 @@ def collect_time_stacks(host, token, vessel_id, scan_times, output_dir,
                     for pending in futures:
                         pending.cancel()
                     break
-                scan_time, images = future.result()
+                scan_time, images, index = future.result()
                 completed_scans += 1
                 if progress_callback:
                     progress_callback(vessel_id, scan_time, completed_scans, total_scans)
-                add_images(scan_time, images)
+                add_images(scan_time, images, index)
         finally:
             executor.shutdown(wait=True, cancel_futures=True)
 
@@ -918,8 +992,12 @@ def collect_time_stacks(host, token, vessel_id, scan_times, output_dir,
                 continue
 
             ch_tag = channel_tag(selected_types)
-            fname = f"VID{vessel_id}_{well_name}_{ch_tag}_timestack.tif"
-            state_key = f"timestack_hyper_{vessel_id}_{row}_{col}_{site}_{ch_tag}"
+            tag = processing_tag(*(channel.get("processing")
+                                   for frame in frames
+                                   for channel in frame["channels"]))
+            fname = f"VID{vessel_id}_{well_name}_{ch_tag}_timestack{tag}.tif"
+            state_key = (f"timestack_hyper_{vessel_id}_{row}_{col}_{site}_"
+                         f"{ch_tag}{tag}")
             labels = [image_type_label(img_type) for img_type in selected_types]
             frame_times = [frame["scan_time"] for frame in frames]
             fpath = output_dir / fname
@@ -944,8 +1022,9 @@ def collect_time_stacks(host, token, vessel_id, scan_times, output_dir,
                 continue
 
             ch_tag = IMAGE_TYPE_SHORT_LABELS.get(img_type, f"type{img_type}")
-            fname = f"VID{vessel_id}_{well_name}_{ch_tag}_timestack.tif"
-            state_key = f"timestack_{vessel_id}_{row}_{col}_{site}_{ch_tag}"
+            tag = processing_tag(*(frame.get("processing") for frame in frames))
+            fname = f"VID{vessel_id}_{well_name}_{ch_tag}_timestack{tag}.tif"
+            state_key = f"timestack_{vessel_id}_{row}_{col}_{site}_{ch_tag}{tag}"
             frame_times = [frame["scan_time"] for frame in frames]
             fpath = output_dir / fname
             state_info = downloaded_state.get(state_key, {})
@@ -966,7 +1045,7 @@ def collect_scan_items_parallel(host, token, vessel_id, scan_times, output_dir,
                                 state=None, wells=None, channels=None,
                                 reference_time=None, hyperstack=False,
                                 max_workers=4, progress_callback=None,
-                                stop_event=None):
+                                stop_event=None, recipe=None):
     """Collect per-scan image or hyperstack download items using parallel scan checks."""
     scan_times = sorted(scan_times, key=parse_scan_datetime)
     total_scans = len(scan_times)
@@ -987,7 +1066,7 @@ def collect_scan_items_parallel(host, token, vessel_id, scan_times, output_dir,
         items = collector(
             host, token, vessel_id, scan_time, output_dir,
             state=state, wells=wells, channels=channels,
-            reference_time=reference_time)
+            reference_time=reference_time, recipe=recipe)
         return scan_time, items
 
     completed = 0
@@ -1075,7 +1154,7 @@ def _fetch_payload(host, token, item, max_retries=3, cache=None):
 
 
 def _download_single_image(host, token, item, state, state_lock, green_phase=False,
-                           max_retries=3):
+                           max_retries=3, cache=None):
     """Download a single image with retry. Returns (fname, size) on success, None on failure."""
     img_bytes, error = _fetch_scan_vessel_image_bytes(host, token, item, max_retries)
     if error:
@@ -1089,18 +1168,34 @@ def _download_single_image(host, token, item, state, state_lock, green_phase=Fal
             # The LUT is cosmetic; a failure must not cost us the image.
             log.debug("green LUT failed for %s: %s", item["fname"], exc)
 
-    item["fpath"].write_bytes(img_bytes)
+    if item.get("processing"):
+        # Processed pixels are no longer the bytes the device sent, so the file
+        # has to be rebuilt rather than passed through.
+        try:
+            array = _payload_array(host, token, item, img_bytes, max_retries,
+                                   cache=cache)
+            _write_plain_tiff(item["fpath"], array)
+        except ImportError as exc:
+            return None, (f"SKIP {item['fname']}: missing dependency ({exc}); "
+                          f"install tifffile")
+        except Exception as exc:
+            _cleanup_partial_file(item["fpath"])
+            return None, f"SKIP {item['fname']}: could not process image ({exc})"
+        size = item["fpath"].stat().st_size
+    else:
+        item["fpath"].write_bytes(img_bytes)
+        size = len(img_bytes)
 
     if state is not None:
         with state_lock:
             state.setdefault("downloaded", {})[item["state_key"]] = {
                 "file": str(item["fpath"]),
                 "time": datetime.now().isoformat(),
-                "size": len(img_bytes),
+                "size": size,
             }
             persist_state(state)
 
-    return item["fname"], len(img_bytes)
+    return item["fname"], size
 
 
 def _tiff_bytes_to_array(tif_bytes):
@@ -1113,6 +1208,39 @@ def _tiff_bytes_to_array(tif_bytes):
     if arr.ndim == 3:
         arr = arr[..., 0]
     return arr
+
+
+def _payload_array(host, token, item, tif_bytes, max_retries=3, cache=None):
+    """Decode a payload, applying whatever preprocessing the item carries.
+
+    Unmixing is the one step that needs a second image, so this is also where
+    the contributor channel is fetched - through the payload cache, because a
+    time stack asks for the same contributor once per frame.
+    """
+    array = _tiff_bytes_to_array(tif_bytes)
+    plan = item.get("processing")
+    if not plan:
+        return array
+    from pyincucyte import processing
+
+    def fetch_contributor(img_type):
+        other = {k: v for k, v in item.items() if k != "processing"}
+        other["img_type"] = img_type
+        other["fname"] = f"{item.get('fname', 'image')}:unmix{img_type}"
+        raw, error = _fetch_payload(host, token, other, max_retries, cache=cache)
+        if error or not raw:
+            raise ValueError(
+                f"could not read channel {img_type} to unmix it out ({error})")
+        return _tiff_bytes_to_array(raw)
+
+    return processing.apply(array, plan, fetch_contributor)
+
+
+def _write_plain_tiff(path, array):
+    """Write one processed plane on its own - 32-bit float when calibrated."""
+    import tifffile
+
+    tifffile.imwrite(str(path), array, photometric="minisblack")
 
 
 def _common_hyperstack_dtype(arrays):
@@ -1239,7 +1367,8 @@ def _download_hyperstack(host, token, item, state, state_lock, max_retries=3,
         if error:
             return None, error.replace(channel_item["fname"], item["fname"], 1)
         try:
-            arrays.append(_tiff_bytes_to_array(img_bytes))
+            arrays.append(_payload_array(host, token, channel_item, img_bytes,
+                                         max_retries, cache=cache))
             labels.append(image_type_label(channel_item["img_type"]))
         except Exception as e:
             return None, f"SKIP {item['fname']}: could not read channel TIFF ({e})"
@@ -1371,7 +1500,9 @@ def _download_time_stack(host, token, item, state, state_lock, max_retries=3,
                     if unit_progress_callback:
                         unit_progress_callback(channel_item["fname"], len(img_bytes))
                     try:
-                        channel_arrays.append(_tiff_bytes_to_array(img_bytes))
+                        channel_arrays.append(_payload_array(
+                            host, token, channel_item, img_bytes, max_retries,
+                            cache=cache))
                     except Exception as e:
                         raise _StackDownloadError(
                             f"SKIP {item['fname']}: could not read channel TIFF ({e})"
@@ -1415,7 +1546,8 @@ def _download_time_stack(host, token, item, state, state_lock, max_retries=3,
                 if unit_progress_callback:
                     unit_progress_callback(frame_item["fname"], len(img_bytes))
                 try:
-                    arr = _tiff_bytes_to_array(img_bytes)
+                    arr = _payload_array(host, token, frame_item, img_bytes,
+                                         max_retries, cache=cache)
                 except Exception as e:
                     raise _StackDownloadError(
                         f"SKIP {item['fname']}: could not read frame TIFF ({e})"
@@ -1494,7 +1626,8 @@ def download_scan_images(host, token, vessel_id, scan_time, output_dir,
             return None, None
         if hyperstack:
             return _download_hyperstack(host, token, item, state, state_lock)
-        return _download_single_image(host, token, item, state, state_lock, green_phase)
+        return _download_single_image(host, token, item, state, state_lock,
+                                      green_phase, cache=cache)
 
     workers = min(max_workers, total)
     with ThreadPoolExecutor(max_workers=workers) as executor:

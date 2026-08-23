@@ -613,6 +613,10 @@ class IncucyteClient:
         scan_times = options.filter_scan_times(scan_times, window_start, window_end)
 
         channel_set = options.channel_set
+        recipe = options.recipe
+        if recipe.is_active:
+            _call(progress, ProgressEvent(
+                stage="planning", detail=f"Preprocessing: {recipe.describe()}"))
         state = StateStore.for_output(output_dir, scope=options.state_scope)
         state_dict = state.as_dict()
 
@@ -639,14 +643,14 @@ class IncucyteClient:
                     state=state_dict, wells=selection, channels=channel_set,
                     reference_time=reference, channel_hyperstack=hyperstack,
                     progress_callback=on_item, stop_event=cancel,
-                    max_workers=options.workers)
+                    max_workers=options.workers, recipe=recipe)
             else:
                 items += engine.collect_scan_items_parallel(
                     self.host, token, vessel.id, vessel_scans, output_dir,
                     state=state_dict, wells=selection, channels=channel_set,
                     reference_time=reference, hyperstack=hyperstack,
                     max_workers=options.workers,
-                    progress_callback=on_item, stop_event=cancel)
+                    progress_callback=on_item, stop_event=cancel, recipe=recipe)
 
         labels = dict(ch.IMAGE_TYPE_LABELS)
         for vessel in vessels:
@@ -730,7 +734,13 @@ class IncucyteClient:
         # A time stack must hold every frame, so one new scan rebuilds the whole
         # file.  Caching the source payloads keeps that a disk read rather than
         # a fresh download of the entire experiment on every poll.
-        cache = cache_for_output(plan.output_dir, mode=options.cache_payloads,
+        # Unmixing reads the other channel for every image it corrects, so
+        # without a cache a time stack pulls the contributor down once per
+        # frame.  That is exactly what the cache exists to stop.
+        cache_mode = options.cache_payloads
+        if cache_mode == "auto" and options.recipe.wants_unmixing:
+            cache_mode = "always"
+        cache = cache_for_output(plan.output_dir, mode=cache_mode,
                                  layout=plan.layout)
 
         def record(fname, size):
@@ -926,6 +936,22 @@ def _channel_matches(vessel, channel):
                if number in active)
 
 
+def _item_processed(item):
+    """True when this output file's pixels were altered from what was stored."""
+    if item.get("processing"):
+        return True
+    for channel in item.get("channels") or ():
+        if channel.get("processing"):
+            return True
+    for frame in item.get("frames") or ():
+        if frame.get("processing"):
+            return True
+        for channel in frame.get("channels") or ():
+            if channel.get("processing"):
+                return True
+    return False
+
+
 def _scans_from(scan_times, reference):
     """Drop scan times that predate a vessel's own first scan."""
     if reference is None:
@@ -971,6 +997,9 @@ def _output_file(item, plan, size):
             elapsed = ""
 
     return OutputFile(
+        processed=_item_processed(item),
+        processing=(plan.options.processing_description
+                    if plan.options is not None else ""),
         path=Path(item["fpath"]),
         vessel_id=item.get("vessel_id"),
         vessel_name=vessel.name if vessel else "",

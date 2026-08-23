@@ -64,6 +64,9 @@ LAYOUT_ORDER = ("separate", "channel_stack", "time_stack", "time_channel_stack")
 #: full-size image off the device - so a preview stops at this many.
 PREVIEW_MAX_IMAGES = DEFAULT_MAX_IMAGES
 
+#: What the processing drop-downs show when a step is switched off.
+PROCESSING_OFF = "off"
+
 
 class App:
     """Controller and view for the main window."""
@@ -355,6 +358,7 @@ class App:
         """A compact two-column form: caption on the left, control on the right."""
         card = Card(parent, title="EXPORT", theme=self.theme)
         card.grid(row=0, column=0, sticky="nsew", pady=(0, theme_mod.PAD_M))
+        self.export_card = card
         body = card.body
         body.columnconfigure(1, weight=1)
         row = 0
@@ -504,6 +508,48 @@ class App:
             f"Writes {MANIFEST_FILENAME} and a CSV index listing every file with "
             f"its well, channel and timepoint - what an analysis pipeline reads "
             f"instead of parsing filenames.", self.theme)
+        row += 1
+
+        # -- preprocessing -------------------------------------------------
+        caption("Processing", row)
+        processing_row = line(row)
+        self.calibrate_var = tk.BooleanVar(value=False)
+        calibrate_check = ttk.Checkbutton(
+            processing_row, text="Calibrated units",
+            variable=self.calibrate_var, command=self._refresh_summary)
+        calibrate_check.pack(side="left", padx=(0, theme_mod.PAD_M))
+        tip(calibrate_check,
+            "Convert raw camera counts to the instrument's calibrated units "
+            "(GCU/RCU) using its own Scale and Bias, and write 32-bit float. "
+            "Phase has no calibration and is never touched.", self.theme)
+
+        ttk.Label(processing_row, text="Unmix", style="Muted.TLabel").pack(
+            side="left", padx=(0, theme_mod.PAD_XS))
+        self.unmix_var = tk.StringVar(value=PROCESSING_OFF)
+        unmix_box = ttk.Combobox(processing_row, textvariable=self.unmix_var,
+                                 values=(PROCESSING_OFF, "device"), width=13)
+        unmix_box.pack(side="left", padx=(0, theme_mod.PAD_M))
+        unmix_box.bind("<<ComboboxSelected>>",
+                       lambda _event: self._refresh_summary())
+        tip(unmix_box,
+            "Linear (spectral) unmixing. 'device' uses the percentages saved "
+            "on the vessel in the Incucyte software; or type a term like "
+            "green:8%red. Reading the other channel costs an extra download "
+            "per image.", self.theme)
+
+        ttk.Label(processing_row, text="Background", style="Muted.TLabel").pack(
+            side="left", padx=(0, theme_mod.PAD_XS))
+        self.background_var = tk.StringVar(value=PROCESSING_OFF)
+        background_box = ttk.Combobox(
+            processing_row, textvariable=self.background_var,
+            values=(PROCESSING_OFF, "device"), width=9)
+        background_box.pack(side="left")
+        background_box.bind("<<ComboboxSelected>>",
+                            lambda _event: self._refresh_summary())
+        tip(background_box,
+            "Subtract a background level before unmixing. 'device' uses the "
+            "level the instrument measured for each image, or type a number "
+            "of raw counts.", self.theme)
 
     # -- summary + actions ----------------------------------------------
 
@@ -973,6 +1019,12 @@ class App:
         else:
             estimate = (f"{count:,} stack files in total · "
                         f"about {human_bytes(size)} of source images per scan time.")
+        recipe = ExportOptions(
+            calibrate=bool(self.calibrate_var.get()),
+            unmix=_processing_value(self.unmix_var.get()),
+            background=_processing_value(self.background_var.get())).recipe
+        if recipe.is_active:
+            estimate += f" Pixels: {recipe.describe()}."
         self.estimate_var.set(estimate + " Press Preview for the exact count.")
 
         example_channels = "-".join(
@@ -1043,6 +1095,9 @@ class App:
             start_from=start_from,
             end_at=end_at,
             green_lut=bool(self.green_lut_var.get()),
+            calibrate=bool(self.calibrate_var.get()),
+            unmix=_processing_value(self.unmix_var.get()),
+            background=_processing_value(self.background_var.get()),
             workers=int(self.workers_var.get() or 4),
             interval_minutes=int(self.interval_var.get() or 10),
             host=self.host_var.get().strip() or DEFAULT_HOST,
@@ -1061,6 +1116,9 @@ class App:
         self.workers_var.set(options.workers)
         self.interval_var.set(options.interval_minutes)
         self.green_lut_var.set(options.green_lut)
+        self.calibrate_var.set(options.calibrate)
+        self.unmix_var.set(options.unmix or PROCESSING_OFF)
+        self.background_var.set(options.background or PROCESSING_OFF)
         self.manifest_var.set(options.write_manifest)
 
         self._set_choice(self.start_var, self.custom_date_var,
@@ -1506,6 +1564,12 @@ class App:
         except Exception:
             pass
         self.root.destroy()
+
+
+def _processing_value(text):
+    """An empty option and the word shown for "off" mean the same thing."""
+    value = str(text or "").strip()
+    return "" if value.lower() in ("", PROCESSING_OFF) else value
 
 
 def main():

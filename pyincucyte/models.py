@@ -323,6 +323,8 @@ class OutputFile:
     elapsed: str = ""                                # e.g. "01d06h30m"
     bytes: int = 0
     vessel_name: str = ""
+    processed: bool = False      # were these pixels altered after download?
+    processing: str = ""         # ...and how, in one line
 
     @property
     def frame_count(self):
@@ -457,6 +459,9 @@ class ExportPlan:
                  f"{LAYOUT_DESCRIPTIONS[self.layout]}")
         if self.window:
             scope += f"\n{self.window_description}"
+        recipe = getattr(self.options, "recipe", None)
+        if recipe is not None and recipe.is_active:
+            scope += f"\nPixels: {recipe.describe()}"
         if self.is_empty:
             return scope + "\nNothing to download - every selected image is already on disk."
         work = " - ".join([

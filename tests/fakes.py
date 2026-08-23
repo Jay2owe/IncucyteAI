@@ -48,24 +48,42 @@ def vessel_record(vessel_id=38, name="Test plate", plate="Sarstedt 24-well",
     }
 
 
-def image_info(row, col, image_type, site=0):
-    return {
+def image_info(row, col, image_type, site=0, scale=None, bias=0.0, median=0.0):
+    """One ImageInfos entry. Fluorescence carries calibration, Phase does not."""
+    info = {
         "Swell": {"RowZeroBased": row, "ColumnZeroBased": col},
         "SwellSite": {"ValueZeroBased": site},
         "ImageType": image_type,
     }
+    if scale is not None:
+        info.update({"Scale": scale, "Bias": bias, "ImageMedian": median,
+                     "NoiseStd": 0.0134})
+    return info
+
+
+def unmix_pair(recipient, contributor, ratio, sigma=0.0):
+    """One ColorUnmixes entry. Colours are numbered 1 and 2, not 2 and 3."""
+    return {"Recipient": recipient, "Contributor": contributor,
+            "ValueRatio": ratio, "BlurringSigma": sigma}
 
 
 class FakeDevice:
     """Answers the handful of routes planning and downloading actually use."""
 
     def __init__(self, vessels=None, scans=None, wells=((0, 0), (0, 1)),
-                 channels=(1, 2), missing_scans=()):
+                 channels=(1, 2), missing_scans=(), calibration=None,
+                 unmixes=None, pixels=None):
         self.vessels = list(vessels or [vessel_record()])
         self.scans = list(scans or ["2026-03-01T09:00:00", "2026-03-01T12:00:00"])
         self.wells = list(wells)
         self.channels = list(channels)
         self.missing_scans = set(missing_scans)
+        #: channel number -> (Scale, Bias, ImageMedian), as the real device
+        #: reports for fluorescence and never for Phase.
+        self.calibration = dict(calibration or {})
+        self.unmixes = list(unmixes or [])
+        #: channel number -> the value every pixel of that channel holds.
+        self.pixels = dict(pixels or {})
         self.calls = []
         self.fetches = []
 
@@ -84,9 +102,16 @@ class FakeDevice:
                 raise engine.ApiError(
                     "API exception: ScanNotFoundException - Vessel ID='38' "
                     "existing scan was not found")
-            infos = [image_info(r, c, t)
-                     for (r, c) in self.wells for t in self.channels]
-            return {"Data": {"ImageInfos": infos}}
+            infos = []
+            for (r, c) in self.wells:
+                for t in self.channels:
+                    scale, bias, median = self.calibration.get(t, (None, 0.0, 0.0))
+                    infos.append(image_info(r, c, t, scale=scale, bias=bias,
+                                            median=median))
+            scan = {"ImageInfos": infos}
+            if self.unmixes:
+                scan["ColorUnmixes"] = {"$values": list(self.unmixes)}
+            return {"Data": scan}
         if route == "Device/Status/GetDeviceStatusUpdate":
             return {"Data": {"State": "Idle"}}
         raise AssertionError(f"unexpected route {route}")
@@ -95,7 +120,8 @@ class FakeDevice:
 
     def fetch_image(self, host, token, item, max_retries=3):
         self.fetches.append(item.get("fname"))
-        return tiff_bytes(value=item.get("img_type", 1)), None
+        img_type = item.get("img_type", 1)
+        return tiff_bytes(value=self.pixels.get(img_type, img_type)), None
 
 
 @contextmanager

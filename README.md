@@ -84,6 +84,8 @@ pyincucyte download -v 38 -o ./images --start-from first
 pyincucyte download -v 38 -o ./images --wells D2-D5 --channels phase,green \
                     --layout time_stack
 pyincucyte watch    -v 38 -o ./images -i 10 --start-from first
+
+pyincucyte download -v 38 -o ./images --calibrate --unmix device
 ```
 
 Useful anywhere: `--json` for machine-readable output, `--preset FILE` to load a
@@ -157,6 +159,9 @@ still works.
 | `-t`, `--scan-time` | Only scan times containing this text |
 | `--workers` | Parallel fetches (default 4) |
 | `--green-lut` / `--no-green-lut` | Recolour Phase as green RGB (display only) |
+| `--calibrate` / `--no-calibrate` | Write fluorescence in calibrated units, 32-bit float |
+| `--unmix` | `device`, or a term like `green:8%red` |
+| `--background` | `device`, or a number of raw counts |
 | `--state-scope` | `auto` (default), `folder`, `global`, `none` |
 | `--cache` | `auto` (default), `always`, `never` — cache source payloads |
 | `--no-manifest` | Skip writing the manifest and CSV index |
@@ -234,6 +239,56 @@ full-size image off the wire — hence `max_images` (24 by default), and hence t
 in-memory cache that makes a second look free. And the tiles are downsampled and
 contrast-stretched so a 16-bit fluorescence frame is visible at all: they are
 for recognition, never for measurement.
+
+### Preprocessing
+
+The instrument's own export wizard offers *As Displayed* (a picture, with
+everything on screen baked in) and *As Stored* ("the raw data" — Sartorius is
+explicit that "user-specified settings are not reflected in this type of
+export"). PyIncucyte downloads the *As Stored* pixels, so nothing arrives
+preprocessed.
+
+What does arrive, in the scan metadata the planner already reads, are the
+instrument's own coefficients — `Scale`/`Bias` per image, the `ImageMedian`
+background it measured, and the `ColorUnmixes` percentages somebody set in the
+Incucyte software. Three options turn those into the same corrections, without
+retyping anything:
+
+```python
+incucyte.fetch(vessel=38, output="./run-01",
+               calibrate=True,        # counts -> calibrated units, 32-bit float
+               background="device",   # the level the instrument measured
+               unmix="device")        # the vessel's own saved percentages
+```
+
+| Option | Values | What it does |
+|---|---|---|
+| `calibrate` | `True` / `False` | `(raw - Bias) / Scale`, written as 32-bit float in GCU/RCU |
+| `background` | `"device"`, a number, `""` | subtracts a background level in raw counts |
+| `unmix` | `"device"`, `"green:8%red"`, `""` | subtracts a fraction of the other channel |
+
+All three default to off, apply in the order **calibrate → background → unmix →
+clip at zero**, and never touch Phase, which has no calibration. An explicit
+unmix term reads `recipient:amount contributor`, optionally with `@2` to blur
+the contributor first as the device's `BlurringSigma` does; several terms are
+comma-separated.
+
+Three things worth knowing:
+
+- **Processed files are named for it** — `VID38_A1_2_00d00h00m_cal-unmix.tif`.
+  That keeps raw and corrected pixels from ever sharing a filename, and it is
+  what lets a second run with a different recipe resume properly instead of
+  deciding it already has the file.
+- **Unmixing reads the other channel**, so it costs an extra download per image
+  when that channel was not selected. The payload cache is switched on
+  automatically when unmixing to keep a time stack from re-fetching it per frame.
+- **It is not guaranteed bit-identical to the Incucyte's own export.** Sartorius
+  does not publish the order it applies these in, and the direction of `Scale`
+  is inferred from the manual's worked example. Check one well against a
+  "Green calibrated" export before trusting a whole experiment to it.
+
+The recipe is recorded in `pyincucyte-manifest.json` (under `options`) and on
+every file entry, so a later pipeline stage can always tell what it is reading.
 
 ### What you get back
 
@@ -321,6 +376,7 @@ PyIncucyte/
     state.py        resume ledger, scoped to the output folder
     cache.py        source-payload cache, so rebuilt stacks do not re-download
     preview.py      find a vessel by name, and look at its wells
+    processing.py   optional preprocessing: calibration, background, unmixing
     watch.py        Watcher - poll and download in a background thread
     engine.py       wire-level REST and ImageJ TIFF writing
     cli.py          command line

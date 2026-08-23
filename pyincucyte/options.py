@@ -121,6 +121,11 @@ class ExportOptions:
     end_at: str = None
     scan_filter: str = None
     green_lut: bool = False
+    # Preprocessing, all off by default: the device sends raw pixels and that
+    # is what a measurement pipeline should get unless it asks otherwise.
+    calibrate: bool = False        # raw counts -> calibrated units, 32-bit float
+    background: str = ""           # "", "device", or a number of raw counts
+    unmix: str = ""                # "", "device", or "green<8%red"
     workers: int = 4
     interval_minutes: int = 10
     host: str = None
@@ -348,9 +353,21 @@ class ExportOptions:
         """Return a copy with fields changed (options are treated as values)."""
         return replace(self, **changes)
 
+    @property
+    def recipe(self):
+        """The preprocessing these options ask for."""
+        from .processing import Recipe
+
+        return Recipe.from_options(self)
+
+    @property
+    def processing_description(self):
+        return self.recipe.describe()
+
     def validate(self):
         """Return a list of human-readable problems; empty means good to go."""
         problems = []
+        problems += self.recipe.validate()
         if not self.output:
             problems.append("No output folder chosen.")
         if not self.vessels:
@@ -381,6 +398,10 @@ class ExportOptions:
             "end_at": self.end_at,
             "scan_filter": self.scan_filter,
             "green_lut": self.green_lut,
+            "calibrate": self.calibrate,
+            "background": self.background,
+            "unmix": self.unmix,
+            "processing": self.recipe.to_dict(),
             "workers": self.workers,
             "interval_minutes": self.interval_minutes,
             "state_scope": self.state_scope,
@@ -407,6 +428,9 @@ class ExportOptions:
         if "max_workers" in data and "workers" not in data:
             data["workers"] = data.pop("max_workers")
         data.pop("max_workers", None)
+        # `processing` is a description written for humans reading a manifest;
+        # the three fields it describes are what actually round trips.
+        data.pop("processing", None)
         known = {f for f in cls.__dataclass_fields__}
         return cls(**{k: v for k, v in data.items() if k in known})
 
@@ -454,6 +478,12 @@ class ExportOptions:
             args += ["--scan-time", _quote(self.scan_filter)]
         if self.green_lut:
             args.append("--green-lut")
+        if self.calibrate:
+            args.append("--calibrate")
+        if self.unmix:
+            args += ["--unmix", _quote(self.unmix)]
+        if self.background:
+            args += ["--background", _quote(self.background)]
         if self.workers != 4:
             args += ["--workers", str(self.workers)]
         if command == "watch":

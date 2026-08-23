@@ -26,6 +26,7 @@ from .models import (
     LAYOUT_DESCRIPTIONS, LAYOUTS, human_bytes, layout_from_flags, resolve_layout,
 )
 from .preview import DEFAULT_MAX_IMAGES, DEFAULT_SIZE
+from .processing import BACKGROUND_HELP, UNMIX_HELP
 from .options import (
     END_NOW, ExportOptions, MOMENT_HELP, START_FIRST, START_TODAY,
     parse_duration, parse_moment,
@@ -42,6 +43,15 @@ WHEN_HELP = ("YYYY-MM-DD, YYYY-MM-DD HH:MM, or a relative offset "
 # ---------------------------------------------------------------------------
 # output helpers
 # ---------------------------------------------------------------------------
+
+def literal(text):
+    """Escape a help string for argparse, which %-formats what it is given.
+
+    The unmix help contains a literal "8%", and argparse reads "%r" in it as a
+    format spec - which turns `--help` into a traceback.
+    """
+    return str(text).replace("%", "%%")
+
 
 def emit(text=""):
     print(text)
@@ -168,6 +178,12 @@ def options_from_args(args, *, require_output=True):
 
     if getattr(args, "green_phase", None) is not None:
         changes["green_lut"] = bool(args.green_phase)
+    if getattr(args, "calibrate", None) is not None:
+        changes["calibrate"] = bool(args.calibrate)
+    if getattr(args, "unmix", None):
+        changes["unmix"] = args.unmix
+    if getattr(args, "background", None):
+        changes["background"] = args.background
 
     # --date is the old single-day shorthand.
     if getattr(args, "date", None):
@@ -613,6 +629,16 @@ def add_selection_args(parser, *, watch=False):
                         default=None, help="Apply a green LUT to Phase images")
     parser.add_argument("--no-green-lut", action="store_false", dest="green_phase",
                         help="Keep Phase images as the device returns them")
+    parser.add_argument("--calibrate", action="store_true", default=None,
+                        help="Write fluorescence in calibrated units (GCU/RCU) "
+                             "as 32-bit float, using the device's own Scale "
+                             "and Bias")
+    parser.add_argument("--no-calibrate", action="store_false", dest="calibrate",
+                        help="Keep raw 16-bit counts (default)")
+    parser.add_argument("--unmix", metavar="SPEC",
+                        help=literal(f"Linear (spectral) unmixing: {UNMIX_HELP}"))
+    parser.add_argument("--background", metavar="LEVEL",
+                        help=literal(f"Subtract a background level: {BACKGROUND_HELP}"))
     parser.add_argument("--state-scope",
                         choices=["auto", "folder", "global", "none"],
                         help="Where the resume ledger lives (default: auto)")

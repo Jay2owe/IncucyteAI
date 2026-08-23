@@ -27,6 +27,7 @@ CSV_COLUMNS = [
     "path", "vessel_id", "vessel_name", "well", "row", "col", "site",
     "layout", "axes", "channels", "image_types", "frame_count",
     "first_scan_time", "last_scan_time", "elapsed", "bytes",
+    "processed", "processing",
 ]
 
 
