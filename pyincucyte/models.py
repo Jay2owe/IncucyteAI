@@ -11,7 +11,7 @@ from pathlib import Path
 
 from . import channels as ch
 from . import wells as wl
-from .engine import parse_scan_datetime, vessel_id_from_record
+from .engine import format_elapsed, parse_scan_datetime, vessel_id_from_record
 
 # ---------------------------------------------------------------------------
 # Output layouts
@@ -183,6 +183,122 @@ class Vessel:
             "channel_labels": {str(k): v for k, v in self.channel_labels.items()},
             "active_channels": sorted(self.active_channels),
         }
+
+
+# ---------------------------------------------------------------------------
+# One vessel at one moment
+# ---------------------------------------------------------------------------
+
+@dataclass
+class VesselScan:
+    """One vessel at one scan time - the unit a preview is taken from.
+
+    :meth:`~pyincucyte.client.IncucyteClient.find_scans` returns these, and
+    each one knows how to show itself, so finding a plate and looking at it is
+    two steps rather than a lookup table::
+
+        scan = incucyte.find_scans(name="Cry1", most_recent=1)[0]
+        scan.preview(wells="A1-B3").show()
+
+    ``wells`` and ``channels`` describe what the device actually holds for this
+    moment, which is not the same as what the plate is capable of - a scan can
+    miss wells, and an experiment can be reconfigured mid-run.
+    """
+
+    vessel: Vessel
+    scan_time: str                                  # exactly as the device says it
+    wells: set = None                               # (row, col) holding images
+    channels: set = field(default_factory=set)      # ImageType numbers present
+    sites: set = field(default_factory=set)
+    image_count: int = 0
+    client: object = field(default=None, repr=False)
+
+    # -- identity ---------------------------------------------------------
+
+    @property
+    def vessel_id(self):
+        return self.vessel.id
+
+    @property
+    def name(self):
+        return self.vessel.name
+
+    @property
+    def when(self):
+        """The scan time as a datetime, or None if the device sent nonsense."""
+        try:
+            return parse_scan_datetime(str(self.scan_time))
+        except (ValueError, TypeError, AttributeError):
+            return None
+
+    @property
+    def elapsed(self):
+        """Time since the vessel's first scan, e.g. ``"01d06h30m"``."""
+        when, first = self.when, self.vessel.first_scan
+        if when is None or first is None:
+            return ""
+        return format_elapsed(when - first)
+
+    @property
+    def well_count(self):
+        return len(self.wells) if self.wells else self.vessel.well_count
+
+    @property
+    def well_names(self):
+        return [wl.well_name(r, c) for r, c in sorted(self.wells or ())]
+
+    @property
+    def channel_summary(self):
+        active = self.channels or self.vessel.active_channels
+        return ch.format_channels(active, self.vessel.channel_labels)
+
+    @property
+    def label(self):
+        """e.g. ``"Vessel 38 - Cry1 plate - 2026-03-03 09:00"``."""
+        when = self.when
+        stamp = f"{when:%Y-%m-%d %H:%M}" if when else str(self.scan_time)
+        return f"Vessel {self.vessel.label} - {stamp}"
+
+    def summary(self):
+        parts = [self.label, _plural(self.well_count, "well")]
+        if self.channel_summary:
+            parts.append(self.channel_summary)
+        if self.elapsed:
+            parts.append(f"+{self.elapsed}")
+        return " - ".join(parts)
+
+    # -- looking at it ----------------------------------------------------
+
+    def preview(self, wells=None, **kwargs):
+        """Fetch thumbnails of these wells. See ``IncucyteClient.preview``."""
+        if self.client is None:
+            raise ValueError(
+                "This scan is not attached to a client - call "
+                "client.preview(scan, ...) instead.")
+        return self.client.preview(self, wells=wells, **kwargs)
+
+    def to_dict(self):
+        when = self.when
+        return {
+            "vessel_id": self.vessel_id,
+            "vessel_name": self.vessel.name,
+            "owner": self.vessel.owner,
+            "plate": self.vessel.plate_format,
+            "scan_time": self.scan_time,
+            "when": when.isoformat() if when else None,
+            "elapsed": self.elapsed,
+            "well_count": self.well_count,
+            "wells": self.well_names,
+            "channels": sorted(self.channels),
+            "channel_names": [
+                self.vessel.channel_labels.get(c, ch.image_type_label(c))
+                for c in sorted(self.channels, key=ch.image_type_sort_key)],
+            "sites": sorted(self.sites),
+            "image_count": self.image_count,
+        }
+
+    def __repr__(self):
+        return f"<VesselScan {self.summary()}>"
 
 
 # ---------------------------------------------------------------------------
@@ -441,6 +557,6 @@ class DownloadResult:
 __all__ = [
     "LAYOUTS", "LAYOUT_DESCRIPTIONS", "LAYOUT_LABELS", "LAYOUT_AXES",
     "LAYOUT_ALIASES", "resolve_layout", "layout_flags", "layout_from_flags",
-    "human_bytes", "Vessel", "OutputFile", "ExportPlan", "DownloadResult",
-    "ProgressEvent",
+    "human_bytes", "Vessel", "VesselScan", "OutputFile", "ExportPlan",
+    "DownloadResult", "ProgressEvent",
 ]

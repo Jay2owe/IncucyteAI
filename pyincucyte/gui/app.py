@@ -30,9 +30,11 @@ from ..models import (
 from ..options import (
     END_NOW, ExportOptions, MOMENT_HELP, START_FIRST, START_TODAY,
 )
+from ..preview import DEFAULT_MAX_IMAGES
 from ..wells import well_name, well_spec
 from . import theme as theme_mod
 from .dialogs import AboutDialog, LoginDialog, PlanDialog
+from .preview import PreviewWindow
 from .widgets import Card, LogView, SearchEntry, StatusBar, WellPlate, tip
 
 GUI_STATE_FILE = APP_DIR / "gui_state.json"
@@ -57,6 +59,10 @@ END_VALUES = {"Now": END_NOW, "+24 hours": "+24h", "+48 hours": "+48h",
 CUSTOM = "Custom..."
 
 LAYOUT_ORDER = ("separate", "channel_stack", "time_stack", "time_channel_stack")
+
+#: Wells are cheap to select and expensive to look at - one thumbnail is a
+#: full-size image off the device - so a preview stops at this many.
+PREVIEW_MAX_IMAGES = DEFAULT_MAX_IMAGES
 
 
 class App:
@@ -87,6 +93,9 @@ class App:
         state = self._read_state()
         scale = theme_mod.enable_dpi_awareness()
         self.theme = theme_mod.install(root, dark=state.get("dark"), scale=scale)
+        # A PreviewSet opened from a script shares this window's palette
+        # rather than restyling everything with a second Theme.
+        root._pyincucyte_theme = self.theme
 
         root.title("PyIncucyte")
         root.minsize(1080, 760)
@@ -133,6 +142,8 @@ class App:
         menubar.add_cascade(label="Export", menu=export_menu)
 
         tools_menu = tk.Menu(menubar, tearoff=0)
+        tools_menu.add_command(label="View well images...", accelerator="Ctrl+I",
+                               command=self._view_images)
         tools_menu.add_command(label="Copy CLI command",
                                command=self._copy_cli_command)
         tools_menu.add_command(label="Sign in...", command=self._login)
@@ -162,6 +173,7 @@ class App:
             "<Control-d>": self._download, "<Control-D>": self._download,
             "<Control-w>": self._start_watch, "<Control-W>": self._start_watch,
             "<Control-q>": self.on_close, "<Control-Q>": self.on_close,
+            "<Control-i>": self._view_images, "<Control-I>": self._view_images,
             "<F5>": self._refresh_vessels,
             "<Escape>": self._stop,
         }
@@ -285,6 +297,7 @@ class App:
         self.vessel_tree.tag_configure(
             "odd", background=self.theme["surface_alt"])
         self.vessel_tree.bind("<<TreeviewSelect>>", self._on_vessel_select)
+        self.vessel_tree.bind("<Double-1>", lambda _e: self._view_images())
 
         self.vessel_hint = ttk.Label(
             body, style="Muted.TLabel",
@@ -323,6 +336,14 @@ class App:
             button = ttk.Button(buttons, text=label, command=command)
             button.pack(side="left", padx=(0, theme_mod.PAD_S))
             tip(button, hint, self.theme)
+
+        self.view_btn = ttk.Button(buttons, text="View images",
+                                   command=self._view_images)
+        self.view_btn.pack(side="left", padx=(theme_mod.PAD_M, 0))
+        tip(self.view_btn,
+            "Fetch a thumbnail of each selected well from the most recent scan, "
+            "to check this is the right plate before downloading it.",
+            self.theme)
 
         self.well_spec_var = tk.StringVar(value="all")
         ttk.Label(buttons, textvariable=self.well_spec_var, style="Muted.TLabel",
@@ -596,7 +617,7 @@ class App:
         self.busy = busy
         state = "disabled" if busy else "normal"
         for widget in (self.download_btn, self.preview_btn, self.watch_btn,
-                       self.refresh_btn):
+                       self.refresh_btn, self.view_btn):
             widget.configure(state=state)
         self.stop_btn.configure(state="normal" if busy else "disabled")
         self.status.set_busy(busy)
@@ -1122,6 +1143,60 @@ class App:
         options = self._validate()
         if options:
             self._run_worker(self._plan_worker, options, False)
+
+    # -- looking at the wells --------------------------------------------
+
+    def _view_images(self):
+        """Thumbnails of the selected wells: is this the right plate?"""
+        if not (self.client.credentials.token_valid
+                or self.client.credentials.can_refresh):
+            self.say("Sign in before looking at wells.", "warn")
+            self._prompt_login()
+            return
+        ids = self._selected_vessel_ids()
+        if not ids:
+            self.say("Select a vessel first, then View images.", "warn")
+            return
+        vessel_id = self.active_vessel if self.active_vessel in ids else ids[0]
+        self._run_worker(self._view_images_worker, vessel_id,
+                         self.selected_wells.get(vessel_id),
+                         self._selected_channels())
+
+    def _view_images_worker(self, vessel_id, wells, channels):
+        self.say(f"Vessel {vessel_id}: finding the most recent scan ...")
+        scans = self.client.find_scans(vessel=vessel_id, most_recent=1,
+                                       progress=self._progress,
+                                       cancel=self.cancel_event)
+        if self.cancel_event.is_set():
+            return
+        if not scans:
+            self.say(f"Vessel {vessel_id} has no scan holding images.", "warn")
+            return
+        scan = scans[0]
+        result = self.client.preview(
+            scan, wells=wells, channels=channels or None,
+            max_images=PREVIEW_MAX_IMAGES, progress=self._progress,
+            cancel=self.cancel_event)
+        if self.cancel_event.is_set():
+            self.say("Preview cancelled.", "muted")
+            return
+        self.say(f"{scan.label}: {result.summary()}")
+        if result.skipped:
+            self.say(f"Only the first {PREVIEW_MAX_IMAGES} wells are shown - "
+                     f"each thumbnail is a full-size image off the device.",
+                     "muted")
+        for message in result.errors[:3]:
+            self.say(message, "warn")
+        self._post(self._open_preview_window, result)
+
+    def _open_preview_window(self, result):
+        if result.is_empty:
+            messagebox.showinfo(
+                "Nothing to show",
+                "That scan holds no images for the selected wells.",
+                parent=self.root)
+            return
+        PreviewWindow(self.root, self.theme, result)
 
     def _download(self):
         options = self._validate()

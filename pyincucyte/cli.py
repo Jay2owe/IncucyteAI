@@ -25,12 +25,18 @@ from .manifest import MANIFEST_FILENAME, load_manifest
 from .models import (
     LAYOUT_DESCRIPTIONS, LAYOUTS, human_bytes, layout_from_flags, resolve_layout,
 )
+from .preview import DEFAULT_MAX_IMAGES, DEFAULT_SIZE
 from .options import (
     END_NOW, ExportOptions, MOMENT_HELP, START_FIRST, START_TODAY,
     parse_duration, parse_moment,
 )
 
 log = logging.getLogger("pyincucyte.cli")
+
+#: What find/preview accept for --at, --since and --until. Narrower than
+#: MOMENT_HELP: a frame count has no meaning without a scan list.
+WHEN_HELP = ("YYYY-MM-DD, YYYY-MM-DD HH:MM, or a relative offset "
+             "like -48h / +3d")
 
 
 # ---------------------------------------------------------------------------
@@ -330,6 +336,79 @@ def _resolve_day(value, client):
     return parse_moment(text, "date").date()
 
 
+def _find_scans(args, client):
+    """Run the scan finder from the shared --name/--at/--most-recent flags."""
+    return client.find_scans(
+        getattr(args, "name", None),
+        vessel=getattr(args, "vessel", None),
+        owner=getattr(args, "owner", None),
+        plate=getattr(args, "plate", None),
+        channel=getattr(args, "channel", None),
+        at=getattr(args, "at", None),
+        since=getattr(args, "since", None),
+        until=getattr(args, "until", None),
+        most_recent=getattr(args, "most_recent", 1),
+        max_days=getattr(args, "max_days", 14),
+        limit=getattr(args, "limit", None),
+        progress=ConsoleProgress(not args.quiet))
+
+
+def cmd_find(args):
+    """Which plate is which: search vessels and report their newest scans."""
+    client = make_client(args)
+    scans = _find_scans(args, client)
+    if args.json:
+        emit_json([scan.to_dict() for scan in scans])
+        return 0
+    if not scans:
+        emit("No scan matched. Try a wider --most-recent, --max-days or fewer "
+             "filters.")
+        return 0
+    rows = [[
+        scan.vessel_id, scan.vessel.name or "-",
+        f"{scan.when:%Y-%m-%d %H:%M}" if scan.when else scan.scan_time,
+        scan.elapsed or "-", scan.well_count, scan.channel_summary or "-",
+    ] for scan in scans]
+    emit()
+    print_table(rows, ["ID", "Name", "Scan", "Elapsed", "Wells", "Channels"])
+    emit(f"\n{len(scans)} scans. Look at one with: pyincucyte preview -v "
+         f"{scans[0].vessel_id}")
+    return 0
+
+
+def cmd_preview(args):
+    """Fetch thumbnails of the wells and show them."""
+    client = make_client(args)
+    scans = _find_scans(args, client)
+    if not scans:
+        emit("No scan matched - nothing to preview.")
+        return 0
+    result = client.preview(
+        scans, wells=args.wells, channels=args.channels, site=args.site,
+        size=args.size, contrast=args.contrast, max_images=args.max_images,
+        workers=args.workers or 4, progress=ConsoleProgress(not args.quiet))
+
+    saved = result.save(args.save) if args.save else []
+    if args.json:
+        payload = result.to_dict()
+        payload["saved"] = [str(path) for path in saved]
+        emit_json(payload)
+        return 0
+
+    emit(f"\n=== {result.title} ===\n")
+    for image in result.images:
+        emit(f"  {image.label:<28} "
+             f"{'x'.join(str(n) for n in image.size) if image.ok else image.error}")
+    emit(f"\n{result.summary()}")
+    if saved:
+        emit(f"{len(saved)} PNGs written to {args.save}")
+    if result.is_empty:
+        return 0
+    if not args.no_show:
+        result.show()
+    return 0
+
+
 def cmd_plan(args):
     client = make_client(args)
     options = options_from_args(args)
@@ -475,6 +554,31 @@ def cmd_preset(args):
 # argument parser
 # ---------------------------------------------------------------------------
 
+def add_finder_args(parser):
+    """The filters that answer "which plate is this?" - shared by find/preview."""
+    parser.add_argument("name", nargs="?",
+                        help="Part of the plate's name (a bare number is a "
+                             "vessel id)")
+    parser.add_argument("--vessel", "-v", type=int, action="append",
+                        help="Vessel ID (repeat for several)")
+    parser.add_argument("--owner", help="Part of the owner's username")
+    parser.add_argument("--plate", help="Well count or plate type (24, Sarstedt)")
+    parser.add_argument("--channel",
+                        help="A channel the experiment uses (GFP, green, 2)")
+    parser.add_argument("--at", metavar="WHEN",
+                        help=f"Take the scan nearest this moment ({WHEN_HELP})")
+    parser.add_argument("--since", metavar="WHEN", help="Look no earlier than this")
+    parser.add_argument("--until", metavar="WHEN", help="Look no later than this")
+    parser.add_argument("--most-recent", "-n", dest="most_recent", type=int,
+                        default=1, metavar="N",
+                        help="Newest N scans per vessel (default 1)")
+    parser.add_argument("--max-days", dest="max_days", type=int, default=14,
+                        metavar="DAYS",
+                        help="How far back to walk from each vessel's last "
+                             "scan (default 14)")
+    parser.add_argument("--limit", type=int, help="Stop after this many scans")
+
+
 def add_selection_args(parser, *, watch=False):
     parser.add_argument("--vessel", "-v", type=int, action="append",
                         help="Vessel ID (repeat for several)")
@@ -531,7 +635,7 @@ def add_selection_args(parser, *, watch=False):
 # are the flags whose values can legitimately start with a minus, and this is
 # the shape such a value takes: a signed number and a unit letter.
 NEGATIVE_VALUE_FLAGS = {"--start-from", "-s", "--end-at", "--end-date",
-                        "--date", "-d"}
+                        "--date", "-d", "--at", "--since", "--until"}
 _NEGATIVE_VALUE = re.compile(r"^-\d+(?:\.\d+)?\s*[smhdwf]", re.IGNORECASE)
 
 
@@ -601,6 +705,34 @@ def build_parser():
     p_scans.add_argument("--end-at", dest="end_at", metavar="WHEN")
     p_scans.add_argument("--end-date", dest="end_date", help=argparse.SUPPRESS)
 
+    p_find = sub.add_parser(
+        "find", help="Find a vessel and its most recent scans")
+    add_finder_args(p_find)
+
+    p_preview = sub.add_parser(
+        "preview", help="Show thumbnails of the wells, to check the vessel")
+    add_finder_args(p_preview)
+    p_preview.add_argument("--wells", "-w",
+                           help="Well filter (A1, A1,B3, A1-D4, all)")
+    p_preview.add_argument("--channels", "-c",
+                           help=f"Channel filter ({CHANNEL_HELP})")
+    p_preview.add_argument("--site", type=int, default=0,
+                           help="Which site within each well (default 0)")
+    p_preview.add_argument("--size", type=int, default=DEFAULT_SIZE,
+                           help=f"Thumbnail edge in pixels (default {DEFAULT_SIZE})")
+    p_preview.add_argument("--contrast", default="auto",
+                           choices=["auto", "minmax", "raw"],
+                           help="Display stretch (default: auto)")
+    p_preview.add_argument("--max-images", dest="max_images", type=int,
+                           default=DEFAULT_MAX_IMAGES, metavar="N",
+                           help=f"Stop after N images - each one is a full-size "
+                                f"download (default {DEFAULT_MAX_IMAGES})")
+    p_preview.add_argument("--save", metavar="DIR",
+                           help="Also write the thumbnails there as PNGs")
+    p_preview.add_argument("--no-show", dest="no_show", action="store_true",
+                           help="Do not open a window")
+    p_preview.add_argument("--workers", type=int, help="Parallel workers (default 4)")
+
     p_plan = sub.add_parser("plan", help="Show what a download would fetch")
     add_selection_args(p_plan)
 
@@ -624,6 +756,7 @@ def build_parser():
 COMMANDS = {
     "probe": cmd_probe, "login": cmd_login, "logout": cmd_logout, "gui": cmd_gui,
     "vessels": cmd_vessels, "scans": cmd_scans, "plan": cmd_plan,
+    "find": cmd_find, "preview": cmd_preview,
     "download": cmd_download, "watch": cmd_watch, "status": cmd_status,
     "manifest": cmd_manifest, "preset": cmd_preset,
 }

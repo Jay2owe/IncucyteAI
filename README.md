@@ -53,6 +53,10 @@ Worth knowing:
 
 - **Preview** (Ctrl+P) counts exactly what would be downloaded and lists the
   filenames, without fetching a single image.
+- **View images** (Ctrl+I, or double-click a vessel) pulls a thumbnail of
+  each selected well from the most recent scan into a scrollable window,
+  captioned with the well and the experiment's own channel names — the
+  quickest way to be sure a vessel id is the plate you meant.
 - **Scanned only** keeps just the wells the instrument actually imaged in the
   most recent scan — wells with no data are shown dimmed on the plate.
 - **Copy CLI command** (Tools menu, and in the confirm dialog) turns whatever is
@@ -72,6 +76,8 @@ Worth knowing:
 pyincucyte probe                       # is the instrument reachable?
 pyincucyte login                       # saves credentials
 pyincucyte vessels                     # what is on the device
+pyincucyte find Cry1                   # which plate is that, and when
+pyincucyte preview -v 38 -w A1-B3      # look at the wells before fetching
 pyincucyte plan -v 38 -o ./images --start-from first     # dry run
 
 pyincucyte download -v 38 -o ./images --start-from first
@@ -190,6 +196,45 @@ for image in result.files:
 also accept `date` and `datetime` objects directly, and `plan.window` reports the
 `(start, end)` the plan actually used — it is recorded in the manifest too.
 
+### Finding the right vessel, and looking at it
+
+A vessel id is not a memorable thing, and the wrong one costs a whole download.
+`find_scans` searches for the plate and `preview` shows you its wells.
+
+```python
+scans = incucyte.find_scans("Cry1", most_recent=1)   # newest scan of that plate
+scans[0].preview(wells="A1-B3").show()               # a scrollable window
+
+incucyte.find_scans(plate=24, channel="GFP")         # every 24-well GFP plate
+incucyte.find_scans(vessel=38, most_recent=3)        # its last three scans
+incucyte.find_scans(vessel=38, at="-48h")            # the scan nearest 48h ago
+```
+
+Each result is a `VesselScan`: the vessel, one scan time, and the wells,
+channels and sites that scan actually holds — `.well_names`, `.elapsed`,
+`.channel_summary`, `.summary()`, `.to_dict()`. Days are walked backwards from
+the vessel's own last scan, and a scan is only returned once the device confirms
+it contains that vessel, so `most_recent=1` means the newest *usable* scan and
+usually costs one call.
+
+`preview` takes a `VesselScan` (or a list of them, a `Vessel`, an id, a name, or
+the same filters as `find_scans`) and returns a `PreviewSet`:
+
+```python
+preview = incucyte.preview(vessel=38, wells="A1-B3", channels="phase")
+preview.show()                    # blocks in a script, returns in the GUI
+preview.save("./thumbs")          # PNGs, one per tile
+preview.summary()                 # "6 of 6 images - 6 wells - Phase"
+for tile in preview:
+    tile.well, tile.channel, tile.array      # "A1", "Cry1-GFP", uint8 2-D
+```
+
+Two things to know. The device has no thumbnail route, so every tile is a
+full-size image off the wire — hence `max_images` (24 by default), and hence the
+in-memory cache that makes a second look free. And the tiles are downsampled and
+contrast-stretched so a 16-bit fluorescence frame is visible at all: they are
+for recognition, never for measurement.
+
 ### What you get back
 
 `DownloadResult` carries `.files` (typed `OutputFile` records), `.paths`,
@@ -275,11 +320,13 @@ PyIncucyte/
     manifest.py     the JSON manifest and CSV index
     state.py        resume ledger, scoped to the output folder
     cache.py        source-payload cache, so rebuilt stacks do not re-download
+    preview.py      find a vessel by name, and look at its wells
     watch.py        Watcher - poll and download in a background thread
     engine.py       wire-level REST and ImageJ TIFF writing
     cli.py          command line
     compat.py       the import names retired in 0.3
-    gui/            desktop app: theme.py, widgets.py, dialogs.py, app.py
+    gui/            desktop app: theme.py, widgets.py, dialogs.py, app.py,
+                    preview.py (the thumbnail window)
   tests/            run with: python -m pytest
 ```
 

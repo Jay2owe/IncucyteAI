@@ -18,21 +18,24 @@ turns the engine's loose dicts into the typed records in
 
 import logging
 import threading
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 from . import channels as ch
 from . import engine
 from .cache import cache_for_output
+from . import preview as preview_mod
 from . import manifest as manifest_mod
 from . import wells as wl
 from .config import ConfigStore, Credentials
 from .errors import NotLoggedInError, VesselNotFoundError
 from .models import (
-    DownloadResult, ExportPlan, OutputFile, ProgressEvent, Vessel,
+    DownloadResult, ExportPlan, OutputFile, ProgressEvent, Vessel, VesselScan,
     LAYOUT_AXES, layout_flags, resolve_layout,
 )
-from .options import ExportOptions, START_FIRST
+from .options import (
+    ExportOptions, START_FIRST, parse_duration, parse_frame_count, parse_moment,
+)
 from .state import StateStore
 
 log = logging.getLogger("pyincucyte.client")
@@ -63,6 +66,7 @@ class IncucyteClient:
         self.host = self._credentials.host or engine.DEFAULT_HOST
         self.log = logger or log
         self._vessels = None
+        self._preview_cache = None
         self._auth_lock = threading.Lock()
         if timeout:
             engine.API_TIMEOUT = int(timeout)
@@ -255,6 +259,292 @@ class IncucyteClient:
                 return vessel.first_scan
         return engine.find_first_scan_time(self.host, self.ensure_token(),
                                            max_days_back=max_days_back)
+
+    # -- finding a vessel, and looking at it ------------------------------
+
+    def scan_detail(self, vessel_id, scan_time):
+        """What one scan actually holds for one vessel: wells, channels, sites.
+
+        Returns ``None`` when the device has no images for that vessel at that
+        moment.  Scan times are device-wide rather than per vessel, so this is
+        the call that turns "a scan happened" into "this plate was in it".
+        """
+        try:
+            data = engine.api_post(
+                self.host, self.ensure_token(), "Vessels/GetScanVessel",
+                {"VesselID": int(vessel_id), "DateTime": scan_time,
+                 "IncludeDiagnosticMetrics": False})
+        except RuntimeError as exc:
+            if engine.is_missing_scan_vessel_error(exc):
+                return None
+            raise
+        scan = engine.unpack_values(data.get("Data", {}))
+        infos = scan.get("ImageInfos") or []
+        if not isinstance(infos, list):
+            infos = []
+        wells, channels, sites = set(), set(), set()
+        for image in infos:
+            swell = image.get("Swell") or {}
+            site = image.get("SwellSite") or {}
+            wells.add((swell.get("RowZeroBased", 0), swell.get("ColumnZeroBased", 0)))
+            channels.add(image.get("ImageType", 1))
+            sites.add(site.get("ValueZeroBased", 0))
+        if not wells:
+            return None
+        return {"wells": wells, "channels": channels, "sites": sites,
+                "image_count": len(infos)}
+
+    def find_vessels(self, name=None, *, vessel=None, owner=None, plate=None,
+                     channel=None, scanned_only=False, refresh=False):
+        """Search the vessel list. Every filter is optional and they all AND.
+
+        ``name`` is a case-insensitive substring of the plate's label (a bare
+        number is taken as a vessel id instead), ``plate`` is either a well
+        count or part of the plate type, and ``channel`` matches either a
+        channel name the experiment uses (``"GFP"``) or its device name
+        (``"green"``).  Results come back with the most recently scanned
+        vessel first, which is nearly always the one being looked for.
+        """
+        wanted_ids = None
+        if vessel is not None:
+            ids = vessel if isinstance(vessel, (list, tuple, set)) else [vessel]
+            wanted_ids = {int(one) for one in ids}
+
+        needle = str(name).strip() if name is not None else ""
+        if needle.isdigit():
+            # find_vessels("38") means the vessel with that id, not a plate
+            # whose label happens to contain "38".
+            wanted_ids = (wanted_ids or set()) | {int(needle)}
+            needle = ""
+        needle = needle.lower()
+        owner_needle = str(owner).strip().lower() if owner else ""
+
+        matches = []
+        for candidate in self.vessels(refresh=refresh):
+            if wanted_ids is not None and candidate.id not in wanted_ids:
+                continue
+            if needle and needle not in (candidate.name or "").lower():
+                continue
+            if owner_needle and owner_needle not in (candidate.owner or "").lower():
+                continue
+            if not _plate_matches(candidate, plate):
+                continue
+            if not _channel_matches(candidate, channel):
+                continue
+            if scanned_only and candidate.last_scan is None:
+                continue
+            matches.append(candidate)
+
+        matches.sort(key=lambda v: (v.last_scan or datetime.min, v.id),
+                     reverse=True)
+        return matches
+
+    def find_scans(self, name=None, *, vessel=None, owner=None, plate=None,
+                   channel=None, at=None, since=None, until=None,
+                   most_recent=1, scanned_only=True, resolve=True,
+                   max_days=14, limit=None, progress=None, cancel=None):
+        """Find scans to look at, as :class:`~pyincucyte.models.VesselScan`.
+
+        The output feeds straight into :meth:`preview`, so "which plate is
+        this?" is two lines::
+
+            incucyte.find_scans(name="Cry1")[0].preview().show()
+            incucyte.find_scans(most_recent=3, plate=24)      # newest three each
+            incucyte.find_scans(vessel=38, at="-48h")         # nearest to then
+
+        The vessel filters are those of :meth:`find_vessels`.  ``at`` picks the
+        scan closest to a moment; ``since``/``until`` bound the search - each
+        takes a date, a datetime, or a signed offset like ``-48h``.  Days are
+        walked backwards from each vessel's own last scan (never from today, or
+        an old experiment sweeps every day since) and no further back than
+        ``max_days``.  With ``resolve`` left on, a scan is only returned once
+        the device confirms it holds images for that vessel, which is what
+        makes ``most_recent=1`` mean the newest *usable* scan.
+        """
+        cancel = _as_event(cancel)
+        wanted = max(1, int(most_recent))
+        since_dt = _moment(since, "since")
+        until_dt = _moment(until, "until", end_of_day=True)
+        at_dt = _moment(at, "at")
+
+        found = []
+        vessels = self.find_vessels(name, vessel=vessel, owner=owner,
+                                    plate=plate, channel=channel,
+                                    scanned_only=scanned_only)
+        for candidate in vessels:
+            if cancel.is_set():
+                break
+            _call(progress, ProgressEvent(
+                stage="scanning", detail=f"Vessel {candidate.id}: looking for scans",
+                vessel_id=candidate.id))
+            found += self._scans_for_vessel(
+                candidate, wanted=wanted, since=since_dt, until=until_dt,
+                at=at_dt, resolve=resolve, max_days=max_days, cancel=cancel)
+            if limit and len(found) >= int(limit):
+                break
+        return found[:int(limit)] if limit else found
+
+    def _scans_for_vessel(self, vessel, *, wanted=1, since=None, until=None,
+                          at=None, resolve=True, max_days=14, cancel=None):
+        """Verified scans for one vessel, newest (or nearest to ``at``) first."""
+        scans, seen = [], set()
+        for scan_time in self._candidate_scan_times(
+                vessel, since=since, until=until, at=at, max_days=max_days,
+                cancel=cancel):
+            if cancel is not None and cancel.is_set():
+                break
+            if scan_time in seen:
+                continue
+            seen.add(scan_time)
+            detail = self.scan_detail(vessel.id, scan_time) if resolve else {}
+            if detail is None:      # the scan happened, but not to this vessel
+                continue
+            scans.append(VesselScan(
+                vessel=vessel, scan_time=scan_time,
+                wells=detail.get("wells"), channels=detail.get("channels", set()),
+                sites=detail.get("sites", set()),
+                image_count=detail.get("image_count", 0), client=self))
+            if len(scans) >= wanted:
+                break
+        return scans
+
+    def _candidate_scan_times(self, vessel, *, since=None, until=None, at=None,
+                              max_days=14, cancel=None):
+        """Yield this vessel's plausible scan times, best guess first.
+
+        Newest first normally; closest to ``at`` when a moment is given.  A day
+        costs one API call, so the order is what keeps ``most_recent=1`` down to
+        a single call.
+        """
+        floor = _later(since, vessel.first_scan)
+        ceiling = _earlier(until, vessel.last_scan)
+
+        def usable(scan_time):
+            try:
+                when = engine.parse_scan_datetime(str(scan_time))
+            except (ValueError, TypeError):
+                return None
+            # A scan predating the plate cannot contain it.
+            if vessel.first_scan and when < vessel.first_scan:
+                return None
+            if since and when < since:
+                return None
+            if until and when > until:
+                return None
+            return when
+
+        if at is not None:
+            for scan_time in self._scans_near(vessel, at, floor, ceiling,
+                                              max_days, cancel, usable):
+                yield scan_time
+            return
+
+        day = (ceiling or datetime.now()).date()
+        first_day = floor.date() if floor else None
+        for _ in range(max(1, int(max_days))):
+            if cancel is not None and cancel.is_set():
+                return
+            if first_day and day < first_day:
+                return
+            times = [(usable(t), t) for t in self.scan_times(day)]
+            for when, scan_time in sorted(
+                    ((w, t) for w, t in times if w is not None), reverse=True):
+                yield scan_time
+            day -= timedelta(days=1)
+
+    def _scans_near(self, vessel, moment, floor, ceiling, max_days, cancel,
+                    usable):
+        """Scan times sorted by distance from ``moment``, nearest first."""
+        target = moment.date()
+        first_day = floor.date() if floor else None
+        last_day = ceiling.date() if ceiling else None
+        collected = {}
+        for offset in _outward(max(1, int(max_days))):
+            if cancel is not None and cancel.is_set():
+                break
+            day = target + timedelta(days=offset)
+            if first_day and day < first_day:
+                continue
+            if last_day and day > last_day:
+                continue
+            for scan_time in self.scan_times(day):
+                when = usable(scan_time)
+                if when is not None:
+                    collected[scan_time] = abs((when - moment).total_seconds())
+            # One day either side of the first hit is enough to be sure the
+            # nearest scan is in hand.
+            if collected and abs(offset) >= 1:
+                break
+        for scan_time in sorted(collected, key=collected.get):
+            yield scan_time
+
+    def preview(self, target=None, *, wells=None, channels=None, site=0,
+                size=None, contrast="auto", max_images=None, workers=4,
+                cache=True, progress=None, cancel=None, **find):
+        """Fetch thumbnails of what is in the wells, ready to be shown.
+
+            incucyte.preview("Cry1", wells="A1-B3").show()
+            incucyte.preview(scan).save("./thumbs")
+
+        ``target`` takes whatever names a plate: a
+        :class:`~pyincucyte.models.VesselScan` (or several) from
+        :meth:`find_scans`, a :class:`~pyincucyte.models.Vessel`, a vessel id,
+        a name to search for, or nothing at all plus the ``find_scans``
+        filters.  Wells and channels the scan does not hold are dropped rather
+        than requested.
+
+        The device has no thumbnail route, so each tile is a full-size image
+        off the wire: ``max_images`` (24 by default) is the brake, and the
+        contrast stretch means these pixels are for recognition only.
+        """
+        cancel = _as_event(cancel)
+        size = int(size or preview_mod.DEFAULT_SIZE)
+        max_images = (preview_mod.DEFAULT_MAX_IMAGES if max_images is None
+                      else max_images)
+        scans = self._scans_to_preview(target, progress=progress, cancel=cancel,
+                                       **find)
+        requests, skipped = preview_mod.build_requests(
+            scans, wells=wells, channels=channels, site=site,
+            max_images=max_images)
+        if skipped:
+            self.log.info("preview capped at %d images; %d not fetched",
+                          max_images, skipped)
+        images = preview_mod.fetch_previews(
+            self, requests, size=size, contrast=contrast, workers=workers,
+            progress=progress, cancel=cancel,
+            cache=self.preview_cache if cache else None)
+        result = preview_mod.PreviewSet(
+            images=images, scans=scans, requested=len(requests), skipped=skipped,
+            cancelled=cancel.is_set(), size=size, contrast=contrast)
+        _call(progress, ProgressEvent(stage="done", detail=result.summary()))
+        return result
+
+    @property
+    def preview_cache(self):
+        """Rendered thumbnails held in memory, so a second look is instant."""
+        if getattr(self, "_preview_cache", None) is None:
+            self._preview_cache = preview_mod.ThumbCache()
+        return self._preview_cache
+
+    def _scans_to_preview(self, target, *, progress=None, cancel=None, **find):
+        """Coerce anything that names a plate into a list of VesselScan."""
+        if target is None:
+            return self.find_scans(progress=progress, cancel=cancel, **find)
+        if isinstance(target, VesselScan):
+            return [target]
+        if isinstance(target, Vessel):
+            return self.find_scans(vessel=target.id, progress=progress,
+                                   cancel=cancel, **find)
+        if isinstance(target, (int, str)):
+            return self.find_scans(target, progress=progress, cancel=cancel,
+                                   **find)
+        if isinstance(target, (list, tuple, set)):
+            scans = []
+            for item in target:
+                scans += self._scans_to_preview(item, progress=progress,
+                                                cancel=cancel, **find)
+            return scans
+        raise TypeError(f"Cannot preview {type(target).__name__}")
 
     # -- planning ---------------------------------------------------------
 
@@ -550,6 +840,91 @@ class IncucyteClient:
 # ---------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------
+
+def _moment(value, field_name="time", end_of_day=False):
+    """Resolve any written form of a moment, or None. Accepts ``-48h``."""
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, date):
+        return parse_moment(value, field_name, end_of_day=end_of_day)
+    text = str(value).strip().lower()
+    if text in ("", "any", "all"):
+        return None
+    if text == "now":
+        return datetime.now()
+    if text == "today":
+        return datetime.combine(date.today(), datetime.min.time())
+    offset = parse_duration(text)
+    if offset is not None:
+        return datetime.now() + offset
+    if parse_frame_count(text) is not None:
+        # A frame has no timestamp until the scans are listed, so it cannot
+        # name a moment to search around.
+        raise ValueError(
+            f"{field_name} needs a time, not a frame count; got {value!r}")
+    return parse_moment(value, field_name, end_of_day=end_of_day)
+
+
+def _later(*moments):
+    """The latest of the moments given, ignoring None."""
+    real = [m for m in moments if m is not None]
+    return max(real) if real else None
+
+
+def _earlier(*moments):
+    real = [m for m in moments if m is not None]
+    return min(real) if real else None
+
+
+def _outward(days):
+    """0, -1, +1, -2, +2 ... - day offsets, closest to the target first."""
+    yield 0
+    for step in range(1, max(1, int(days)) + 1):
+        yield -step
+        yield step
+
+
+def _plate_matches(vessel, plate):
+    """True when a vessel matches a plate filter: 24, '24-well', 'Sarstedt'."""
+    if plate is None:
+        return True
+    text = str(plate).strip().lower()
+    if not text:
+        return True
+    digits = text.replace("-well", "").replace(" well", "").replace(" ", "")
+    if digits.isdigit():
+        return vessel.well_count == int(digits)
+    return text in (vessel.type_name or "").lower()
+
+
+def _channel_matches(vessel, channel):
+    """True when a vessel uses a channel, named either way round.
+
+    ``"green"`` is the device's name for channel 2; ``"GFP"`` is what this
+    experiment calls it.  Both should find the same plate.
+    """
+    if channel is None:
+        return True
+    active = vessel.active_channels or set(ch.ALL_CHANNELS)
+    if isinstance(channel, int):
+        return channel in active
+    text = str(channel).strip().lower()
+    if not text or text == "all":
+        return True
+    if text.isdigit():
+        return int(text) in active
+    try:
+        wanted = ch.parse_channels(text)
+    except ValueError:
+        wanted = None
+    if wanted:
+        return bool(active & wanted)
+    return any(text in str(label).lower()
+               for number, label in vessel.channel_labels.items()
+               if number in active)
+
 
 def _scans_from(scan_times, reference):
     """Drop scan times that predate a vessel's own first scan."""
