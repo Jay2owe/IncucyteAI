@@ -68,6 +68,32 @@ class LegacyFlagTests(unittest.TestCase):
         self.assertEqual(options.channels, "phase")
 
 
+class BatchFlagTests(unittest.TestCase):
+    """--batch-frames / --batch-after, the chunked watch."""
+
+    def test_the_chunk_rule_reaches_the_options(self):
+        options = resolve(["watch", "-v", "38", "-o", "o",
+                           "--batch-frames", "50", "--batch-after", "7d"])
+        self.assertEqual(options.batch_frames, 50)
+        self.assertEqual(options.batch_after, "7d")
+        self.assertTrue(options.batches)
+
+    def test_either_condition_works_on_its_own(self):
+        self.assertEqual(
+            resolve(["watch", "-v", "1", "-o", "o", "--batch-after", "12h"]
+                    ).batch_after, "12h")
+        self.assertEqual(
+            resolve(["watch", "-v", "1", "-o", "o", "--batch-frames", "24"]
+                    ).batch_frames, 24)
+
+    def test_a_plain_watch_does_not_batch(self):
+        self.assertFalse(resolve(["watch", "-v", "1", "-o", "o"]).batches)
+
+    def test_a_download_has_no_batch_flags(self):
+        with self.assertRaises(SystemExit):
+            parse(["download", "-v", "1", "-o", "o", "--batch-frames", "5"])
+
+
 class NewFlagTests(unittest.TestCase):
     def test_several_vessels_can_be_given(self):
         options = resolve(["download", "-v", "38", "-v", "41", "-o", "o"])

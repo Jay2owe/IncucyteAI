@@ -2,7 +2,7 @@
 
 import json
 import unittest
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -139,6 +139,66 @@ class CommandLineMirrorTests(unittest.TestCase):
     def test_watch_command_carries_the_interval(self):
         options = ExportOptions(output="out", vessels=[1], interval_minutes=20)
         self.assertIn("-i 20", options.cli_command("watch"))
+
+    def test_watch_command_carries_the_chunk_rule(self):
+        options = ExportOptions(output="out", vessels=[1],
+                                batch_frames=50, batch_after="7d")
+        command = options.cli_command("watch")
+        self.assertIn("--batch-frames 50", command)
+        self.assertIn("--batch-after 7d", command)
+
+    def test_a_download_is_never_asked_to_batch(self):
+        # Chunking is a watch idea: a one-shot download has nothing to wait for.
+        options = ExportOptions(output="out", vessels=[1], batch_frames=50)
+        self.assertNotIn("--batch-frames", options.cli_command("download"))
+
+
+class BatchTests(unittest.TestCase):
+    """Holding new frames back into chunks, for a watcher left running."""
+
+    def test_batching_is_off_unless_asked_for(self):
+        options = ExportOptions(output="out", vessels=[1])
+        self.assertFalse(options.batches)
+        self.assertEqual(options.batch_frames, 0)
+        self.assertEqual(options.batch_after, "")
+        self.assertIsNone(options.batch_delay)
+        self.assertEqual(options.batch_description, "")
+
+    def test_a_delay_is_read_as_a_length_of_time(self):
+        options = ExportOptions(output="out", vessels=[1], batch_after="7d")
+        self.assertEqual(options.batch_delay, timedelta(days=7))
+        self.assertTrue(options.batches)
+
+    def test_a_timedelta_is_stored_as_the_text_a_preset_can_hold(self):
+        options = ExportOptions(output="out", vessels=[1],
+                                batch_after=timedelta(hours=48))
+        self.assertEqual(options.batch_after, "2d")
+        self.assertIsInstance(json.dumps(options.to_dict()), str)
+
+    def test_something_that_is_not_a_length_of_time_is_refused_at_load(self):
+        with self.assertRaises(ValueError):
+            ExportOptions(output="out", vessels=[1], batch_after="next Tuesday")
+        with self.assertRaises(ValueError):
+            ExportOptions(output="out", vessels=[1], batch_after="7")
+
+    def test_the_rule_round_trips_through_a_preset(self):
+        options = ExportOptions(output="out", vessels=[1],
+                                batch_frames=24, batch_after="12h")
+        again = ExportOptions.from_dict(json.loads(json.dumps(options.to_dict())))
+        self.assertEqual(again.batch_frames, 24)
+        self.assertEqual(again.batch_after, "12h")
+
+    def test_the_condition_is_spelled_out_for_a_ui(self):
+        options = ExportOptions(output="out", vessels=[1],
+                                batch_frames=50, batch_after="7d")
+        self.assertEqual(
+            options.batch_description,
+            "50 frames have accumulated or 7 days have passed, "
+            "whichever comes first")
+
+    def test_a_span_is_described_in_the_unit_it_was_written_in(self):
+        options = ExportOptions(output="out", vessels=[1], batch_after="48h")
+        self.assertIn("48 hours", options.batch_description)
 
 
 if __name__ == "__main__":

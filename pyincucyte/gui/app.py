@@ -28,7 +28,7 @@ from ..models import (
     LAYOUT_DESCRIPTIONS, LAYOUT_LABELS, human_bytes, resolve_layout,
 )
 from ..options import (
-    END_NOW, ExportOptions, MOMENT_HELP, START_FIRST, START_TODAY,
+    END_NOW, ExportOptions, MOMENT_HELP, SPAN_HELP, START_FIRST, START_TODAY,
 )
 from ..preview import DEFAULT_MAX_IMAGES
 from ..wells import well_name, well_spec
@@ -77,6 +77,7 @@ class App:
         self.cancel_event = threading.Event()
         self.worker = None
         self.watcher = None
+        self._last_held = None
         self.busy = False
 
         self.store = ConfigStore()
@@ -484,6 +485,36 @@ class App:
         interval.pack(side="left", padx=theme_mod.PAD_S)
         ttk.Label(speed_row, text="min", style="Muted.TLabel").pack(side="left")
         tip(interval, "How often Watch checks the instrument for a new scan.",
+            self.theme)
+        row += 1
+
+        # -- chunked watching ----------------------------------------------
+        caption("Batch", row)
+        batch_row = line(row)
+        ttk.Label(batch_row, text="Every", style="Muted.TLabel").pack(side="left")
+        self.batch_frames_var = tk.IntVar(value=0)
+        batch_frames = ttk.Spinbox(batch_row, from_=0, to=9999, width=5,
+                                   textvariable=self.batch_frames_var,
+                                   command=self._refresh_summary)
+        batch_frames.pack(side="left", padx=theme_mod.PAD_S)
+        batch_frames.bind("<FocusOut>", lambda _e: self._refresh_summary())
+        tip(batch_frames,
+            "Watch normally downloads a frame the moment it appears. Set a "
+            "number here and it waits until that many new frames are ready, "
+            "then fetches them in one go. 0 means download on sight.",
+            self.theme)
+        ttk.Label(batch_row, text="frames, or after",
+                  style="Muted.TLabel").pack(side="left",
+                                             padx=(0, theme_mod.PAD_XS))
+        self.batch_after_var = tk.StringVar(value="")
+        batch_after = ttk.Entry(batch_row, textvariable=self.batch_after_var,
+                                width=7)
+        batch_after.pack(side="left")
+        batch_after.bind("<FocusOut>", lambda _e: self._refresh_summary())
+        tip(batch_after,
+            f"...or once the oldest waiting frame is this old: {SPAN_HELP}. "
+            f"Leave blank for no time limit. '7d' collects a week at a time - "
+            f"start it with the experiment and come back on Monday.",
             self.theme)
         row += 1
 
@@ -1100,6 +1131,8 @@ class App:
             background=_processing_value(self.background_var.get()),
             workers=int(self.workers_var.get() or 4),
             interval_minutes=int(self.interval_var.get() or 10),
+            batch_frames=int(self.batch_frames_var.get() or 0),
+            batch_after=self.batch_after_var.get().strip(),
             host=self.host_var.get().strip() or DEFAULT_HOST,
             write_manifest=bool(self.manifest_var.get()),
         )
@@ -1115,6 +1148,8 @@ class App:
         self.layout_var.set(options.layout)
         self.workers_var.set(options.workers)
         self.interval_var.set(options.interval_minutes)
+        self.batch_frames_var.set(options.batch_frames)
+        self.batch_after_var.set(options.batch_after)
         self.green_lut_var.set(options.green_lut)
         self.calibrate_var.set(options.calibrate)
         self.unmix_var.set(options.unmix or PROCESSING_OFF)
@@ -1154,7 +1189,13 @@ class App:
         custom_var.set(str(value))
 
     def _validate(self):
-        options = self._current_options()
+        try:
+            options = self._current_options()
+        except ValueError as exc:
+            # A free-text field (the custom date, or the batch delay) holds
+            # something that is not a time at all.
+            messagebox.showwarning("Not ready", str(exc), parent=self.root)
+            return None
         problems = options.validate()
         if not (self.client.credentials.token_valid
                 or self.client.credentials.can_refresh):
@@ -1331,10 +1372,28 @@ class App:
         self.watch_btn.configure(state="disabled")
         self.say(f"Watching for new scans every {options.interval_minutes} "
                  f"minutes; new images go to {options.output}.", "success")
+        if options.batches:
+            self.say(f"Holding new frames until {options.batch_description}.",
+                     "muted")
+        self._last_held = None
         self.watcher = self.client.watch(
             options, progress=self._progress,
-            on_result=lambda result: self.say(result.summary(), "success"),
+            on_result=self._watch_result,
+            on_hold=lambda watcher: self._watch_hold(watcher.hold_description,
+                                                      watcher.pending_frames),
             on_error=lambda exc: self.say(f"Poll failed: {exc}", "error"))
+
+    # Both of these run on the watcher thread; say() is what crosses back.
+    def _watch_result(self, result):
+        self._last_held = None
+        self.say(result.summary(), "success")
+
+    def _watch_hold(self, description, frames):
+        """Log a held chunk once per change, not once per poll."""
+        if frames == self._last_held:
+            return
+        self._last_held = frames
+        self.say(description, "muted")
 
     def _stop(self):
         stopped = False
@@ -1353,8 +1412,38 @@ class App:
         if self.watcher and self.watcher.is_running:
             self.root.after(400, self._finish_watch)
             return
-        self.watcher = None
+        watcher, self.watcher = self.watcher, None
+        if watcher and watcher.pending_frames and self._offer_the_held_chunk(watcher):
+            return                      # the flush thread finishes the work
         self._finish_work()
+
+    def _offer_the_held_chunk(self, watcher):
+        """Stopping mid-chunk should be a choice, not a silent abandonment."""
+        held = watcher.pending_frames
+        plural = "" if held == 1 else "s"
+        if not messagebox.askyesno(
+                "Frames still waiting",
+                f"{held} frame{plural} have been held for a later chunk and "
+                f"not downloaded yet.\n\nDownload them now? They stay on the "
+                f"instrument either way.",
+                parent=self.root):
+            self.say(f"{watcher.hold_description}; still on the instrument.",
+                     "muted")
+            return False
+        self.say(f"Collecting the {held} held frame{plural}...")
+        self.worker = threading.Thread(
+            target=self._guarded, args=(self._flush_watcher, watcher),
+            name="pyincucyte-flush", daemon=True)
+        self.worker.start()
+        return True
+
+    def _flush_watcher(self, watcher):
+        """Runs on a worker thread; _guarded reports and clears the busy state."""
+        result = watcher.flush()
+        if result and result.files:
+            self.say(result.summary(), "success")
+        else:
+            self.say("Nothing left to collect.", "muted")
 
     # ==================================================================
     # files, presets, misc

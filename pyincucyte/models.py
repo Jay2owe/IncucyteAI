@@ -366,6 +366,14 @@ class ProgressEvent:
         return f"{self.stage}: {self.detail}"
 
 
+def _scan_sort_key(scan_time):
+    """Sort scan times chronologically, tolerating anything unparseable."""
+    try:
+        return (0, parse_scan_datetime(str(scan_time)))
+    except (ValueError, TypeError):
+        return (1, datetime.max)
+
+
 @dataclass
 class ExportPlan:
     """Everything a download *would* do, computed before any image is fetched.
@@ -416,6 +424,37 @@ class ExportPlan:
         if item.get("channels"):
             return [c["img_type"] for c in item["channels"]]
         return [item.get("img_type", 1)]
+
+    @property
+    def new_scan_times(self):
+        """The scan times this plan would add that the folder does not have.
+
+        Not the same as the number of files: a frame is one moment on the time
+        axis, covering every selected well and channel at once.  For the
+        per-scan layouts every planned item is new, so this is simply the
+        moments they cover.  A time stack is rewritten whole whenever one frame
+        arrives, so its item lists *every* frame in the file - only the ones the
+        resume ledger has not already recorded count as new.
+        """
+        recorded = {}
+        state = getattr(self, "_state", None)
+        if state is not None:
+            recorded = getattr(state, "entries", None) or {}
+        moments = set()
+        for item in self.items:
+            frame_times = item.get("scan_times")
+            if frame_times:
+                known = recorded.get(item.get("state_key")) or {}
+                seen = set(known.get("scan_times") or [])
+                moments.update(t for t in frame_times if t not in seen)
+            elif item.get("scan_time"):
+                moments.add(item["scan_time"])
+        return sorted(moments, key=_scan_sort_key)
+
+    @property
+    def new_frame_count(self):
+        """How many new moments this plan would add. See :attr:`new_scan_times`."""
+        return len(self.new_scan_times)
 
     @property
     def is_empty(self):

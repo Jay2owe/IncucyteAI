@@ -57,6 +57,68 @@ def parse_duration(value):
     return -delta if sign == "-" else delta
 
 
+#: An unsigned length of time, as ``batch_after`` takes: ``7d``, ``48h``, ``90m``.
+#: Unlike an offset there is no sign here - this is "how long", not "how long
+#: before or after".
+_SPAN = re.compile(r"^\+?\s*(\d+(?:\.\d+)?)\s*([smhdw])$", re.IGNORECASE)
+
+SPAN_HELP = "a length of time such as 90m, 12h, 7d or 2w"
+
+#: Largest-first, so a span is written in the biggest unit that divides it.
+#: Weeks are deliberately absent: nobody who typed ``7d`` wants to read ``1w``.
+_SPAN_UNITS = (("d", "day", 86400), ("h", "hour", 3600), ("m", "minute", 60))
+
+#: unit letter -> the word for it, for spans said out loud.
+_SPAN_WORDS = {"s": "second", "m": "minute", "h": "hour", "d": "day",
+               "w": "week"}
+
+
+def parse_span(value):
+    """Return a positive timedelta for ``7d``/``48h``, or None if not one."""
+    if isinstance(value, timedelta):
+        return value if value > timedelta(0) else None
+    match = _SPAN.match(str(value).strip())
+    if not match:
+        return None
+    amount, unit = match.groups()
+    delta = timedelta(**{_DURATION_UNITS[unit.lower()]: float(amount)})
+    return delta if delta > timedelta(0) else None
+
+
+def format_span(delta):
+    """Write a timedelta back in the biggest whole unit: ``7d``, ``90m``."""
+    seconds = int(round(delta.total_seconds()))
+    for short, _word, size in _SPAN_UNITS:
+        if seconds and seconds % size == 0:
+            return f"{seconds // size}{short}"
+    return f"{seconds}s"
+
+
+def describe_span(value):
+    """Say a length of time in words, in the unit it was written in.
+
+    ``"7d"`` reads back as "7 days", not "1 week" - the point is to echo the
+    setting the user typed, not to find the tidiest way to say it.
+    """
+    if not isinstance(value, timedelta):
+        match = _SPAN.match(str(value).strip())
+        if match:
+            amount, unit = match.groups()
+            number = float(amount)
+            count = int(number) if number == int(number) else number
+            word = _SPAN_WORDS[unit.lower()]
+            return f"{count} {word}{'' if count == 1 else 's'}"
+        value = parse_span(value)
+        if value is None:
+            return str(value)
+    seconds = int(round(value.total_seconds()))
+    for _short, word, size in _SPAN_UNITS:
+        if seconds and seconds % size == 0:
+            count = seconds // size
+            return f"{count} {word}{'' if count == 1 else 's'}"
+    return f"{seconds} second{'' if seconds == 1 else 's'}"
+
+
 def parse_frame_count(value):
     """Return a signed frame count for ``-50f`` / ``+100 frames``, or None.
 
@@ -108,6 +170,20 @@ def _as_text(value):
     return value
 
 
+def _as_span_text(value):
+    """Normalise a batch delay to its written form, or "" when there is none."""
+    if value in (None, "", 0):
+        return ""
+    if isinstance(value, timedelta):
+        return format_span(value)
+    text = str(value).strip()
+    if not text:
+        return ""
+    if parse_span(text) is None:
+        raise ValueError(f"batch_after must be {SPAN_HELP}; got {value!r}")
+    return text
+
+
 @dataclass
 class ExportOptions:
     """A complete, serialisable description of one download."""
@@ -128,6 +204,11 @@ class ExportOptions:
     unmix: str = ""                # "", "device", or "green<8%red"
     workers: int = 4
     interval_minutes: int = 10
+    # Chunked watching. Watch mode normally downloads a frame the moment it
+    # appears; these hold it back until the chunk is worth fetching - so an
+    # experiment can be left to run and collected a week at a time.
+    batch_frames: int = 0          # ...until this many new frames are waiting
+    batch_after: str = ""          # ...or the oldest has waited this long: "7d"
     host: str = None
     wells_by_vessel: dict = field(default_factory=dict)
     state_scope: str = "auto"
@@ -143,6 +224,8 @@ class ExportOptions:
         self.vessels = [int(v) for v in (self.vessels or [])]
         self.workers = max(1, min(32, int(self.workers or 1)))
         self.interval_minutes = max(1, int(self.interval_minutes or 1))
+        self.batch_frames = max(0, int(self.batch_frames or 0))
+        self.batch_after = _as_span_text(self.batch_after)
         self.wells_by_vessel = {
             str(k): v for k, v in (self.wells_by_vessel or {}).items()}
         if self.layout != "separate":
@@ -370,6 +453,40 @@ class ExportOptions:
     def processing_description(self):
         return self.recipe.describe()
 
+    # -- chunked watching -------------------------------------------------
+
+    @property
+    def batch_delay(self):
+        """``batch_after`` as a timedelta, or None when it is not set."""
+        return parse_span(self.batch_after) if self.batch_after else None
+
+    @property
+    def batches(self):
+        """True when watch mode should hold new frames back into chunks."""
+        return bool(self.batch_frames or self.batch_after)
+
+    @property
+    def batch_description(self):
+        """The condition a held chunk is waiting for, or "" when there is none.
+
+        e.g. ``"50 frames have accumulated or 7 days have passed, whichever
+        comes first"`` - written to follow "hold new frames until ...".
+        """
+        parts = []
+        if self.batch_frames:
+            plural = "" if self.batch_frames == 1 else "s"
+            parts.append(f"{self.batch_frames} frame{plural} "
+                         f"{'has' if not plural else 'have'} accumulated")
+        if self.batch_after:
+            said = describe_span(self.batch_after)
+            parts.append(f"{said} {'has' if said.startswith('1 ') else 'have'}"
+                         f" passed")
+        if not parts:
+            return ""
+        if len(parts) == 1:
+            return parts[0]
+        return f"{parts[0]} or {parts[1]}, whichever comes first"
+
     def validate(self):
         """Return a list of human-readable problems; empty means good to go."""
         problems = []
@@ -410,6 +527,8 @@ class ExportOptions:
             "processing": self.recipe.to_dict(),
             "workers": self.workers,
             "interval_minutes": self.interval_minutes,
+            "batch_frames": self.batch_frames,
+            "batch_after": self.batch_after,
             "state_scope": self.state_scope,
             "cache_payloads": self.cache_payloads,
             "write_manifest": self.write_manifest,
@@ -494,6 +613,10 @@ class ExportOptions:
             args += ["--workers", str(self.workers)]
         if command == "watch":
             args += ["-i", str(self.interval_minutes)]
+            if self.batch_frames:
+                args += ["--batch-frames", str(self.batch_frames)]
+            if self.batch_after:
+                args += ["--batch-after", self.batch_after]
         if not self.write_manifest:
             args.append("--no-manifest")
         if self.cache_payloads != "auto":
@@ -524,4 +647,5 @@ def _quote(value):
 
 __all__ = ["ExportOptions", "PRESET_VERSION", "START_FIRST", "START_TODAY",
            "END_NOW", "parse_moment", "parse_duration", "parse_frame_count",
-           "MOMENT_HELP", "FRAME_LOOKBACK_DAYS"]
+           "parse_span", "format_span", "describe_span",
+           "MOMENT_HELP", "SPAN_HELP", "FRAME_LOOKBACK_DAYS"]

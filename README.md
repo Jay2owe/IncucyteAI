@@ -85,6 +85,7 @@ pyincucyte download -v 38 -o ./images --start-from first
 pyincucyte download -v 38 -o ./images --wells D2-D5 --channels phase,green \
                     --layout time_stack
 pyincucyte watch    -v 38 -o ./images -i 10 --start-from first
+pyincucyte watch    -v 38 -o ./images -i 60 --start-from first --batch-after 7d
 
 pyincucyte download -v 38 -o ./images --calibrate --unmix device
 ```
@@ -167,6 +168,8 @@ still works.
 | `--cache` | `auto` (default), `always`, `never` — cache source payloads |
 | `--no-manifest` | Skip writing the manifest and CSV index |
 | `-i`, `--interval` | `watch` only: poll interval in minutes |
+| `--batch-frames` | `watch` only: hold new frames until N are waiting |
+| `--batch-after` | `watch` only: ...or until the oldest has waited `7d` / `12h` |
 
 ---
 
@@ -355,6 +358,45 @@ watcher.stop(wait=30)
 `Watcher` also works as a context manager, and `run_forever()` blocks if that is
 what you want.
 
+### Downloading in chunks instead of frame by frame
+
+By default a frame is fetched the moment it appears. Set `batch_frames` and/or
+`batch_after` and the watcher **holds** new frames instead, downloading only
+once the chunk is worth fetching — so an experiment can be started on the Monday
+and collected the following week in one pass:
+
+```python
+watcher = incucyte.watch(options, vessel=38, output="./run-01",
+                         start_from="first", batch_after="7d", interval=60)
+```
+
+| Setting | Meaning |
+| --- | --- |
+| `batch_frames=50` | Wait until 50 new frames are ready |
+| `batch_after="7d"` | ...or until the oldest waiting frame is 7 days old |
+| both | Whichever comes first — a fast run does not wait out the clock, and a stalled one still delivers what it has |
+| neither (default) | Download on sight |
+
+A **frame** is one moment on the time axis, not one file: 50 frames of a 24-well
+plate in two channels is 2,400 images. `batch_after` takes `90m`, `12h`, `7d`,
+`2w`, and its clock runs from the *waiting frame's own timestamp* — so pointing
+a fresh watcher at a week-old experiment collects it immediately rather than
+waiting another week, and restarting a watcher does not restart the wait.
+
+While a chunk is held nothing is written and the resume ledger is untouched, so
+the frames stay collectable however the watcher ends. To take a part-full chunk
+— the tail of an experiment that will never reach its count:
+
+```python
+watcher.flush()                      # download what is waiting, right now
+watcher.stop(flush=True)             # ...or on the way out
+print(watcher.pending_frames, watcher.hold_description)
+```
+
+`on_hold=` is called with the watcher on each poll that finds work and decides
+to wait. One caution: a poll re-checks the whole window whether or not the chunk
+is due, so pair a long chunk with a lazy `interval` (an hour, not ten minutes).
+
 ### Presets shared with the GUI
 
 ```python
@@ -407,7 +449,8 @@ PyIncucyte/
     cache.py        source-payload cache, so rebuilt stacks do not re-download
     preview.py      find a vessel by name, and look at its wells
     processing.py   optional preprocessing: calibration, background, unmixing
-    watch.py        Watcher - poll and download in a background thread
+    watch.py        Watcher - poll and download in a background thread,
+                    frame by frame or in held chunks
     engine.py       wire-level REST and ImageJ TIFF writing
     cli.py          command line
     compat.py       the import names retired in 0.3

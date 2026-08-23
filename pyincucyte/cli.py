@@ -12,7 +12,7 @@ import json
 import logging
 import re
 import sys
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 from . import __version__
@@ -28,7 +28,7 @@ from .models import (
 from .preview import DEFAULT_MAX_IMAGES, DEFAULT_SIZE
 from .processing import BACKGROUND_HELP, UNMIX_HELP
 from .options import (
-    END_NOW, ExportOptions, MOMENT_HELP, START_FIRST, START_TODAY,
+    END_NOW, ExportOptions, MOMENT_HELP, SPAN_HELP, START_FIRST, START_TODAY,
     parse_duration, parse_moment,
 )
 
@@ -159,6 +159,10 @@ def options_from_args(args, *, require_output=True):
         changes["workers"] = args.workers
     if getattr(args, "interval", None):
         changes["interval_minutes"] = args.interval
+    if getattr(args, "batch_frames", None):
+        changes["batch_frames"] = args.batch_frames
+    if getattr(args, "batch_after", None):
+        changes["batch_after"] = args.batch_after
     if getattr(args, "scan_time", None):
         changes["scan_filter"] = args.scan_time
     if getattr(args, "state_scope", None):
@@ -499,26 +503,49 @@ def cmd_watch(args):
     emit(f"  Output:   {options.output}")
     emit(f"  Layout:   {options.layout} - {LAYOUT_DESCRIPTIONS[options.layout]}")
     emit(f"  Interval: every {options.interval_minutes} minutes")
+    if options.batches:
+        emit(f"  Batch:    hold new frames until {options.batch_description}")
+        delay = options.batch_delay
+        if delay and delay >= timedelta(days=1) and options.interval_minutes < 30:
+            # Every poll re-checks the whole window, chunk due or not.
+            emit(f"            (a chunk this long is happier with -i 60 than "
+                 f"-i {options.interval_minutes})")
     emit("  Press Ctrl+C to stop\n")
 
     progress = ConsoleProgress(not args.quiet)
+    last_held = [None]
 
     def on_result(result):
         progress._clear()
+        last_held[0] = None
         emit(f"[{datetime.now():%H:%M:%S}] {result.summary()}")
+
+    def on_hold(watcher):
+        # One line per change, not one per poll: a week-long chunk polls
+        # hundreds of times and most of them have nothing new to say.
+        if watcher.pending_frames == last_held[0]:
+            return
+        last_held[0] = watcher.pending_frames
+        progress._clear()
+        emit(f"[{datetime.now():%H:%M:%S}] {watcher.hold_description}")
 
     def on_error(exc):
         progress._clear()
         emit(f"[{datetime.now():%H:%M:%S}] error: {exc}")
 
     watcher = client.watch(options, on_result=on_result, on_error=on_error,
-                           progress=progress, start=False)
+                           on_hold=on_hold, progress=progress, start=False)
     try:
         watcher.run_forever()
     except KeyboardInterrupt:
         watcher.stop()
         progress._clear()
         emit("\nStopped.")
+        if watcher.pending_frames:
+            emit(f"  {watcher.hold_description}.")
+            emit("  Those frames are still on the instrument. Collect them "
+                 "now with:")
+            emit(f"    {options.cli_command('download')}")
     return 0
 
 
@@ -658,6 +685,14 @@ def add_selection_args(parser, *, watch=False):
     if watch:
         parser.add_argument("--interval", "-i", type=int,
                             help="Poll interval in minutes (default 10)")
+        parser.add_argument("--batch-frames", type=int, metavar="N",
+                            help="Hold new frames back until N of them are "
+                                 "waiting, then fetch the chunk in one go "
+                                 "(default: download each frame on sight)")
+        parser.add_argument("--batch-after", metavar="SPAN",
+                            help=f"...or until the oldest waiting frame is "
+                                 f"this old: {SPAN_HELP}. Given both, "
+                                 f"whichever comes first wins")
 
 
 # argparse treats anything starting with "-" as an option, so

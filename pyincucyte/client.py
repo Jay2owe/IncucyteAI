@@ -859,11 +859,17 @@ class IncucyteClient:
     # -- watching ---------------------------------------------------------
 
     def watch(self, options=None, *, on_result=None, on_error=None,
-              on_poll=None, progress=None, interval=None, start=True, **kwargs):
+              on_poll=None, on_hold=None, progress=None, interval=None,
+              start=True, **kwargs):
         """Poll for new scans and download them as they appear.
 
         Returns a :class:`~pyincucyte.watch.Watcher` running in its own thread,
         so a pipeline can carry on and call ``stop()`` when it is done.
+
+        Pass ``batch_frames`` and/or ``batch_after`` to download in chunks
+        instead of frame by frame - ``batch_after="7d"`` collects a week at a
+        time.  ``on_hold`` is then called with the watcher on each poll that
+        finds work but decides the chunk is not ready.
         """
         from .watch import Watcher
 
@@ -871,7 +877,8 @@ class IncucyteClient:
         if interval is not None:
             options = options.replace(interval_minutes=int(interval))
         watcher = Watcher(self, options, on_result=on_result,
-                          on_error=on_error, on_poll=on_poll, progress=progress)
+                          on_error=on_error, on_poll=on_poll, on_hold=on_hold,
+                          progress=progress)
         if start:
             watcher.start()
         return watcher
