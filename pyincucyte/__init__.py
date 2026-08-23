@@ -1,0 +1,113 @@
+"""PyIncucyte - download Incucyte live-cell images from Python.
+
+Two ways in.  A desktop app::
+
+    pyincucyte gui                  # or: pyincucyte-gui, python -m pyincucyte.gui
+
+...and an importable API for an automated pipeline::
+
+    from pyincucyte import IncucyteClient
+
+    with IncucyteClient.from_saved() as incucyte:
+        result = incucyte.fetch(
+            vessel=38, output="./run-01", wells="A1-D6",
+            channels="phase,green", layout="time_channel_stack",
+            start_from="first")
+
+    for image in result.files:
+        segment(image.path, well=image.well, channels=image.channels)
+
+``result.files`` carries the well, channel names, timepoints and axis order for
+every file, and the same information is written to ``pyincucyte-manifest.json``
+next to the images so a later stage can pick up without re-parsing filenames.
+"""
+
+import logging
+
+__version__ = "0.3.0"
+
+# A library should not configure logging for its host application; this only
+# stops "No handlers could be found" warnings when nobody has set one up.
+logging.getLogger("pyincucyte").addHandler(logging.NullHandler())
+
+from .errors import (  # noqa: E402
+    ApiError,
+    AuthenticationError,
+    DeviceUnreachableError,
+    EncryptionUnavailableError,
+    ExportCancelled,
+    ExportError,
+    IncucyteError,
+    NotLoggedInError,
+    TokenExpiredError,
+    VesselNotFoundError,
+)
+from .models import (  # noqa: E402
+    DownloadResult,
+    ExportPlan,
+    LAYOUTS,
+    LAYOUT_AXES,
+    LAYOUT_DESCRIPTIONS,
+    LAYOUT_LABELS,
+    OutputFile,
+    ProgressEvent,
+    Vessel,
+    human_bytes,
+    resolve_layout,
+)
+from .options import ExportOptions  # noqa: E402
+from .config import ConfigStore, Credentials  # noqa: E402
+from .state import StateStore  # noqa: E402
+from .client import IncucyteClient  # noqa: E402
+from .watch import Watcher  # noqa: E402
+from .manifest import load_manifest, write_manifest  # noqa: E402
+from .engine import DEFAULT_HOST, APP_DIR  # noqa: E402
+
+# Import names retired in 0.3 - see pyincucyte.compat.
+from . import compat  # noqa: E402
+
+compat.install()
+
+
+def connect(host=None, username=None, password=None):
+    """Return a ready client - saved login by default, or fresh credentials."""
+    if username and password:
+        return IncucyteClient.connect(host or DEFAULT_HOST, username, password)
+    return IncucyteClient.from_saved(host)
+
+
+__all__ = [
+    "__version__",
+    "connect",
+    "IncucyteClient",
+    "ExportOptions",
+    "ExportPlan",
+    "DownloadResult",
+    "OutputFile",
+    "ProgressEvent",
+    "Vessel",
+    "Watcher",
+    "StateStore",
+    "ConfigStore",
+    "Credentials",
+    "LAYOUTS",
+    "LAYOUT_AXES",
+    "LAYOUT_LABELS",
+    "LAYOUT_DESCRIPTIONS",
+    "resolve_layout",
+    "human_bytes",
+    "load_manifest",
+    "write_manifest",
+    "DEFAULT_HOST",
+    "APP_DIR",
+    "IncucyteError",
+    "ApiError",
+    "AuthenticationError",
+    "NotLoggedInError",
+    "TokenExpiredError",
+    "DeviceUnreachableError",
+    "EncryptionUnavailableError",
+    "VesselNotFoundError",
+    "ExportError",
+    "ExportCancelled",
+]

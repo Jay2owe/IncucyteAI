@@ -1,4 +1,6 @@
 .tmp/
+.venv/
+venv/
 __pycache__/
 *.pyc
 *.wsdl
@@ -7,5 +9,6 @@ dist/
 *.egg-info/
 *.tif
 *.tiff
+.pytest_cache/
 CLAUDE.md
 SETUP_PLAN.md
