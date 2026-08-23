@@ -25,6 +25,7 @@ from . import channels as ch
 from . import engine
 from .cache import cache_for_output
 from . import preview as preview_mod
+from . import processing
 from . import manifest as manifest_mod
 from . import wells as wl
 from .config import ConfigStore, Credentials
@@ -283,16 +284,25 @@ class IncucyteClient:
         if not isinstance(infos, list):
             infos = []
         wells, channels, sites = set(), set(), set()
+        coefficients = {}
         for image in infos:
             swell = image.get("Swell") or {}
             site = image.get("SwellSite") or {}
-            wells.add((swell.get("RowZeroBased", 0), swell.get("ColumnZeroBased", 0)))
-            channels.add(image.get("ImageType", 1))
-            sites.add(site.get("ValueZeroBased", 0))
+            row = swell.get("RowZeroBased", 0)
+            col = swell.get("ColumnZeroBased", 0)
+            index = site.get("ValueZeroBased", 0)
+            img_type = image.get("ImageType", 1)
+            wells.add((row, col))
+            channels.add(img_type)
+            sites.add(index)
+            found = processing.coefficients_from_image(image)
+            if found:
+                coefficients.setdefault((row, col, index), {})[img_type] = found
         if not wells:
             return None
         return {"wells": wells, "channels": channels, "sites": sites,
-                "image_count": len(infos)}
+                "image_count": len(infos), "coefficients": coefficients,
+                "unmixing": processing.Unmixing.from_scan(scan)}
 
     def find_vessels(self, name=None, *, vessel=None, owner=None, plate=None,
                      channel=None, scanned_only=False, refresh=False):
@@ -403,7 +413,9 @@ class IncucyteClient:
                 vessel=vessel, scan_time=scan_time,
                 wells=detail.get("wells"), channels=detail.get("channels", set()),
                 sites=detail.get("sites", set()),
-                image_count=detail.get("image_count", 0), client=self))
+                image_count=detail.get("image_count", 0),
+                coefficients=detail.get("coefficients") or {},
+                unmixing=detail.get("unmixing"), client=self))
             if len(scans) >= wanted:
                 break
         return scans
@@ -478,9 +490,27 @@ class IncucyteClient:
         for scan_time in sorted(collected, key=collected.get):
             yield scan_time
 
+    def unmixing(self, target=None, **find):
+        """The unmixing the Incucyte has saved for a vessel, ready to adjust.
+
+            mixing = incucyte.unmixing("Cry1")   # what is set on the instrument
+            mixing["green"] = 0.12               # not enough was coming out
+            incucyte.fetch(vessel=38, output="./run-01", unmix=mixing)
+
+        Returns an empty :class:`~pyincucyte.processing.Unmixing` when nobody
+        has configured any - which is the usual state, and a perfectly good
+        starting point for setting your own.
+        """
+        scans = self._scans_to_preview(target, **find)
+        if not scans:
+            raise VesselNotFoundError(
+                "No scan matched, so there is no saved unmixing to read.")
+        return scans[0].unmixing or processing.Unmixing()
+
     def preview(self, target=None, *, wells=None, channels=None, site=0,
                 size=None, contrast="auto", max_images=None, workers=4,
-                cache=True, progress=None, cancel=None, **find):
+                cache=True, calibrate=False, background="", unmix="",
+                progress=None, cancel=None, **find):
         """Fetch thumbnails of what is in the wells, ready to be shown.
 
             incucyte.preview("Cry1", wells="A1-B3").show()
@@ -493,6 +523,14 @@ class IncucyteClient:
         filters.  Wells and channels the scan does not hold are dropped rather
         than requested.
 
+        ``calibrate``, ``background`` and ``unmix`` are the same options a
+        download takes, so a preview can answer "is this the right ratio?"
+        before anything is written::
+
+            mixing = incucyte.unmixing(38)
+            mixing["green"] = 0.12
+            incucyte.preview(38, unmix=mixing).show()
+
         The device has no thumbnail route, so each tile is a full-size image
         off the wire: ``max_images`` (24 by default) is the brake, and the
         contrast stretch means these pixels are for recognition only.
@@ -501,11 +539,18 @@ class IncucyteClient:
         size = int(size or preview_mod.DEFAULT_SIZE)
         max_images = (preview_mod.DEFAULT_MAX_IMAGES if max_images is None
                       else max_images)
+        recipe = processing.Recipe(
+            calibrate=bool(calibrate),
+            background="" if background is None else str(background),
+            unmix=processing.normalise_unmix(unmix))
+        problems = recipe.validate()
+        if problems:
+            raise ValueError("; ".join(problems))
         scans = self._scans_to_preview(target, progress=progress, cancel=cancel,
                                        **find)
         requests, skipped = preview_mod.build_requests(
             scans, wells=wells, channels=channels, site=site,
-            max_images=max_images)
+            max_images=max_images, recipe=recipe)
         if skipped:
             self.log.info("preview capped at %d images; %d not fetched",
                           max_images, skipped)
@@ -515,7 +560,8 @@ class IncucyteClient:
             cache=self.preview_cache if cache else None)
         result = preview_mod.PreviewSet(
             images=images, scans=scans, requested=len(requests), skipped=skipped,
-            cancelled=cancel.is_set(), size=size, contrast=contrast)
+            cancelled=cancel.is_set(), size=size, contrast=contrast,
+            recipe=recipe)
         _call(progress, ProgressEvent(stage="done", detail=result.summary()))
         return result
 

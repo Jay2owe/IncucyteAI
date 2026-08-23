@@ -155,6 +155,12 @@ class ExportOptions:
         wl.parse_wells(self.wells)
         for spec in self.wells_by_vessel.values():
             wl.parse_wells(spec)
+        # unmix may arrive as an Unmixing object or a list of terms; the
+        # canonical form is the spec string, so a preset stays plain JSON.
+        from .processing import normalise_unmix
+
+        self.unmix = normalise_unmix(self.unmix)
+        self.background = "" if self.background is None else str(self.background)
         self.start_from = _as_text(self.start_from)
         self.end_at = _as_text(self.end_at)
 

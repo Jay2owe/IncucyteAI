@@ -211,6 +211,10 @@ class VesselScan:
     channels: set = field(default_factory=set)      # ImageType numbers present
     sites: set = field(default_factory=set)
     image_count: int = 0
+    #: (row, col, site) -> {channel: {scale, bias, median}} for fluorescence.
+    coefficients: dict = field(default_factory=dict, repr=False)
+    #: What the Incucyte software has saved for this vessel, ready to adjust.
+    unmixing: object = None
     client: object = field(default=None, repr=False)
 
     # -- identity ---------------------------------------------------------
@@ -295,6 +299,7 @@ class VesselScan:
                 for c in sorted(self.channels, key=ch.image_type_sort_key)],
             "sites": sorted(self.sites),
             "image_count": self.image_count,
+            "unmixing": str(self.unmixing or ""),
         }
 
     def __repr__(self):

@@ -162,7 +162,7 @@ class Recipe:
         if self.wants_unmixing:
             parts.append("unmixed with the vessel's saved values"
                          if self.uses_device_unmixing
-                         else f"unmixed ({self.unmix})")
+                         else f"unmixed ({Unmixing.coerce(self.unmix).describe()})")
         return ", ".join(parts)
 
     def to_dict(self):
@@ -209,6 +209,198 @@ def parse_unmix(spec):
                       "ratio": amount,
                       "sigma": float(match.group("sigma") or 0.0)})
     return pairs
+
+
+# ---------------------------------------------------------------------------
+# unmixing you can adjust
+# ---------------------------------------------------------------------------
+
+def other_colour(channel):
+    """The fluorescence channel that is not this one."""
+    return ch.COLOR2 if int(channel) == ch.COLOR1 else ch.COLOR1
+
+
+class Unmixing:
+    """A set of unmixing terms: read them off the device, change them, use them.
+
+    Whoever set the percentages in the Incucyte software was matching what
+    looked right on screen, which is not always what an analysis wants.  So the
+    saved values are a starting point rather than a verdict::
+
+        mixing = incucyte.unmixing(38)      # what the instrument has saved
+        print(mixing)                       # green:8%red
+        mixing["green"] = 0.12              # too little was coming out
+        scan.preview(unmix=mixing).show()   # look before committing
+        incucyte.fetch(vessel=38, output="./run-01", unmix=mixing)
+
+    Terms are keyed by ``(recipient, contributor)``: the channel being cleaned
+    up and the one bleeding into it.  Both are device channel numbers, but any
+    method here takes ``"green"``/``"red"`` too.
+    """
+
+    def __init__(self, terms=()):
+        self._terms = {}
+        for term in terms or ():
+            if isinstance(term, dict):
+                self.set(term.get("recipient"), term.get("contributor"),
+                         term.get("ratio", 0.0), term.get("sigma", 0.0))
+            else:
+                self.set(*term)
+
+    # -- building ---------------------------------------------------------
+
+    @classmethod
+    def parse(cls, spec):
+        """Build from a spec string such as ``"green:8%red"``."""
+        return cls(parse_unmix(spec))
+
+    @classmethod
+    def from_scan(cls, scan):
+        """Build from the ``ColorUnmixes`` saved on a ``GetScanVessel`` payload."""
+        return cls(unmix_pairs_from_scan(scan))
+
+    @classmethod
+    def coerce(cls, value):
+        """Accept whatever a caller passed: spec, terms, or an Unmixing."""
+        if isinstance(value, cls):
+            return cls(value.terms())
+        if value is None or _is_off(value):
+            return cls()
+        if isinstance(value, str):
+            return cls.parse(value)
+        if isinstance(value, dict):
+            return cls([value])
+        return cls(value)
+
+    # -- reading and changing ---------------------------------------------
+
+    def set(self, recipient, contributor=None, ratio=0.0, sigma=0.0):
+        """Set one term. A ratio of 0 removes it. Returns self, so it chains."""
+        recipient = _channel_number(recipient)
+        contributor = (other_colour(recipient) if contributor is None
+                       else _channel_number(contributor))
+        if recipient == contributor:
+            raise ValueError("A channel cannot be unmixed from itself.")
+        ratio = float(ratio)
+        if not 0 <= ratio <= 1:
+            raise ValueError(
+                f"An unmix ratio must be between 0 and 1 (0% and 100%); "
+                f"got {ratio}.")
+        if ratio == 0:
+            self._terms.pop((recipient, contributor), None)
+        else:
+            self._terms[(recipient, contributor)] = {
+                "recipient": recipient, "contributor": contributor,
+                "ratio": ratio, "sigma": float(sigma or 0.0)}
+        return self
+
+    def get(self, recipient, contributor=None):
+        """The ratio for one term, or 0.0 if there is not one."""
+        recipient = _channel_number(recipient)
+        contributor = (other_colour(recipient) if contributor is None
+                       else _channel_number(contributor))
+        term = self._terms.get((recipient, contributor))
+        return term["ratio"] if term else 0.0
+
+    def blur(self, recipient, sigma, contributor=None):
+        """Blur the contributor before subtracting it, as BlurringSigma does."""
+        recipient = _channel_number(recipient)
+        contributor = (other_colour(recipient) if contributor is None
+                       else _channel_number(contributor))
+        term = self._terms.get((recipient, contributor))
+        if term is None:
+            raise KeyError(
+                f"No unmixing of {ch.image_type_label(contributor)} out of "
+                f"{ch.image_type_label(recipient)} to blur.")
+        term["sigma"] = float(sigma)
+        return self
+
+    def scaled(self, factor):
+        """A copy with every ratio multiplied - "take half as much out"."""
+        copy = Unmixing()
+        for term in self.terms():
+            copy.set(term["recipient"], term["contributor"],
+                     min(1.0, term["ratio"] * float(factor)), term["sigma"])
+        return copy
+
+    def terms(self):
+        """The terms, ordered by recipient then contributor."""
+        return [dict(self._terms[key]) for key in sorted(self._terms)]
+
+    def __getitem__(self, recipient):
+        return self.get(recipient)
+
+    def __setitem__(self, recipient, ratio):
+        self.set(recipient, None, ratio)
+
+    def __delitem__(self, recipient):
+        self.set(recipient, None, 0.0)
+
+    def __contains__(self, recipient):
+        return self.get(recipient) > 0
+
+    def __iter__(self):
+        return iter(self.terms())
+
+    def __len__(self):
+        return len(self._terms)
+
+    def __bool__(self):
+        return bool(self._terms)
+
+    def __eq__(self, other):
+        if isinstance(other, Unmixing):
+            return self.terms() == other.terms()
+        if isinstance(other, str):
+            return self.to_spec() == Unmixing.parse(other).to_spec()
+        return NotImplemented
+
+    # -- writing out ------------------------------------------------------
+
+    def to_spec(self):
+        """The spec string that parses back to this - what a preset stores."""
+        parts = []
+        for term in self.terms():
+            piece = (f"{ch.IMAGE_TYPE_SHORT_LABELS[term['recipient']]}:"
+                     f"{term['ratio'] * 100:g}%"
+                     f"{ch.IMAGE_TYPE_SHORT_LABELS[term['contributor']]}")
+            if term["sigma"]:
+                piece += f"@{term['sigma']:g}"
+            parts.append(piece)
+        return ",".join(parts)
+
+    def to_list(self):
+        return self.terms()
+
+    def describe(self):
+        if not self._terms:
+            return "no unmixing"
+        return ", ".join(
+            f"{term['ratio'] * 100:g}% of "
+            f"{ch.image_type_label(term['contributor'])} out of "
+            f"{ch.image_type_label(term['recipient'])}"
+            for term in self.terms())
+
+    def __repr__(self):
+        return f"<Unmixing {self.to_spec() or 'empty'}>"
+
+    def __str__(self):
+        return self.to_spec()
+
+
+def normalise_unmix(value):
+    """Coerce any accepted unmix input to the string an ExportOptions holds."""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        text = value.strip()
+        if _is_off(text):
+            return ""
+        if text.lower() == "device":
+            return "device"
+        # Validate now so a bad preset fails at load, not mid-download.
+        return Unmixing.parse(text).to_spec()
+    return Unmixing.coerce(value).to_spec()
 
 
 # ---------------------------------------------------------------------------
@@ -444,7 +636,8 @@ def apply(array, plan, fetch_contributor=None):
 
 
 __all__ = [
-    "Recipe", "UNMIX_HELP", "BACKGROUND_HELP", "COLOR_INDEX_OFFSET",
+    "Recipe", "Unmixing", "UNMIX_HELP", "BACKGROUND_HELP",
+    "COLOR_INDEX_OFFSET", "other_colour", "normalise_unmix",
     "parse_unmix", "unmix_pairs_from_scan", "coefficients_from_image",
     "plan_for_image", "apply", "decode",
 ]

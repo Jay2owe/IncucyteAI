@@ -58,7 +58,7 @@ from .models import (  # noqa: E402
 )
 from .options import ExportOptions  # noqa: E402
 from .preview import PreviewImage, PreviewSet  # noqa: E402
-from .processing import Recipe  # noqa: E402
+from .processing import Recipe, Unmixing  # noqa: E402
 from .config import ConfigStore, Credentials  # noqa: E402
 from .state import StateStore  # noqa: E402
 from .client import IncucyteClient  # noqa: E402
@@ -93,6 +93,7 @@ __all__ = [
     "PreviewImage",
     "PreviewSet",
     "Recipe",
+    "Unmixing",
     "Watcher",
     "StateStore",
     "ConfigStore",

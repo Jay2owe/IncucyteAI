@@ -78,6 +78,7 @@ pyincucyte login                       # saves credentials
 pyincucyte vessels                     # what is on the device
 pyincucyte find Cry1                   # which plate is that, and when
 pyincucyte preview -v 38 -w A1-B3      # look at the wells before fetching
+pyincucyte preview -v 38 --unmix green:12%red   # try a ratio before using it
 pyincucyte plan -v 38 -o ./images --start-from first     # dry run
 
 pyincucyte download -v 38 -o ./images --start-from first
@@ -160,7 +161,7 @@ still works.
 | `--workers` | Parallel fetches (default 4) |
 | `--green-lut` / `--no-green-lut` | Recolour Phase as green RGB (display only) |
 | `--calibrate` / `--no-calibrate` | Write fluorescence in calibrated units, 32-bit float |
-| `--unmix` | `device`, or a term like `green:8%red` |
+| `--unmix` | `device`, or a term like `green:8%red` (also on `preview`) |
 | `--background` | `device`, or a number of raw counts |
 | `--state-scope` | `auto` (default), `folder`, `global`, `none` |
 | `--cache` | `auto` (default), `always`, `never` — cache source payloads |
@@ -265,13 +266,42 @@ incucyte.fetch(vessel=38, output="./run-01",
 |---|---|---|
 | `calibrate` | `True` / `False` | `(raw - Bias) / Scale`, written as 32-bit float in GCU/RCU |
 | `background` | `"device"`, a number, `""` | subtracts a background level in raw counts |
-| `unmix` | `"device"`, `"green:8%red"`, `""` | subtracts a fraction of the other channel |
+| `unmix` | `"device"`, `"green:8%red"`, an `Unmixing`, `""` | subtracts a fraction of the other channel |
 
 All three default to off, apply in the order **calibrate → background → unmix →
 clip at zero**, and never touch Phase, which has no calibration. An explicit
 unmix term reads `recipient:amount contributor`, optionally with `@2` to blur
 the contributor first as the device's `BlurringSigma` does; several terms are
 comma-separated.
+
+#### Setting your own unmixing
+
+`"device"` uses whatever somebody typed into the Incucyte software, which was
+chosen to look right on screen — not necessarily what an analysis wants. Read
+it, change it, and check it before committing:
+
+```python
+mixing = incucyte.unmixing(38)      # an Unmixing: green:8%red
+mixing["green"] = 0.12              # take more red out of green
+mixing.set("red", "green", 0.02)    # and a little the other way
+mixing.blur("green", sigma=2)       # blur the contributor first, as the device can
+
+incucyte.preview(38, wells="A1", unmix=mixing).show()   # look at it
+incucyte.fetch(vessel=38, output="./run-01", unmix=mixing)
+```
+
+`Unmixing` is a small mutable set of terms keyed by `(recipient, contributor)`:
+`mixing["green"]` reads the ratio, `mixing["green"] = 0` removes the term,
+`mixing.scaled(0.5)` halves everything at once, and `str(mixing)` is the spec
+string a preset stores. `ExportOptions(unmix=...)` accepts the object, a spec
+string, or a plain list of terms, and always stores the spec — so a recipe you
+tuned in a notebook is the same recipe on the command line.
+
+Previewing is how you tune it: unmixing and background removal visibly change
+the thumbnails, so `pyincucyte preview -v 38 --unmix green:12%red` shows the
+result of a ratio before an experiment is downloaded with it. Calibration is
+invisible in a preview — it is a linear rescale and the contrast stretch undoes
+it. `pyincucyte find` prints each vessel's saved unmixing in its own column.
 
 Three things worth knowing:
 

@@ -384,9 +384,11 @@ def cmd_find(args):
         scan.vessel_id, scan.vessel.name or "-",
         f"{scan.when:%Y-%m-%d %H:%M}" if scan.when else scan.scan_time,
         scan.elapsed or "-", scan.well_count, scan.channel_summary or "-",
+        str(scan.unmixing or "") or "-",
     ] for scan in scans]
     emit()
-    print_table(rows, ["ID", "Name", "Scan", "Elapsed", "Wells", "Channels"])
+    print_table(rows, ["ID", "Name", "Scan", "Elapsed", "Wells", "Channels",
+                       "Unmixing"])
     emit(f"\n{len(scans)} scans. Look at one with: pyincucyte preview -v "
          f"{scans[0].vessel_id}")
     return 0
@@ -402,7 +404,9 @@ def cmd_preview(args):
     result = client.preview(
         scans, wells=args.wells, channels=args.channels, site=args.site,
         size=args.size, contrast=args.contrast, max_images=args.max_images,
-        workers=args.workers or 4, progress=ConsoleProgress(not args.quiet))
+        workers=args.workers or 4, calibrate=bool(args.calibrate),
+        background=args.background or "", unmix=args.unmix or "",
+        progress=ConsoleProgress(not args.quiet))
 
     saved = result.save(args.save) if args.save else []
     if args.json:
@@ -758,6 +762,15 @@ def build_parser():
     p_preview.add_argument("--no-show", dest="no_show", action="store_true",
                            help="Do not open a window")
     p_preview.add_argument("--workers", type=int, help="Parallel workers (default 4)")
+    p_preview.add_argument("--calibrate", action="store_true",
+                           help="Apply calibration (invisible here - the "
+                                "contrast stretch undoes a linear rescale)")
+    p_preview.add_argument("--unmix", metavar="SPEC",
+                           help=literal(f"Preview an unmixing before "
+                                        f"downloading with it: {UNMIX_HELP}"))
+    p_preview.add_argument("--background", metavar="LEVEL",
+                           help=literal(f"Preview a background subtraction: "
+                                        f"{BACKGROUND_HELP}"))
 
     p_plan = sub.add_parser("plan", help="Show what a download would fetch")
     add_selection_args(p_plan)

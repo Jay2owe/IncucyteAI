@@ -27,6 +27,7 @@ from pathlib import Path
 
 from . import channels as ch
 from . import engine
+from . import processing as proc
 from . import wells as wl
 from .models import ProgressEvent
 
@@ -96,12 +97,22 @@ def _resample():
     return getattr(Image, "Resampling", Image).BILINEAR
 
 
-def thumbnail(tif_bytes, size=DEFAULT_SIZE, contrast="auto"):
-    """Decode one payload and return a small uint8 array of it."""
+def thumbnail(tif_bytes, size=DEFAULT_SIZE, contrast="auto", plan=None,
+              fetch_contributor=None):
+    """Decode one payload and return a small uint8 array of it.
+
+    With a ``plan`` the same preprocessing a download would apply happens first.
+    Calibration is invisible here - it is a linear rescale and the contrast
+    stretch undoes it - but unmixing and background removal are exactly what a
+    preview is for.
+    """
     from PIL import Image
     import numpy as np
 
-    scaled = autoscale(engine._tiff_bytes_to_array(tif_bytes), contrast)
+    array = engine._tiff_bytes_to_array(tif_bytes)
+    if plan:
+        array = proc.apply(array, plan, fetch_contributor)
+    scaled = autoscale(array, contrast)
     image = Image.fromarray(scaled)
     image.thumbnail((int(size), int(size)), _resample())
     return np.asarray(image)
@@ -110,6 +121,20 @@ def thumbnail(tif_bytes, size=DEFAULT_SIZE, contrast="auto"):
 # ---------------------------------------------------------------------------
 # cache
 # ---------------------------------------------------------------------------
+
+def _plan_signature(plan):
+    """A hashable summary of a processing plan, for the thumbnail cache key.
+
+    Without it, nudging an unmix ratio would keep handing back the picture made
+    with the old one - which is exactly the comparison being made.
+    """
+    if not plan:
+        return ()
+    return (bool(plan.get("calibrate")), round(float(plan.get("background") or 0), 6),
+            tuple(sorted((term["contributor"], round(float(term["ratio"]), 6),
+                          round(float(term.get("sigma") or 0), 6))
+                         for term in plan.get("unmix") or ())))
+
 
 class ThumbCache:
     """A small in-memory store of rendered thumbnails, oldest evicted first.
@@ -130,7 +155,8 @@ class ThumbCache:
     def key(host, request, size, contrast):
         return (host, request["vessel_id"], request["scan_time"],
                 request["row"], request["col"], request["site"],
-                request["img_type"], int(size), str(contrast))
+                request["img_type"], int(size), str(contrast),
+                _plan_signature(request.get("processing")))
 
     def get(self, key):
         with self._lock:
@@ -249,6 +275,7 @@ class PreviewSet:
     cancelled: bool = False
     size: int = DEFAULT_SIZE
     contrast: str = "auto"
+    recipe: object = None          # the processing these tiles went through
 
     # -- shape ------------------------------------------------------------
 
@@ -307,11 +334,17 @@ class PreviewSet:
             return f"{vessels[0].label} - {len(self.scans)} scans"
         return f"{len(vessels)} vessels - {len(self.scans)} scans"
 
+    @property
+    def processing_description(self):
+        return self.recipe.describe() if self.recipe is not None else ""
+
     def summary(self):
         wells = len({(i.vessel_id, i.well) for i in self.images})
         parts = [f"{self.count} of {self.requested} images",
                  f"{wells} wells",
                  " + ".join(self.channels_present()) or "no channels"]
+        if self.recipe is not None and self.recipe.is_active:
+            parts.append(self.recipe.describe())
         if self.skipped:
             parts.append(f"{self.skipped} not fetched (limit reached)")
         if self.errors:
@@ -349,6 +382,8 @@ class PreviewSet:
             "cancelled": self.cancelled,
             "size": self.size,
             "contrast": self.contrast,
+            "processing": (self.recipe.to_dict() if self.recipe is not None
+                           else None),
             "bytes_fetched": self.bytes_total,
             "scans": [scan.to_dict() for scan in self.scans],
             "images": [image.to_dict() for image in self.images],
@@ -377,7 +412,18 @@ def _by_vessel(scans):
     return grouped.values()
 
 
-def build_requests(scans, wells=None, channels=None, site=0, max_images=None):
+def resolve_pairs(recipe, scan):
+    """The unmix terms for one scan: the vessel's own, or the ones asked for."""
+    if recipe is None or not recipe.wants_unmixing:
+        return []
+    if recipe.uses_device_unmixing:
+        saved = getattr(scan, "unmixing", None)
+        return list(saved) if saved else []
+    return proc.parse_unmix(recipe.unmix)
+
+
+def build_requests(scans, wells=None, channels=None, site=0, max_images=None,
+                   recipe=None):
     """Turn scans plus a well/channel selection into a flat list of tiles.
 
     Returns ``(requests, skipped)``.  Wells and channels the scan does not
@@ -387,6 +433,9 @@ def build_requests(scans, wells=None, channels=None, site=0, max_images=None):
     Order is vessel, then well, then scan time, then channel.  Well before time
     is what makes a capped preview of several scans show a couple of wells
     across the whole time course rather than the newest scan's first few wells.
+
+    A ``recipe`` attaches the same processing plan a download would use, so a
+    preview can answer "is this unmix ratio right?" before anything is written.
     """
     requests, skipped = [], 0
     wanted_channels = (ch.parse_channels(channels)
@@ -412,6 +461,9 @@ def build_requests(scans, wells=None, channels=None, site=0, max_images=None):
             for scan in group:
                 if scan.wells and (row, col) not in scan.wells:
                     continue
+                pairs = resolve_pairs(recipe, scan)
+                coefficients = (getattr(scan, "coefficients", None)
+                                or {}).get((row, col, int(site)), {})
                 present = (scan.channels or vessel.active_channels
                            or set(ch.ALL_CHANNELS))
                 types = (present if wanted_channels is None
@@ -432,8 +484,22 @@ def build_requests(scans, wells=None, channels=None, site=0, max_images=None):
                         "elapsed": scan.elapsed,
                         "fname": (f"preview VID{scan.vessel_id} "
                                   f"{wl.well_name(row, col)} type {img_type}"),
+                        "processing": proc.plan_for_image(
+                            recipe, img_type, coefficients, pairs),
                     })
     return requests, skipped
+
+
+def _contributor(client, request, img_type):
+    """Fetch the other channel of the same image, for an unmix term."""
+    other = {k: v for k, v in request.items() if k != "processing"}
+    other["img_type"] = img_type
+    other["fname"] = f"{request.get('fname', 'preview')}:unmix{img_type}"
+    raw, error = engine._fetch_scan_vessel_image_bytes(
+        client.host, client.ensure_token(), other)
+    if error or not raw:
+        raise ValueError(f"could not read channel {img_type} to unmix ({error})")
+    return engine._tiff_bytes_to_array(raw)
 
 
 def _image_from(request, **extra):
@@ -489,7 +555,10 @@ def fetch_previews(client, requests, *, size=DEFAULT_SIZE, contrast="auto",
             announce(image)
             return index, image
         try:
-            array = thumbnail(raw, size=size, contrast=contrast)
+            array = thumbnail(raw, size=size, contrast=contrast,
+                              plan=request.get("processing"),
+                              fetch_contributor=lambda number: _contributor(
+                                  client, request, number))
         except Exception as exc:            # a bad payload is not a fatal error
             image = _image_from(request, error=f"could not render: {exc}",
                                 source_bytes=len(raw))

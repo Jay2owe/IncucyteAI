@@ -103,6 +103,69 @@ class DeviceValueTests(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# adjusting it
+# ---------------------------------------------------------------------------
+
+class UnmixingObjectTests(unittest.TestCase):
+    def test_a_ratio_can_be_set_by_channel_name(self):
+        mixing = processing.Unmixing()
+        mixing["green"] = 0.12
+        self.assertEqual(mixing.to_spec(), "green:12%red")
+        self.assertEqual(mixing["green"], 0.12)
+
+    def test_the_contributor_defaults_to_the_other_colour(self):
+        self.assertEqual(processing.Unmixing().set("red", ratio=0.02).to_spec(),
+                         "red:2%green")
+
+    def test_device_values_can_be_read_then_changed(self):
+        mixing = processing.Unmixing.from_scan(
+            {"ColorUnmixes": [unmix_pair(1, 2, 0.08)]})
+        self.assertEqual(mixing.to_spec(), "green:8%red")
+        mixing["green"] = 0.12
+        self.assertEqual(mixing.to_spec(), "green:12%red")
+
+    def test_a_spec_round_trips_through_the_object(self):
+        for spec in ("green:8%red", "red:2.5%green", "green:8%red,red:2%green",
+                     "green:8%red@1.5"):
+            self.assertEqual(processing.Unmixing.parse(spec).to_spec(), spec)
+
+    def test_setting_a_ratio_of_zero_removes_the_term(self):
+        mixing = processing.Unmixing.parse("green:8%red,red:2%green")
+        mixing["green"] = 0
+        self.assertEqual(mixing.to_spec(), "red:2%green")
+        self.assertEqual(len(mixing), 1)
+
+    def test_scaled_tunes_every_term_at_once(self):
+        mixing = processing.Unmixing.parse("green:8%red,red:2%green")
+        self.assertEqual(mixing.scaled(0.5).to_spec(), "green:4%red,red:1%green")
+
+    def test_blur_matches_the_devices_blurring_sigma(self):
+        mixing = processing.Unmixing.parse("green:8%red").blur("green", 2)
+        self.assertEqual(mixing.to_spec(), "green:8%red@2")
+
+    def test_an_impossible_ratio_is_refused_at_the_point_of_setting(self):
+        with self.assertRaises(ValueError):
+            processing.Unmixing().set("green", ratio=1.4)
+
+    def test_an_empty_unmixing_is_falsey_and_means_no_unmixing(self):
+        self.assertFalse(processing.Unmixing())
+        self.assertEqual(processing.Unmixing().to_spec(), "")
+
+    def test_options_accept_the_object_and_store_the_spec(self):
+        mixing = processing.Unmixing().set("green", ratio=0.12)
+        options = ExportOptions(output=".", vessels=[38], unmix=mixing)
+        self.assertEqual(options.unmix, "green:12%red")
+        self.assertEqual(
+            ExportOptions.from_dict(options.to_dict()).unmix, "green:12%red")
+
+    def test_options_accept_a_plain_list_of_terms(self):
+        options = ExportOptions(
+            output=".", vessels=[38],
+            unmix=[{"recipient": 2, "contributor": 3, "ratio": 0.08}])
+        self.assertEqual(options.unmix, "green:8%red")
+
+
+# ---------------------------------------------------------------------------
 # the arithmetic
 # ---------------------------------------------------------------------------
 
@@ -363,6 +426,55 @@ class ProcessedDownloadTests(unittest.TestCase):
         with patched(self.device):
             plan = self.client.plan(self.options(calibrate=True))
         self.assertIn("Pixels: calibrated units", plan.summary())
+
+    # -- reading it off the device, and adjusting it -----------------------
+
+    def test_the_saved_unmixing_can_be_read_off_the_vessel(self):
+        with patched(self.device):
+            mixing = self.client.unmixing(38)
+        self.assertEqual(mixing.to_spec(), "green:10%red")
+
+    def test_a_read_and_adjusted_ratio_is_what_gets_applied(self):
+        with patched(self.device):
+            mixing = self.client.unmixing(38)
+            mixing["green"] = 0.25
+            result = self.client.fetch(self.options(unmix=mixing))
+        pixels = tifffile.imread(str(result.files[0].path))
+        self.assertEqual(int(pixels[0, 0]), 1000 - 100)
+
+    def test_an_empty_unmixing_reads_back_as_no_unmixing(self):
+        self.device.unmixes = []
+        with patched(self.device):
+            self.assertEqual(len(self.client.unmixing(38)), 0)
+
+    def preview_pixel(self, **changes):
+        """The 8-bit value one preview tile ends up with, raw stretch and all."""
+        with patched(self.device):
+            result = self.client.preview(38, wells="A1", channels="green",
+                                         contrast="raw", **changes)
+        return int(result.ok[0].array[0, 0]), result
+
+    def test_the_preview_applies_the_ratio_being_tried(self):
+        # Bright pixels, so the difference survives the 8-bit display stretch.
+        self.device.pixels = {1: 120, 2: 60000, 3: 40000}
+        value, result = self.preview_pixel(unmix="green:50%red")
+        self.assertEqual(value, int((60000 - 20000) * 255 / 65535))
+        self.assertIn("unmixed", result.summary())
+
+    def test_changing_the_ratio_is_not_served_from_the_thumbnail_cache(self):
+        # The whole point of previewing a ratio is comparing it with another,
+        # which a cache keyed only on the well would quietly prevent.
+        self.device.pixels = {1: 120, 2: 60000, 3: 40000}
+        gentle, _ = self.preview_pixel(unmix="green:10%red")
+        strong, _ = self.preview_pixel(unmix="green:50%red")
+        self.assertEqual(gentle, int((60000 - 4000) * 255 / 65535))
+        self.assertEqual(strong, int((60000 - 20000) * 255 / 65535))
+        self.assertNotEqual(gentle, strong)
+
+    def test_find_json_reports_what_the_instrument_has_saved(self):
+        with patched(self.device):
+            scan = self.client.find_scans(vessel=38)[0]
+        self.assertEqual(scan.to_dict()["unmixing"], "green:10%red")
 
     def test_copy_cli_command_carries_the_recipe(self):
         # The GUI's "Copy CLI command" is how a settings screen becomes a line

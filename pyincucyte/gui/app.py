@@ -1216,11 +1216,17 @@ class App:
             self.say("Select a vessel first, then View images.", "warn")
             return
         vessel_id = self.active_vessel if self.active_vessel in ids else ids[0]
+        # Preview whatever the Processing row is set to, so what is on screen
+        # is what a download would write.
         self._run_worker(self._view_images_worker, vessel_id,
                          self.selected_wells.get(vessel_id),
-                         self._selected_channels())
+                         self._selected_channels(),
+                         {"calibrate": bool(self.calibrate_var.get()),
+                          "unmix": _processing_value(self.unmix_var.get()),
+                          "background": _processing_value(
+                              self.background_var.get())})
 
-    def _view_images_worker(self, vessel_id, wells, channels):
+    def _view_images_worker(self, vessel_id, wells, channels, recipe=None):
         self.say(f"Vessel {vessel_id}: finding the most recent scan ...")
         scans = self.client.find_scans(vessel=vessel_id, most_recent=1,
                                        progress=self._progress,
@@ -1234,7 +1240,7 @@ class App:
         result = self.client.preview(
             scan, wells=wells, channels=channels or None,
             max_images=PREVIEW_MAX_IMAGES, progress=self._progress,
-            cancel=self.cancel_event)
+            cancel=self.cancel_event, **(recipe or {}))
         if self.cancel_event.is_set():
             self.say("Preview cancelled.", "muted")
             return
