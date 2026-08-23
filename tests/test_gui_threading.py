@@ -3,6 +3,7 @@
 import queue
 import threading
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from pyincucyte.gui import app as app_module
@@ -123,6 +124,88 @@ class StateMigrationTests(unittest.TestCase):
     def test_a_current_settings_file_is_left_alone(self):
         current = {"options": {"output": "keep"}, "dark": True}
         self.assertIs(App._migrate_state(current), current)
+
+
+class RecordingClient:
+    """Records the writes the app asks for, and how they were confirmed."""
+
+    def __init__(self):
+        self.scans = []
+        self.unmixes = []
+
+    def begin_scan(self, vessel_id, **kwargs):
+        self.scans.append((vessel_id, kwargs))
+        return SimpleNamespace(summary=lambda: "Idle")
+
+    def save_unmix(self, vessel_id, mixing, **kwargs):
+        self.unmixes.append((vessel_id, str(mixing), kwargs))
+
+
+class DeviceWriteTests(unittest.TestCase):
+    """Nothing reaches the shared instrument without a dialog first."""
+
+    def app_with(self, selected, options_unmix="green:8%red"):
+        app = object.__new__(App)
+        app.root = None                    # only ever passed as a dialog parent
+        app.vessels = []
+        app.client = RecordingClient()
+        app.started = []
+        app._selected_vessel_ids = lambda: list(selected)
+        app._run_worker = lambda target, *args: app.started.append((target, args))
+        app._current_options = lambda: SimpleNamespace(unmix=options_unmix)
+        return app
+
+    def test_scanning_needs_exactly_one_vessel(self):
+        app = self.app_with([38, 39])
+        with patch.object(app_module.messagebox, "showinfo") as told:
+            app._scan_now()
+        self.assertTrue(told.called)
+        self.assertEqual(app.started, [], "nothing should have been started")
+
+    def test_declining_the_dialog_starts_no_work(self):
+        app = self.app_with([38])
+        with patch.object(app_module.messagebox, "askyesno", return_value=False):
+            app._scan_now()
+        self.assertEqual(app.started, [])
+
+    def test_accepting_the_dialog_hands_the_vessel_to_a_worker(self):
+        app = self.app_with([38])
+        with patch.object(app_module.messagebox, "askyesno", return_value=True):
+            app._scan_now()
+        self.assertEqual(len(app.started), 1)
+        target, args = app.started[0]
+        self.assertEqual(target, app._scan_now_worker)
+        self.assertEqual(args, (38,))
+
+    def test_the_worker_confirms_the_write(self):
+        app = self.app_with([38])
+        app.status = SimpleNamespace(set_message=lambda *_: None)
+        app._post = lambda callback, *args, **kwargs: None
+        app.say = lambda *args, **kwargs: None
+        app._scan_now_worker(38)
+        vessel_id, kwargs = app.client.scans[0]
+        self.assertEqual(vessel_id, 38)
+        self.assertTrue(kwargs["confirm"])
+
+    def test_saving_unmixing_asks_first_and_passes_the_current_recipe(self):
+        app = self.app_with([38])
+        with patch.object(app_module.messagebox, "askyesno", return_value=True):
+            app._save_unmix()
+        target, args = app.started[0]
+        self.assertEqual(target, app._save_unmix_worker)
+        self.assertEqual(str(args[1]), "green:8%red")
+
+    def test_a_bad_unmix_spec_is_reported_not_raised(self):
+        app = self.app_with([38], options_unmix="not a spec")
+
+        def explode():
+            raise ValueError("that is not an unmixing")
+
+        app._current_options = explode
+        with patch.object(app_module.messagebox, "showerror") as told:
+            app._save_unmix()
+        self.assertTrue(told.called)
+        self.assertEqual(app.started, [])
 
 
 if __name__ == "__main__":

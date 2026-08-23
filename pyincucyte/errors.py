@@ -54,6 +54,20 @@ class ExportCancelled(IncucyteError):
     """A download was stopped by its cancel event before finishing."""
 
 
+class ConfirmationRequiredError(IncucyteError):
+    """A write to the instrument was attempted without confirming it.
+
+    Everything else in PyIncucyte reads.  The handful of calls that change the
+    instrument refuse until the caller says so in as many words, because the
+    Incucyte is shared: ``confirm=True`` in Python, ``--yes`` on the command
+    line, the dialog in the app.
+    """
+
+
+class DeviceBusyError(IncucyteError):
+    """The instrument is in a state that makes this write pointless or unsafe."""
+
+
 __all__ = [
     "IncucyteError",
     "DeviceUnreachableError",
@@ -65,4 +79,6 @@ __all__ = [
     "VesselNotFoundError",
     "ExportError",
     "ExportCancelled",
+    "ConfirmationRequiredError",
+    "DeviceBusyError",
 ]

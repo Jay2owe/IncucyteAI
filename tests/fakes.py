@@ -12,7 +12,7 @@ from datetime import datetime, timedelta
 import numpy as np
 from PIL import Image
 
-from pyincucyte import engine
+from pyincucyte import device, engine
 from pyincucyte.config import ConfigStore, Credentials
 
 
@@ -72,7 +72,8 @@ class FakeDevice:
 
     def __init__(self, vessels=None, scans=None, wells=((0, 0), (0, 1)),
                  channels=(1, 2), missing_scans=(), calibration=None,
-                 unmixes=None, pixels=None):
+                 unmixes=None, pixels=None, activity="Idle", drawer="Closed",
+                 user_id=7, next_scan=None, refuse=None):
         self.vessels = list(vessels or [vessel_record()])
         self.scans = list(scans or ["2026-03-01T09:00:00", "2026-03-01T12:00:00"])
         self.wells = list(wells)
@@ -84,13 +85,27 @@ class FakeDevice:
         self.unmixes = list(unmixes or [])
         #: channel number -> the value every pixel of that channel holds.
         self.pixels = dict(pixels or {})
+        #: what the instrument says it is doing, by DeviceActivityTypeCode name.
+        self.activity = activity
+        self.drawer = drawer
+        self.next_scan = next_scan
+        self.user_id = user_id
+        #: route -> message, to make one route answer with an API exception.
+        self.refuse = dict(refuse or {})
         self.calls = []
         self.fetches = []
+        #: every write the device was asked to make, so a test can prove that
+        #: an unconfirmed call sent nothing at all.
+        self.scans_requested = []
+        self.saved_unmixes = []
 
     # -- routes -----------------------------------------------------------
 
     def api_post(self, host, token, route, payload=None, timeout=None):
         self.calls.append((route, payload))
+        if route in self.refuse:
+            raise engine.ApiError(f"API exception: {self.refuse[route]}",
+                                  route=route)
         if route == "Vessels/GetAllSearchVessels":
             return {"Data": {"$values": self.vessels}}
         if route == "Scans/AllScanTimes":
@@ -112,9 +127,62 @@ class FakeDevice:
             if self.unmixes:
                 scan["ColorUnmixes"] = {"$values": list(self.unmixes)}
             return {"Data": scan}
-        if route == "Device/Status/GetDeviceStatusUpdate":
-            return {"Data": {"State": "Idle"}}
+        if route == device.ROUTE_STATUS:
+            return {"Data": self.status_payload()}
+        if route == device.ROUTE_TEMPERATURES:
+            return {"Data": {"$values": [self.temperature_payload()]}}
+        if route == device.ROUTE_SCAN_PATTERN:
+            return {"Data": {
+                "Name": "Standard",
+                "ImagesPerSwell": 2,
+                "Magnification": "X10",
+                "IsWholeWellSamplePattern": False,
+                "Swells": {"$values": [{"RowZeroBased": r, "ColumnZeroBased": c}
+                                       for (r, c) in self.wells]},
+            }}
+        if route == device.ROUTE_VALIDATE_LOGIN:
+            return {"Data": {"ID": self.user_id, "UserName": "tester",
+                             "PermissionLevel": 2}}
+        if route == device.ROUTE_BEGIN_SCAN:
+            self.scans_requested.append(payload)
+            return {"Data": True}
+        if route == device.ROUTE_SAVE_UNMIX:
+            self.saved_unmixes.append(payload)
+            return {"Data": True}
         raise AssertionError(f"unexpected route {route}")
+
+    # -- device state -----------------------------------------------------
+
+    def status_payload(self):
+        """A DeviceStatusUpdateState, with the enums as the ints .NET sends."""
+        return {
+            "DeviceStatus": {
+                "DeviceActivity": device.DEVICE_ACTIVITY.index(self.activity),
+                "DrawerStatus": device.DRAWER_STATUS.index(self.drawer),
+                "IsAutomationMode": False,
+                "PercentageComplete": 42.0 if self.activity == "Scanning" else None,
+                "TimeToComplete": "01:12:00" if self.activity == "Scanning" else None,
+                "LastScan": self.scans[-1] if self.scans else None,
+                "DateTime": datetime.now().isoformat(timespec="seconds"),
+                "NextScanInfo": {"NextScan": self.next_scan,
+                                 "UserName": "tester" if self.next_scan else "",
+                                 "LastModified": None},
+                "Temperature": self.temperature_payload(),
+            },
+            "ValidAcquisitionTypes": {"$values": [0]},
+        }
+
+    def temperature_payload(self):
+        return {
+            "DeviceDateTime": datetime.now().isoformat(timespec="seconds"),
+            "DeviceActivity": device.DEVICE_ACTIVITY.index(self.activity),
+            "GantryBoardDegreesCelcius": 37.4,
+            "OpticsBoardDegreesCelcius": 36.1,
+            "CubeBoardDegreesCelcius": None,
+            "CameraDegreesCelcius": 29.8,
+            "PredictedTemp": 37.0,
+            "AcquisitionTypeID": 1,
+        }
 
     # -- pixels -----------------------------------------------------------
 

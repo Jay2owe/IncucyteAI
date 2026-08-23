@@ -33,6 +33,8 @@ logging.getLogger("pyincucyte").addHandler(logging.NullHandler())
 from .errors import (  # noqa: E402
     ApiError,
     AuthenticationError,
+    ConfirmationRequiredError,
+    DeviceBusyError,
     DeviceUnreachableError,
     EncryptionUnavailableError,
     ExportCancelled,
@@ -56,6 +58,7 @@ from .models import (  # noqa: E402
     human_bytes,
     resolve_layout,
 )
+from .device import DeviceState, ScanPattern  # noqa: E402
 from .options import ExportOptions  # noqa: E402
 from .preview import PreviewImage, PreviewSet  # noqa: E402
 from .processing import Recipe, Unmixing  # noqa: E402
@@ -90,6 +93,8 @@ __all__ = [
     "ProgressEvent",
     "Vessel",
     "VesselScan",
+    "DeviceState",
+    "ScanPattern",
     "PreviewImage",
     "PreviewSet",
     "Recipe",
@@ -118,4 +123,6 @@ __all__ = [
     "VesselNotFoundError",
     "ExportError",
     "ExportCancelled",
+    "ConfirmationRequiredError",
+    "DeviceBusyError",
 ]

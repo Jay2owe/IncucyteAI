@@ -26,7 +26,7 @@ from .models import (
     LAYOUT_DESCRIPTIONS, LAYOUTS, human_bytes, layout_from_flags, resolve_layout,
 )
 from .preview import DEFAULT_MAX_IMAGES, DEFAULT_SIZE
-from .processing import BACKGROUND_HELP, UNMIX_HELP
+from .processing import BACKGROUND_HELP, UNMIX_HELP, Unmixing
 from .options import (
     END_NOW, ExportOptions, MOMENT_HELP, SPAN_HELP, START_FIRST, START_TODAY,
     parse_duration, parse_moment,
@@ -550,13 +550,91 @@ def cmd_watch(args):
 
 
 def cmd_status(args):
+    """What the instrument is doing. Exits non-zero if it reports a fault."""
     client = make_client(args)
-    status = client.device_status()
+    state = client.device_state()
+    patterns = {}
+    for vessel_id in getattr(args, "vessel", None) or []:
+        patterns[vessel_id] = client.scan_pattern(vessel_id)
     if args.json:
-        emit_json(status)
-    else:
-        emit("\n=== Device status ===\n")
-        emit(json.dumps(status, indent=2, default=str)[:4000])
+        payload = state.to_dict()
+        if patterns:
+            payload["vessels"] = {
+                str(vessel_id): {"pattern": pattern.name,
+                                 "wells": pattern.well_count,
+                                 "images_per_well": pattern.images_per_well}
+                for vessel_id, pattern in patterns.items()}
+        if getattr(args, "raw", False):
+            payload["raw"] = state.raw
+        emit_json(payload)
+        return 1 if state.has_problem else 0
+    emit(f"\n=== {client.host} ===\n")
+    for line in state.describe():
+        emit(f"  {line}")
+    for vessel_id, pattern in patterns.items():
+        emit(f"  Vessel {vessel_id}:    {pattern.summary()}")
+    if getattr(args, "raw", False):
+        emit("\n" + json.dumps(state.raw, indent=2, default=str)[:4000])
+    return 1 if state.has_problem else 0
+
+
+def confirm_write(args, question):
+    """``--yes``, or an interactive yes. A script without a tty gets neither.
+
+    Returning False is not a refusal here - it lets the client raise
+    ConfirmationRequiredError, which says how to confirm properly.
+    """
+    if getattr(args, "yes", False):
+        return True
+    if not sys.stdin or not sys.stdin.isatty():
+        return False
+    emit(question)
+    try:
+        return input("  Type yes to go ahead: ").strip().lower() in ("y", "yes")
+    except EOFError:
+        return False
+
+
+def cmd_scan_now(args):
+    """Ask the instrument to scan one vessel now. Writes; needs confirming."""
+    client = make_client(args)
+    vessel_id = args.vessel
+    state = client.device_state()
+    emit(f"\n=== {client.host} ===\n")
+    for line in state.describe():
+        emit(f"  {line}")
+    emit("")
+    agreed = confirm_write(
+        args, f"  This asks the instrument to scan vessel {vessel_id} now.")
+    client.begin_scan(vessel_id, confirm=agreed, force=args.force, state=state)
+    emit(f"  Requested a scan of vessel {vessel_id}.")
+    emit("  The instrument decides when it actually runs - watch it with "
+         "'pyincucyte status'.")
+    return 0
+
+
+def cmd_unmix(args):
+    """Show a vessel's unmixing on the instrument, and optionally change it."""
+    client = make_client(args)
+    current = client.unmixing(args.vessel)
+    emit(f"\n=== Vessel {args.vessel} ===\n")
+    emit(f"  On the instrument: {current.describe()}")
+    emit(f"  As a spec:         {current.to_spec() or '-'}")
+    if not args.set:
+        emit("")
+        emit("  Downloading with --unmix does this arithmetic locally and "
+             "changes nothing on the device.")
+        emit(f"  To change what the Incucyte software displays: "
+             f"pyincucyte unmix -v {args.vessel} --set SPEC --yes")
+        return 0
+    wanted = Unmixing.coerce(args.set)
+    emit(f"  Would become:      {wanted.describe()}")
+    emit("")
+    agreed = confirm_write(
+        args, f"  This changes what the Incucyte software shows everyone for "
+              f"vessel {args.vessel}.")
+    client.save_unmix(args.vessel, wanted, confirm=agreed, force=args.force)
+    emit(f"  Saved: {wanted.describe()}")
     return 0
 
 
@@ -624,6 +702,17 @@ def add_finder_args(parser):
                         help="How far back to walk from each vessel's last "
                              "scan (default 14)")
     parser.add_argument("--limit", type=int, help="Stop after this many scans")
+
+
+def add_write_args(parser):
+    """The two flags every command that changes the instrument carries.
+
+    The Incucyte is shared, so a write says so out loud or does not happen.
+    """
+    parser.add_argument("--yes", action="store_true",
+                        help="Confirm this change to the instrument")
+    parser.add_argument("--force", action="store_true",
+                        help="Send it even if the instrument reports a fault")
 
 
 def add_selection_args(parser, *, watch=False):
@@ -762,7 +851,28 @@ def build_parser():
     sub.add_parser("logout", help="Forget the saved login")
     sub.add_parser("gui", help="Open the desktop app")
     sub.add_parser("vessels", help="List vessels")
-    sub.add_parser("status", help="Show device status")
+    p_status = sub.add_parser(
+        "status", help="Show what the instrument is doing")
+    p_status.add_argument("--vessel", "-v", type=int, action="append",
+                          help="Also show this vessel's scan pattern "
+                               "(repeat for several)")
+    p_status.add_argument("--raw", action="store_true",
+                          help="Include the untouched payload")
+
+    p_scan_now = sub.add_parser(
+        "scan-now", help="Ask the instrument to scan one vessel now (writes)")
+    p_scan_now.add_argument("--vessel", "-v", type=int, required=True,
+                            help="Vessel ID to scan")
+    add_write_args(p_scan_now)
+
+    p_unmix = sub.add_parser(
+        "unmix", help="Show, or change, the unmixing saved on a vessel")
+    p_unmix.add_argument("--vessel", "-v", type=int, required=True,
+                         help="Vessel ID")
+    p_unmix.add_argument("--set", metavar="SPEC",
+                         help=literal(f"Save these coefficients to the "
+                                      f"instrument: {UNMIX_HELP}"))
+    add_write_args(p_unmix)
 
     p_scans = sub.add_parser("scans", help="List scan times")
     p_scans.add_argument("--date", "-d")
@@ -832,6 +942,7 @@ COMMANDS = {
     "vessels": cmd_vessels, "scans": cmd_scans, "plan": cmd_plan,
     "find": cmd_find, "preview": cmd_preview,
     "download": cmd_download, "watch": cmd_watch, "status": cmd_status,
+    "scan-now": cmd_scan_now, "unmix": cmd_unmix,
     "manifest": cmd_manifest, "preset": cmd_preset,
 }
 

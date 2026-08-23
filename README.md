@@ -88,6 +88,9 @@ pyincucyte watch    -v 38 -o ./images -i 10 --start-from first
 pyincucyte watch    -v 38 -o ./images -i 60 --start-from first --batch-after 7d
 
 pyincucyte download -v 38 -o ./images --calibrate --unmix device
+
+pyincucyte status                      # what is the instrument doing?
+pyincucyte scan-now -v 38 --yes        # scan this plate now (changes the device)
 ```
 
 Useful anywhere: `--json` for machine-readable output, `--preset FILE` to load a
@@ -397,6 +400,64 @@ print(watcher.pending_frames, watcher.hold_description)
 to wait. One caution: a poll re-checks the whole window whether or not the chunk
 is due, so pair a long chunk with a lazy `interval` (an hour, not ten minutes).
 
+### Talking back to the instrument
+
+Everything above reads. Three calls write, and they are the only ones in the
+package that change the Incucyte at all:
+
+| | What it does | Reaches |
+|---|---|---|
+| `device_state()` | what the instrument is doing, how warm it is, when it next scans | read only |
+| `begin_scan(vessel)` | asks for a scan of one plate, now | that plate |
+| `save_unmix(vessel, spec)` | stores unmixing on a vessel, so the Incucyte's own software displays it | that plate |
+
+Reading is free:
+
+```python
+state = incucyte.device_state()
+print(state.summary())          # "Scanning, 42% done, ~1h 12m left"
+if state.has_problem:           # disk full, hot board, RAID degraded...
+    alert(state.activity)
+```
+
+```bash
+pyincucyte status               # exits non-zero if the instrument reports a fault
+pyincucyte status --json        # for a monitoring script
+```
+
+Writing is not. The instrument is shared, so a write says so in as many words
+or it does not happen — there is no default that sends:
+
+```python
+incucyte.begin_scan(38)                     # ConfirmationRequiredError, sends nothing
+incucyte.begin_scan(38, confirm=True)       # goes
+```
+
+```bash
+pyincucyte scan-now -v 38 --yes
+pyincucyte unmix -v 38                      # show what the vessel has
+pyincucyte unmix -v 38 --set green:8%red --yes
+```
+
+In the app: **Tools → Device status**, **Scan selected vessel now**, **Save
+unmixing to instrument**, each behind a dialog.
+
+Both writes also refuse while the instrument reports a fault — starting a scan
+into a full disk achieves nothing — unless you pass `--force` / `force=True`.
+
+Two things worth knowing:
+
+- **There is no stop.** The device API has no stop, pause or abort. Ending an
+  experiment early means replacing the schedule for the *whole tray*, every
+  vessel on it — someone else's plate included — so PyIncucyte does not do it.
+- **`save_unmix` is never needed for downloading.** `fetch(..., unmix=...)`
+  does that arithmetic here, on the pixels, touching nothing. Saving is only
+  for changing what the Incucyte's own viewer shows other people.
+
+None of this has run against the real instrument. The route and field names
+come from the vendor client assemblies rather than from guesswork, but the
+first `scan-now` at Imperial should be watched.
+
 ### Presets shared with the GUI
 
 ```python
@@ -432,7 +493,8 @@ old shared file; `"none"` disables resume entirely.
 Everything derives from `IncucyteError`, so a pipeline can wrap a whole run in
 one `except`: `DeviceUnreachableError`, `AuthenticationError`,
 `NotLoggedInError`, `TokenExpiredError`, `ApiError`, `VesselNotFoundError`,
-`EncryptionUnavailableError`, `ExportError`.
+`EncryptionUnavailableError`, `ExportError`, `ConfirmationRequiredError`,
+`DeviceBusyError`.
 
 ---
 
@@ -451,6 +513,7 @@ PyIncucyte/
     processing.py   optional preprocessing: calibration, background, unmixing
     watch.py        Watcher - poll and download in a background thread,
                     frame by frame or in held chunks
+    device.py       device state, and the only two calls that write back
     engine.py       wire-level REST and ImageJ TIFF writing
     cli.py          command line
     compat.py       the import names retired in 0.3

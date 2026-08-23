@@ -31,6 +31,7 @@ from ..options import (
     END_NOW, ExportOptions, MOMENT_HELP, SPAN_HELP, START_FIRST, START_TODAY,
 )
 from ..preview import DEFAULT_MAX_IMAGES
+from ..processing import Unmixing
 from ..wells import well_name, well_spec
 from . import theme as theme_mod
 from .dialogs import AboutDialog, LoginDialog, PlanDialog
@@ -154,6 +155,14 @@ class App:
         tools_menu.add_command(label="Refresh vessels", accelerator="F5",
                                command=self._refresh_vessels)
         tools_menu.add_command(label="Test connection", command=self._probe)
+        tools_menu.add_separator()
+        # Everything below this line talks back to the instrument.
+        tools_menu.add_command(label="Device status...",
+                               command=self._device_status)
+        tools_menu.add_command(label="Scan selected vessel now...",
+                               command=self._scan_now)
+        tools_menu.add_command(label="Save unmixing to instrument...",
+                               command=self._save_unmix)
         tools_menu.add_separator()
         tools_menu.add_command(label="Forget saved login", command=self._logout)
         menubar.add_cascade(label="Tools", menu=tools_menu)
@@ -791,6 +800,85 @@ class App:
                      f"{report.get('error', 'unreachable')}", "error")
             self.say("The instrument is only routable from the site network.",
                      "muted")
+
+    # ==================================================================
+    # the instrument itself
+    #
+    # Reading is free.  The two writes each put the question in a dialog
+    # first, because the Incucyte is shared and a mis-click here is somebody
+    # else's experiment.
+    # ==================================================================
+
+    def _device_status(self):
+        self._run_worker(self._device_status_worker)
+
+    def _device_status_worker(self):
+        self._post(self.status.set_message, "Reading device status...")
+        state = self.client.device_state()
+        self.say(f"Instrument: {state.summary()}",
+                 "warn" if state.has_problem else "success")
+        for line in state.describe()[1:]:
+            self.say(f"  {line}", "muted")
+
+    def _one_selected_vessel(self, action):
+        """The single selected vessel id, or None having said why not."""
+        selected = self._selected_vessel_ids()
+        if len(selected) != 1:
+            messagebox.showinfo("Pick one vessel",
+                                f"Select exactly one vessel to {action}.",
+                                parent=self.root)
+            return None
+        return selected[0]
+
+    def _scan_now(self):
+        vessel_id = self._one_selected_vessel("scan")
+        if vessel_id is None:
+            return
+        vessel = self._vessel(vessel_id)
+        name = vessel.label if vessel else f"vessel {vessel_id}"
+        if not messagebox.askyesno(
+                "Scan now?",
+                f"Ask the Incucyte to scan {name} now?\n\n"
+                f"This adds work to the instrument. Nothing already scheduled "
+                f"is cancelled or moved, and there is no way to call it back.",
+                parent=self.root):
+            return
+        self._run_worker(self._scan_now_worker, vessel_id)
+
+    def _scan_now_worker(self, vessel_id):
+        self._post(self.status.set_message, "Requesting a scan...")
+        state = self.client.begin_scan(vessel_id, confirm=True)
+        self.say(f"Asked the instrument to scan vessel {vessel_id}.", "success")
+        self.say(f"  Instrument: {state.summary()}", "muted")
+
+    def _save_unmix(self):
+        vessel_id = self._one_selected_vessel("save unmixing onto")
+        if vessel_id is None:
+            return
+        try:
+            spec = self._current_options().unmix
+        except ValueError as exc:
+            messagebox.showerror("Unmixing", str(exc), parent=self.root)
+            return
+        mixing = Unmixing.coerce(spec)
+        change = (f"Save {mixing.describe()} onto vessel {vessel_id}?"
+                  if mixing else
+                  f"Clear the unmixing saved on vessel {vessel_id}?")
+        if not messagebox.askyesno(
+                "Change the instrument?",
+                f"{change}\n\n"
+                f"This changes what the Incucyte's own software displays, for "
+                f"everyone. Downloading with these values needs none of it - "
+                f"that arithmetic happens here.",
+                parent=self.root):
+            return
+        self._run_worker(self._save_unmix_worker, vessel_id, mixing)
+
+    def _save_unmix_worker(self, vessel_id, mixing):
+        self._post(self.status.set_message, "Saving unmixing...")
+        self.client.save_unmix(vessel_id, mixing, confirm=True)
+        self.say(f"Saved {mixing.describe()} onto vessel {vessel_id}.",
+                 "success")
 
     # ==================================================================
     # vessels

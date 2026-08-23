@@ -22,6 +22,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 
 from . import channels as ch
+from . import device as device_mod
 from . import engine
 from .cache import cache_for_output
 from . import preview as preview_mod
@@ -68,6 +69,7 @@ class IncucyteClient:
         self.log = logger or log
         self._vessels = None
         self._preview_cache = None
+        self._user_id = None
         self._auth_lock = threading.Lock()
         if timeout:
             engine.API_TIMEOUT = int(timeout)
@@ -146,6 +148,7 @@ class IncucyteClient:
         self.store.clear()
         self._credentials = Credentials(host=self.host)
         self._vessels = None
+        self._user_id = None
 
     # -- raw calls --------------------------------------------------------
 
@@ -182,8 +185,111 @@ class IncucyteClient:
         return report
 
     def device_status(self):
-        """Return the device's current status block."""
-        return self.call("Device/Status/GetDeviceStatusUpdate")
+        """Return the device's current status block, exactly as it arrived."""
+        return self.call(device_mod.ROUTE_STATUS)
+
+    # -- the instrument itself --------------------------------------------
+
+    def device_state(self):
+        """What the instrument is doing right now, as a typed record.
+
+            state = incucyte.device_state()
+            if state.is_idle:
+                ...
+
+        Returns a :class:`~pyincucyte.device.DeviceState`: activity, drawer,
+        next scan, board temperatures.  Read-only and cheap.
+        """
+        return device_mod.read_state(self.call)
+
+    def temperatures(self, start=None, end=None):
+        """Board temperature readings, defaulting to the last 24 hours."""
+        return device_mod.read_temperatures(self.call, start, end)
+
+    def scan_pattern(self, vessel, when=None):
+        """The imaging pattern one vessel is scanned with."""
+        vessel_id, _ = self._vessel_ref(vessel)
+        return device_mod.read_scan_pattern(self.call, vessel_id, when)
+
+    def user_id(self, refresh=False):
+        """This login's numeric user id, which the Automation routes want."""
+        if self._user_id is None or refresh:
+            credentials = self.credentials
+            if not credentials.username or not credentials.encrypted_password:
+                raise NotLoggedInError(
+                    "The instrument needs a numeric user id for this, and that "
+                    "comes from the saved login. Sign in again, or pass "
+                    "user_id= yourself.")
+            self._user_id = device_mod.read_user_id(
+                self.call, credentials.username, credentials.encrypted_password)
+        return self._user_id
+
+    # -- writes (each one refuses until it is confirmed) -------------------
+
+    def begin_scan(self, vessel, *, confirm=False, force=False, user_id=None,
+                   state=None):
+        """Ask the instrument to scan one vessel now.
+
+            incucyte.begin_scan(38, confirm=True)
+
+        Without ``confirm=True`` this raises
+        :class:`~pyincucyte.errors.ConfirmationRequiredError` and sends
+        nothing - the Incucyte is shared, so a write is deliberate or it does
+        not happen.  It also refuses while the instrument reports a fault,
+        unless ``force=True``.
+
+        There is no matching ``stop_scan``: the device API has none.  See
+        :mod:`pyincucyte.device`.
+
+        ``state`` lets a caller that has just read the status pass it in rather
+        than have it fetched twice.
+        """
+        vessel_id, label = self._vessel_ref(vessel)
+        if state is None and not force:
+            state = self.device_state()
+        if user_id is None:
+            user_id = self.user_id()
+        if user_id is None:
+            raise NotLoggedInError(
+                "The device did not give a user id for this login, so the "
+                "scan was not requested. Pass user_id= if you know it.")
+        device_mod.begin_scan(self.call, vessel_id, user_id, confirm=confirm,
+                              force=force, state=state, label=label)
+        self.log.info("asked %s to scan vessel %s", self.host, vessel_id)
+        return self.device_state()
+
+    def save_unmix(self, vessel, unmix, *, confirm=False, force=False,
+                   state=None):
+        """Store unmixing coefficients on a vessel, on the instrument.
+
+            incucyte.save_unmix(38, "green:8%red", confirm=True)
+
+        This changes what the Incucyte's own software displays for everyone.
+        Downloading with ``fetch(..., unmix=...)`` needs none of it - that does
+        the arithmetic locally and touches nothing.  Same guard as
+        :meth:`begin_scan`.
+        """
+        vessel_id, label = self._vessel_ref(vessel)
+        if state is None and not force:
+            state = self.device_state()
+        return device_mod.save_unmix(self.call, vessel_id, unmix,
+                                     confirm=confirm, force=force, state=state,
+                                     label=label)
+
+    def _vessel_ref(self, target):
+        """Turn a vessel id, Vessel or name into ``(id, label)`` for a message."""
+        if isinstance(target, Vessel):
+            return target.id, target.name
+        if isinstance(target, (int, float)) or str(target).strip().isdigit():
+            vessel_id = int(target)
+            try:                        # a nicer message, never a hard failure
+                return vessel_id, self.vessel(vessel_id).name
+            except Exception:
+                return vessel_id, ""
+        matches = self.find_vessels(str(target))
+        if not matches:
+            raise VesselNotFoundError(f"No vessel matched {target!r}")
+        return matches[0].id, matches[0].name
 
     # -- vessels ----------------------------------------------------------
 
