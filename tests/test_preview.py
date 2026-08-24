@@ -12,12 +12,14 @@ import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 import numpy as np
 from PIL import Image
 
 from pyincucyte import IncucyteClient, PreviewSet, VesselScan
 from pyincucyte import cli, preview as preview_mod
+from pyincucyte.pyramid import PyramidFrame
 
 from fakes import FakeDevice, logged_in_store, patched, vessel_record
 
@@ -208,6 +210,62 @@ class PreviewTests(PreviewTestCase):
         self.assertTrue(all(image.cached for image in result.images))
         self.assertEqual(result.count, 4)
 
+    def test_advertised_pyramid_tiles_avoid_the_full_tiff_route(self):
+        class Tiles:
+            capabilities = {}
+
+            def fetch_frame(self, request, level, cancel=None):
+                return PyramidFrame(
+                    array=np.full((24, 32), request["img_type"], np.uint16),
+                    source_bytes=400, level=level.level, tile_count=1)
+
+        with patched(self.device):
+            scan = self.client.find_scans(vessel=38)[0]
+        scan.pyramid_levels = [
+            {"Level0": 3, "Size_pixels": {"Width": 32, "Height": 24}}]
+        self.client._preview_transport = Tiles()
+        with patch("pyincucyte.preview.engine._fetch_scan_vessel_image_bytes",
+                   side_effect=AssertionError("pyramid tile should win")):
+            result = self.client.preview(scan, wells="A1", channels="phase")
+        self.assertEqual(result.count, 1)
+        self.assertEqual(result.images[0].source_bytes, 400)
+
+    def test_read_only_tile_probe_reports_shapes_but_not_pixels(self):
+        class ProbeTiles:
+            capabilities = {"phase": True, "colour": True}
+
+            def fetch_frame(self, request, level, cancel=None):
+                return PyramidFrame(
+                    array=np.full((level.height, level.width),
+                                  request["img_type"], np.uint16),
+                    source_bytes=300 + level.level,
+                    level=level.level, tile_count=1)
+
+        original = self.device.api_post
+
+        def with_levels(host, token, route, payload=None, timeout=None):
+            response = original(host, token, route, payload, timeout)
+            if route == "Vessels/GetScanVessel":
+                response["Data"]["ImagePyramidLevels"] = {"$values": [
+                    {"Level0": 1,
+                     "Size_pixels": {"Width": 8, "Height": 6}},
+                    {"Level0": 2,
+                     "Size_pixels": {"Width": 4, "Height": 3}},
+                ]}
+            return response
+
+        self.device.api_post = with_levels
+        self.client._preview_transport = ProbeTiles()
+        with patched(self.device):
+            scan = self.client.find_scans(vessel=38)[0]
+            report = self.client.probe_preview_tiles(scan, wells="A1")
+        self.assertEqual(report["lowest_resolution_level"], 2)
+        self.assertEqual(report["channels"]["1"]["levels"][0]
+                         ["decoded_shape"], [6, 8])
+        self.assertGreater(report["channels"]["1"]["full_tiff_bytes"], 0)
+        self.assertNotIn("array", str(report).lower())
+        self.assertNotIn("bytes': b", str(report).lower())
+
     def test_one_unreadable_image_does_not_cost_the_others(self):
         def broken(host, token, item, max_retries=3):
             if item["img_type"] == 2:
@@ -311,6 +369,16 @@ class PreviewCliTests(PreviewTestCase):
         self.assertEqual(payload["returned"], 2)
         self.assertEqual(payload["size"], 48)
         self.assertTrue(all(tile["width"] <= 48 for tile in payload["images"]))
+
+    def test_timeline_command_is_bounded_and_machine_readable(self):
+        code, output = self.run_cli(
+            "--json", "timeline", "-v", "38", "-w", "A1", "-c", "phase",
+            "--since", "2026-03-01", "--until", "2026-03-01",
+            "--anchors", "2", "--no-show")
+        self.assertEqual(code, 0)
+        payload = json.loads(output)
+        self.assertEqual(payload["frame_count"], 2)
+        self.assertEqual(payload["network_fetches"], 2)
 
 
 if __name__ == "__main__":

@@ -10,11 +10,11 @@ window.
     scan = incucyte.find_scans(name="Cry1", most_recent=1)[0]
     scan.preview(wells="A1-B3").show()
 
-Two warnings that matter.  The device has no thumbnail route, so every tile in
-that window is a full-size image off the wire (1.5-3 MB each) - which is why
-:data:`DEFAULT_MAX_IMAGES` exists.  And both the shrinking and the contrast
-stretch throw information away, so nothing shown here is quantitative: measure
-the downloaded TIFF, never the preview.
+Two warnings that matter.  Compatible devices expose undocumented reduced
+viewer tiles; older devices fall back to full-size images, so
+:data:`DEFAULT_MAX_IMAGES` still bounds this wall.  Both shrinking and contrast
+stretching throw information away, so nothing shown here is quantitative:
+measure the downloaded TIFF, never the preview.
 """
 
 import logging
@@ -36,8 +36,8 @@ log = logging.getLogger("pyincucyte.preview")
 #: Longest edge of one thumbnail, in pixels.
 DEFAULT_SIZE = 240
 
-#: How many images one preview fetches before it starts refusing.  Each one is
-#: a full-size download, so this cap is about the network, not the window.
+#: How many images one static preview fetches before it starts refusing.  The
+#: cap still protects devices that need the full-size compatibility route.
 DEFAULT_MAX_IMAGES = 24
 
 #: Percentile pair used by the automatic contrast stretch.
@@ -106,10 +106,17 @@ def thumbnail(tif_bytes, size=DEFAULT_SIZE, contrast="auto", plan=None,
     stretch undoes it - but unmixing and background removal are exactly what a
     preview is for.
     """
+    array = engine._tiff_bytes_to_array(tif_bytes)
+    return thumbnail_array(array, size=size, contrast=contrast, plan=plan,
+                           fetch_contributor=fetch_contributor)
+
+
+def thumbnail_array(array, size=DEFAULT_SIZE, contrast="auto", plan=None,
+                    fetch_contributor=None):
+    """Render a native array as a bounded uint8 recognition thumbnail."""
     from PIL import Image
     import numpy as np
 
-    array = engine._tiff_bytes_to_array(tif_bytes)
     if plan:
         array = proc.apply(array, plan, fetch_contributor)
     scaled = autoscale(array, contrast)
@@ -482,6 +489,7 @@ def build_requests(scans, wells=None, channels=None, site=0, max_images=None,
                         "channel": labels.get(img_type,
                                               ch.image_type_label(img_type)),
                         "elapsed": scan.elapsed,
+                        "pyramid_levels": getattr(scan, "pyramid_levels", ()),
                         "fname": (f"preview VID{scan.vessel_id} "
                                   f"{wl.well_name(row, col)} type {img_type}"),
                         "processing": proc.plan_for_image(
@@ -549,24 +557,78 @@ def fetch_previews(client, requests, *, size=DEFAULT_SIZE, contrast="auto",
                 image = _image_from(request, array=hit, cached=True)
                 announce(image)
                 return index, image
-        raw, error = engine._fetch_scan_vessel_image_bytes(host, token, request)
-        if error or not raw:
-            image = _image_from(request, error=str(error or "no image data"))
-            announce(image)
-            return index, image
+        level = None
+        array = None
+        source_bytes = 0
+        levels = []
+        if request.get("pyramid_levels"):
+            from .pyramid import (PyramidUnavailable, choose_level,
+                                  parse_pyramid_levels)
+
+            levels = parse_pyramid_levels(request["pyramid_levels"])
+            if levels:
+                level = choose_level(levels, max(int(size), 256))
+                try:
+                    frame = client.preview_transport.fetch_frame(
+                        request, level, cancel=cancel)
+                    if frame.ok:
+                        array = frame.array
+                        source_bytes += frame.source_bytes
+                except PyramidUnavailable:
+                    array = None
+        raw = None
+        if array is None:
+            raw, error = engine._fetch_scan_vessel_image_bytes(host, token, request)
+            if error or not raw:
+                image = _image_from(request, error=str(error or "no image data"))
+                announce(image)
+                return index, image
+            source_bytes += len(raw)
+            try:
+                array = engine._tiff_bytes_to_array(raw)
+            except Exception as exc:
+                image = _image_from(request, error=f"could not render: {exc}",
+                                    source_bytes=source_bytes)
+                announce(image)
+                return index, image
+
+        def contributor(number):
+            nonlocal source_bytes
+            other = {key: value for key, value in request.items()
+                     if key != "processing"}
+            other["img_type"] = number
+            other["fname"] = f"{request.get('fname', 'preview')}:unmix{number}"
+            if level is not None:
+                from .pyramid import PyramidUnavailable
+
+                try:
+                    frame = client.preview_transport.fetch_frame(
+                        other, level, cancel=cancel)
+                    if frame.ok:
+                        source_bytes += frame.source_bytes
+                        return frame.array
+                except PyramidUnavailable:
+                    pass
+            payload, problem = engine._fetch_scan_vessel_image_bytes(
+                client.host, client.ensure_token(), other)
+            if problem or not payload:
+                raise ValueError(
+                    f"could not read channel {number} to unmix ({problem})")
+            source_bytes += len(payload)
+            return engine._tiff_bytes_to_array(payload)
+
         try:
-            array = thumbnail(raw, size=size, contrast=contrast,
-                              plan=request.get("processing"),
-                              fetch_contributor=lambda number: _contributor(
-                                  client, request, number))
+            array = thumbnail_array(
+                array, size=size, contrast=contrast,
+                plan=request.get("processing"), fetch_contributor=contributor)
         except Exception as exc:            # a bad payload is not a fatal error
             image = _image_from(request, error=f"could not render: {exc}",
-                                source_bytes=len(raw))
+                                source_bytes=source_bytes)
             announce(image)
             return index, image
         if cache is not None:
             cache.put(key, array)
-        image = _image_from(request, array=array, source_bytes=len(raw))
+        image = _image_from(request, array=array, source_bytes=source_bytes)
         announce(image)
         return index, image
 
@@ -581,5 +643,6 @@ def fetch_previews(client, requests, *, size=DEFAULT_SIZE, contrast="auto",
 __all__ = [
     "DEFAULT_SIZE", "DEFAULT_MAX_IMAGES", "CONTRAST_PERCENTILES", "CACHE_SIZE",
     "PreviewImage", "PreviewSet", "ThumbCache",
-    "autoscale", "thumbnail", "build_requests", "fetch_previews",
+    "autoscale", "thumbnail", "thumbnail_array", "build_requests",
+    "fetch_previews",
 ]

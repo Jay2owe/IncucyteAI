@@ -25,12 +25,18 @@ def tiff_bytes(value=7, shape=(6, 8), dtype=np.uint16):
 
 def vessel_record(vessel_id=38, name="Test plate", plate="Sarstedt 24-well",
                   first="2026-03-01T09:00:00", last="2026-03-03T09:00:00",
-                  color1="GFP", color2="mCherry"):
+                  color1="GFP", color2="mCherry", microns_per_pixel=2.824051):
     """Build one record shaped like GetAllSearchVessels returns."""
     return {
         "VesselID": vessel_id,
         "VesselTypeName": plate,
         "VesselTypeID": 4,
+        # The real device states the pixel size here, on every vessel.  The
+        # number is the one captured in .tmp/vessels_with_scan.json, so a test
+        # that reads it is reading what the instrument actually sends.
+        "ImageSize": ({"Size_pixels": "1536, 1152",
+                       "MicronsPerPixel": microns_per_pixel}
+                      if microns_per_pixel is not None else None),
         "VesselDocumentation": {"Label": name, "UserName": "tester"},
         "FirstScanDateTime": first,
         "LastScanDateTime": last,
@@ -73,7 +79,8 @@ class FakeDevice:
     def __init__(self, vessels=None, scans=None, wells=((0, 0), (0, 1)),
                  channels=(1, 2), missing_scans=(), calibration=None,
                  unmixes=None, pixels=None, activity="Idle", drawer="Closed",
-                 user_id=7, next_scan=None, refuse=None, pixel_for=None):
+                 user_id=7, next_scan=None, refuse=None, pixel_for=None,
+                 wells_for=None):
         self.vessels = list(vessels or [vessel_record()])
         self.scans = list(scans or ["2026-03-01T09:00:00", "2026-03-01T12:00:00"])
         self.wells = list(wells)
@@ -88,6 +95,10 @@ class FakeDevice:
         #: optional (img_type, scan_time) -> pixel value, so the frames of one
         #: time stack can be told apart by looking at them.
         self.pixel_for = pixel_for
+        #: optional scan_time -> the wells that scan holds, so one well can
+        #: miss a timepoint the rest of the plate has.  The real instrument
+        #: does this whenever a scan is interrupted part way across the tray.
+        self.wells_for = dict(wells_for or {})
         #: what the instrument says it is doing, by DeviceActivityTypeCode name.
         self.activity = activity
         self.drawer = drawer
@@ -121,7 +132,7 @@ class FakeDevice:
                     "API exception: ScanNotFoundException - Vessel ID='38' "
                     "existing scan was not found")
             infos = []
-            for (r, c) in self.wells:
+            for (r, c) in self.wells_for.get(when, self.wells):
                 for t in self.channels:
                     scale, bias, median = self.calibration.get(t, (None, 0.0, 0.0))
                     infos.append(image_info(r, c, t, scale=scale, bias=bias,

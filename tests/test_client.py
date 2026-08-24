@@ -150,14 +150,15 @@ class DownloadTests(ClientTestCase):
         self.assertEqual(one.layout, "separate")
         self.assertEqual(one.axes, "YX")
         self.assertEqual(len(one.channels), 1)
-        self.assertIn(one.channels[0], ("Phase", "GFP"))
+        self.assertIn(one.channel_names[0], ("Phase", "GFP"))
+        self.assertEqual(one.channels[0]["index"], 1)
         self.assertGreater(one.bytes, 0)
         self.assertRegex(one.elapsed, r"^\d\dd\d\dh\d\dm$")
 
     def test_channel_names_come_from_the_vessel_not_the_device_defaults(self):
         with patched(self.device):
             result = self.client.download(self.options(channels="green"))
-        self.assertEqual({name for f in result.files for name in f.channels},
+        self.assertEqual({name for f in result.files for name in f.channel_names},
                          {"GFP"})
 
     def test_time_channel_stack_writes_a_readable_imagej_tcyx_file(self):
@@ -168,9 +169,11 @@ class DownloadTests(ClientTestCase):
         with tifffile.TiffFile(result.files[0].path) as handle:
             self.assertTrue(handle.is_imagej)
             self.assertEqual(handle.series[0].shape, (2, 2, 6, 8))
+            self.assertEqual(handle.imagej_metadata["Labels"],
+                             ["Phase", "GFP"] * 2)
         written = result.files[0]
         self.assertEqual(written.axes, "TCYX")
-        self.assertEqual(written.channels, ["Phase", "GFP"])
+        self.assertEqual(written.channel_names, ["Phase", "GFP"])
         self.assertEqual(len(written.scan_times), 2)
 
     def test_a_second_run_downloads_nothing_new(self):
@@ -221,7 +224,7 @@ class ManifestTests(ClientTestCase):
         self.assertEqual(manifest["options"]["channels"], "phase,green")
         entry = manifest["files"][0]
         for key in ("path", "well", "channels", "scan_times", "axes",
-                    "first_scan_time", "frame_count"):
+                    "first_scan_time", "frames"):
             self.assertIn(key, entry)
 
     def test_a_later_run_merges_into_the_same_manifest(self):

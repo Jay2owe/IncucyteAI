@@ -9,7 +9,7 @@
         print(plan.summary())              # dry run - nothing fetched yet
         result = incucyte.download(plan)   # writes files + a manifest
         for image in result.files:
-            analyse(image.path, well=image.well, channels=image.channels)
+            analyse(image.path, well=image.well, channels=image.channel_names)
 
 The client owns the token (refreshing it silently), caches the vessel list, and
 turns the engine's loose dicts into the typed records in
@@ -26,6 +26,8 @@ from . import device as device_mod
 from . import engine
 from .cache import cache_for_output
 from . import preview as preview_mod
+from . import pyramid as pyramid_mod
+from . import timeline as timeline_mod
 from . import processing
 from . import manifest as manifest_mod
 from . import wells as wl
@@ -33,10 +35,11 @@ from .config import ConfigStore, Credentials
 from .errors import HostNotSetError, NotLoggedInError, VesselNotFoundError
 from .models import (
     DownloadResult, ExportPlan, OutputFile, ProgressEvent, Vessel, VesselScan,
-    LAYOUT_AXES, layout_flags, resolve_layout,
+    LAYOUT_AXES, derived, layout_flags, resolve_layout,
 )
 from .options import (
-    ExportOptions, START_FIRST, parse_duration, parse_frame_count, parse_moment,
+    ExportOptions, END_NOW, START_FIRST, parse_duration, parse_frame_count,
+    parse_moment,
 )
 from .state import StateStore
 
@@ -52,8 +55,8 @@ def _call(callback, event):
     if callback:
         try:
             callback(event)
-        except Exception:  # a broken progress hook must not kill a download
-            log.debug("progress callback raised", exc_info=True)
+        except Exception:  # a broken hook must not kill a download
+            log.debug("callback raised", exc_info=True)
 
 
 class IncucyteClient:
@@ -69,6 +72,8 @@ class IncucyteClient:
         self.log = logger or log
         self._vessels = None
         self._preview_cache = None
+        self._preview_transport = None
+        self._timeline_sources = []
         self._user_id = None
         self._auth_lock = threading.Lock()
         if timeout:
@@ -425,6 +430,7 @@ class IncucyteClient:
             return None
         return {"wells": wells, "channels": channels, "sites": sites,
                 "image_count": len(infos), "coefficients": coefficients,
+                "pyramid_levels": scan.get("ImagePyramidLevels") or [],
                 "unmixing": processing.Unmixing.from_scan(scan)}
 
     def find_vessels(self, name=None, *, vessel=None, owner=None, plate=None,
@@ -538,7 +544,8 @@ class IncucyteClient:
                 sites=detail.get("sites", set()),
                 image_count=detail.get("image_count", 0),
                 coefficients=detail.get("coefficients") or {},
-                unmixing=detail.get("unmixing"), client=self))
+                unmixing=detail.get("unmixing"),
+                pyramid_levels=detail.get("pyramid_levels") or [], client=self))
             if len(scans) >= wanted:
                 break
         return scans
@@ -654,8 +661,9 @@ class IncucyteClient:
             mixing["green"] = 0.12
             incucyte.preview(38, unmix=mixing).show()
 
-        The device has no thumbnail route, so each tile is a full-size image
-        off the wire: ``max_images`` (24 by default) is the brake, and the
+        Compatible devices use the viewer's reduced pyramid tiles.  The
+        established full-TIFF route remains a feature-detected fallback, so
+        ``max_images`` (24 by default) still bounds this static wall.  The
         contrast stretch means these pixels are for recognition only.
         """
         cancel = _as_event(cancel)
@@ -694,6 +702,255 @@ class IncucyteClient:
         if getattr(self, "_preview_cache", None) is None:
             self._preview_cache = preview_mod.ThumbCache()
         return self._preview_cache
+
+    @property
+    def preview_transport(self):
+        """Session-scoped reduced viewer route, feature-detected on first use."""
+        if self._preview_transport is None:
+            self._preview_transport = pyramid_mod.PyramidTransport(self)
+        return self._preview_transport
+
+    def probe_preview_tiles(self, target=None, *, wells=None, channels=None,
+                            site=0, compare_full=True, progress=None,
+                            cancel=None, **find):
+        """Read-only proof of the private tile contract, with no pixel output.
+
+        The returned report contains levels, decoded shapes, byte counts, and
+        the orientation/correlation against the established full TIFF route.
+        It never writes image data, response bodies, tokens, or credentials.
+        """
+        cancel = _as_event(cancel)
+        scans = self._scans_to_preview(target, progress=progress,
+                                       cancel=cancel, **find)
+        if not scans:
+            raise VesselNotFoundError("No scan matched the preview probe.")
+        scan = scans[0]
+        detail = self.scan_detail(scan.vessel_id, scan.scan_time)
+        if detail is None:
+            raise VesselNotFoundError("The selected scan contains no images.")
+        levels = pyramid_mod.parse_pyramid_levels(
+            detail.get("pyramid_levels") or detail)
+        report = {
+            "vessel_id": scan.vessel_id, "scan_time": scan.scan_time,
+            "levels": [
+                {"level": level.level, "width": level.width,
+                 "height": level.height} for level in levels],
+            "lowest_resolution_level": (
+                min(levels, key=lambda level: level.width * level.height).level
+                if levels else None),
+            "channels": {}, "capabilities": self.preview_transport.capabilities,
+        }
+        if not levels:
+            report["error"] = "scan advertises no ImagePyramidLevels"
+            return report
+
+        selection = wl.normalise_wells(wells, scan.vessel.rows, scan.vessel.cols)
+        available_wells = detail.get("wells") or set()
+        candidates = ((selection & available_wells) if selection is not None
+                      else available_wells)
+        if not candidates:
+            report["error"] = "no requested well was acquired in this scan"
+            return report
+        row, col = sorted(candidates)[0]
+        report["well"] = wl.well_name(row, col)
+        report["site"] = int(site)
+        wanted = (ch.parse_channels(channels) if isinstance(channels, str)
+                  else (set(channels) if channels else None))
+        present = detail.get("channels") or set()
+        present = present if wanted is None else present & wanted
+        selected_types = []
+        if 1 in present:
+            selected_types.append(1)
+        selected_types.extend(sorted((number for number in present if number != 1),
+                                     key=ch.image_type_sort_key)[:1])
+
+        for image_type in selected_types:
+            request = {
+                "vessel_id": scan.vessel_id, "scan_time": scan.scan_time,
+                "row": row, "col": col, "site": int(site),
+                "img_type": int(image_type),
+                "fname": f"preview probe type {image_type}",
+            }
+            full = None
+            full_bytes = 0
+            full_error = ""
+            if compare_full:
+                raw, full_error = engine._fetch_scan_vessel_image_bytes(
+                    self.host, self.ensure_token(), request)
+                if raw:
+                    full_bytes = len(raw)
+                    try:
+                        full = engine._tiff_bytes_to_array(raw)
+                    finally:
+                        del raw
+            entries = []
+            for level in levels:
+                if cancel.is_set():
+                    break
+                try:
+                    frame = self.preview_transport.fetch_frame(
+                        request, level, cancel=cancel)
+                    entry = {
+                        "level": level.level, "advertised_shape": [
+                            level.height, level.width],
+                        "decoded_shape": (list(frame.array.shape)
+                                          if frame.ok else None),
+                        "bytes": frame.source_bytes,
+                        "tiles": frame.tile_count,
+                        "error": frame.error,
+                    }
+                    if frame.ok and full is not None:
+                        entry.update(pyramid_mod.compare_arrays(frame.array, full))
+                except Exception as exc:
+                    entry = {"level": level.level, "error": str(exc),
+                             "decoded_shape": None, "bytes": 0, "tiles": 0}
+                entries.append(entry)
+            report["channels"][str(image_type)] = {
+                "name": scan.vessel.channel_labels.get(
+                    image_type, ch.image_type_label(image_type)),
+                "route": pyramid_mod.route_for(image_type),
+                "full_tiff_bytes": full_bytes,
+                "full_tiff_error": str(full_error or ""),
+                "levels": entries,
+            }
+        report["capabilities"] = self.preview_transport.capabilities
+        return report
+
+    def timeline(self, target=None, *, wells=None, channels=None, site=0,
+                 size=None, contrast="auto", anchors=timeline_mod.DEFAULT_ANCHORS,
+                 frame_cache=timeline_mod.DEFAULT_FRAME_CACHE,
+                 render_cache=timeline_mod.DEFAULT_RENDER_CACHE,
+                 prefetch=timeline_mod.DEFAULT_PREFETCH_RADIUS,
+                 proxy_dir=None, local_stack=None, output=None,
+                 fallback_byte_budget=timeline_mod.DEFAULT_FALLBACK_BYTE_BUDGET,
+                 start_from=START_FIRST, end_at=END_NOW, max_frames=None,
+                 prime=True, calibrate=False, background="", unmix="",
+                 progress=None, cancel=None, **find):
+        """Open a bounded, lazy time course without downloading the run.
+
+        Reduced viewer tiles are used when the connected device supports them.
+        Otherwise at most ``anchors`` evenly spaced full TIFFs are fetched for
+        the first view, shrunk immediately, and later positions remain lazy.
+        ``local_stack`` or ``proxy_dir`` is checked before either device route.
+
+        ``target`` may be one or more :class:`VesselScan` records, a Vessel, an
+        id or a name.  A vessel/id/name uses its full acquisition window by
+        default; ``start_from`` and ``end_at`` accept the same values as export.
+        """
+        cancel = _as_event(cancel)
+        scans = self._scans_to_timeline(
+            target, start_from=start_from, end_at=end_at,
+            max_frames=max_frames, progress=progress, cancel=cancel, **find)
+        if not scans:
+            raise VesselNotFoundError("No scan times matched this timeline.")
+        recipe = processing.Recipe(
+            calibrate=bool(calibrate),
+            background="" if background is None else str(background),
+            unmix=processing.normalise_unmix(unmix))
+        problems = recipe.validate()
+        if problems:
+            raise ValueError("; ".join(problems))
+        if output:
+            output = Path(output).expanduser()
+            if proxy_dir is None:
+                proxy_dir = output / ".pyincucyte-preview"
+            if local_stack is None:
+                vessel = scans[0].vessel
+                selected_wells = wl.normalise_wells(wells, vessel.rows, vessel.cols)
+                if selected_wells is None:
+                    selected_wells = set().union(
+                        *(scan.wells or set() for scan in scans))
+                if not selected_wells:
+                    selected_wells = wl.all_wells(vessel.rows, vessel.cols)
+                selected_channels = (ch.parse_channels(channels)
+                                     if isinstance(channels, str) else
+                                     (set(channels) if channels else None))
+                if selected_channels is None:
+                    selected_channels = set().union(
+                        *(scan.channels or set() for scan in scans))
+                if not selected_channels:
+                    selected_channels = set(vessel.active_channels or {1})
+                local_stack = timeline_mod.discover_local_stacks(
+                    output, vessel.id,
+                    [wl.well_name(row, col) for row, col
+                     in sorted(selected_wells)], selected_channels)
+        source = timeline_mod.HybridTimelineSource(
+            self, scans, wells=wells, channels=channels, sites={int(site)},
+            recipe=recipe,
+            max_edge=int(size or timeline_mod.DEFAULT_TIMELINE_SIZE),
+            frame_cache=frame_cache, render_cache=render_cache,
+            prefetch_radius=prefetch, proxy_dir=proxy_dir,
+            local_stack=local_stack, transport=self.preview_transport,
+            fallback_byte_budget=fallback_byte_budget, progress=progress)
+        self._timeline_sources.append(source)
+        result = timeline_mod.TimelinePreview(
+            source=source, well=source.available_wells[0], site=int(site),
+            channel=source.available_channels[0],
+            size=int(size or timeline_mod.DEFAULT_TIMELINE_SIZE),
+            contrast=contrast)
+        if prime:
+            source.prime(result.well, result.site, result.channel,
+                         count=anchors, cancel=cancel)
+        _call(progress, ProgressEvent(stage="done", detail=result.summary()))
+        return result
+
+    def _scans_to_timeline(self, target, *, start_from=START_FIRST,
+                           end_at=END_NOW, max_frames=None, progress=None,
+                           cancel=None, **find):
+        """Resolve a timeline while leaving per-frame image detail lazy."""
+        if isinstance(target, VesselScan):
+            return [target]
+        if isinstance(target, (list, tuple, set)):
+            scans = []
+            for item in target:
+                if not isinstance(item, VesselScan):
+                    raise TypeError("a timeline scan list may only contain VesselScan")
+                scans.append(item)
+            return sorted(scans, key=lambda scan: engine.parse_scan_datetime(
+                str(scan.scan_time)))
+
+        if isinstance(target, Vessel):
+            vessel = target
+        else:
+            name = find.pop("name", target)
+            vessel_filter = find.pop("vessel", None)
+            if isinstance(target, int):
+                vessel_filter, name = int(target), None
+            matches = self.find_vessels(
+                name, vessel=vessel_filter, owner=find.pop("owner", None),
+                plate=find.pop("plate", None), channel=find.pop("channel", None),
+                scanned_only=True)
+            if not matches:
+                raise VesselNotFoundError(f"No vessel matched {target!r}")
+            vessel = matches[0]
+
+        window_options = ExportOptions(
+            vessels=[vessel.id], start_from=start_from, end_at=end_at)
+        start, end = window_options.resolve_window(first_scan=vessel.first_scan)
+        if vessel.first_scan is not None:
+            start = max(start, vessel.first_scan)
+        if vessel.last_scan is not None:
+            end = min(end, vessel.last_scan)
+        if end < start:
+            return []
+        wanted = window_options.start_frames or window_options.end_frames
+        reverse = window_options.start_frames is not None
+        scan_times = self.scan_times_between(
+            start.date(), end.date(), progress=progress, cancel=cancel,
+            reverse=reverse,
+            enough=((lambda values: len(values) >= wanted) if wanted else None))
+        scan_times = [value for value in scan_times
+                      if start <= engine.parse_scan_datetime(str(value)) <= end]
+        scan_times = sorted(set(scan_times), key=engine.parse_scan_datetime)
+        if window_options.start_frames:
+            scan_times = scan_times[-window_options.start_frames:]
+        elif window_options.end_frames:
+            scan_times = scan_times[:window_options.end_frames]
+        if max_frames is not None:
+            limit = max(0, int(max_frames))
+            scan_times = scan_times[-limit:] if limit else []
+        return [VesselScan(vessel=vessel, scan_time=value, client=self)
+                for value in scan_times]
 
     def _scans_to_preview(self, target, *, progress=None, cancel=None, **find):
         """Coerce anything that names a plate into a list of VesselScan."""
@@ -813,14 +1070,16 @@ class IncucyteClient:
                     reference_time=reference, channel_hyperstack=hyperstack,
                     progress_callback=on_item, stop_event=cancel,
                     max_workers=options.workers, recipe=recipe,
-                    append=options.append_stacks)
+                    append=options.append_stacks,
+                    channel_labels=vessel.channel_labels)
             else:
                 items += engine.collect_scan_items_parallel(
                     self.host, token, vessel.id, vessel_scans, output_dir,
                     state=state_dict, wells=selection, channels=channel_set,
                     reference_time=reference, hyperstack=hyperstack,
                     max_workers=options.workers,
-                    progress_callback=on_item, stop_event=cancel, recipe=recipe)
+                    progress_callback=on_item, stop_event=cancel, recipe=recipe,
+                    channel_labels=vessel.channel_labels)
 
         labels = dict(ch.IMAGE_TYPE_LABELS)
         for vessel in vessels:
@@ -874,8 +1133,19 @@ class IncucyteClient:
     # -- downloading ------------------------------------------------------
 
     def download(self, plan=None, *, progress=None, cancel=None,
-                 write_manifest=None, **kwargs):
-        """Run a plan (or build one from options) and write the files."""
+                 write_manifest=None, on_file=None, complete=None, **kwargs):
+        """Run a plan (or build one from options) and write the files.
+
+        ``on_file`` is called with each :class:`~pyincucyte.models.OutputFile`
+        the moment it lands, so a pipeline can start on well A1 while B1 is
+        still downloading rather than waiting for the whole run.  It is handed
+        the same object that ends up in ``result.files``.
+
+        ``complete`` states whether the files this writes are finished - what
+        the manifest's ``complete`` field says.  Leave it None and each file
+        answers for itself; a watcher passes False while it is still polling
+        and True on the flush that ends the run.
+        """
         if plan is None or not isinstance(plan, ExportPlan):
             plan = self.plan(plan, progress=progress, cancel=cancel, **kwargs)
 
@@ -915,8 +1185,11 @@ class IncucyteClient:
 
         def record(fname, size):
             item = by_name.get(fname)
-            if item is not None:
-                result.files.append(_output_file(item, plan, size))
+            if item is None:
+                return
+            written = _output_file(item, plan, size, complete=complete)
+            result.files.append(written)
+            _call(on_file, written)
 
         def on_error(message):
             result.errors.append(str(message))
@@ -928,7 +1201,7 @@ class IncucyteClient:
                         stage="downloading", detail=fname, done=done,
                         total=total, unit="source images"))
 
-                def on_file(fname, size, done, total):
+                def on_written(fname, size, done, total):
                     record(fname, size)
                     _call(progress, ProgressEvent(
                         stage="writing", detail=fname, done=done, total=total,
@@ -937,11 +1210,11 @@ class IncucyteClient:
                 engine.download_collected_time_stack_items(
                     self.host, token, plan.items, state=state_dict,
                     max_workers=options.workers,
-                    progress_callback=on_file,
+                    progress_callback=on_written,
                     unit_progress_callback=on_unit,
                     error_callback=on_error, stop_event=cancel, cache=cache)
             else:
-                def on_file(fname, size, done, total):
+                def on_written(fname, size, done, total):
                     record(fname, size)
                     _call(progress, ProgressEvent(
                         stage="downloading", detail=fname, done=done,
@@ -951,7 +1224,7 @@ class IncucyteClient:
                     self.host, token, plan.items, state=state_dict,
                     max_workers=options.workers,
                     green_phase=options.green_lut, hyperstack=hyperstack,
-                    progress_callback=on_file, error_callback=on_error,
+                    progress_callback=on_written, error_callback=on_error,
                     stop_event=cancel, cache=cache)
         finally:
             state.flush(force=True)
@@ -975,20 +1248,29 @@ class IncucyteClient:
         _call(progress, ProgressEvent(stage="done", detail=result.summary()))
         return result
 
-    def fetch(self, options=None, *, progress=None, cancel=None, **kwargs):
-        """Plan and download in one call - the shortest path to files on disk."""
+    def fetch(self, options=None, *, progress=None, cancel=None,
+              on_file=None, complete=None, **kwargs):
+        """Plan and download in one call - the shortest path to files on disk.
+
+        ``on_file`` fires per written file; see :meth:`download`.
+        """
         plan = self.plan(options, progress=progress, cancel=cancel, **kwargs)
-        return self.download(plan, progress=progress, cancel=cancel)
+        return self.download(plan, progress=progress, cancel=cancel,
+                             on_file=on_file, complete=complete)
 
     # -- watching ---------------------------------------------------------
 
-    def watch(self, options=None, *, on_result=None, on_error=None,
-              on_poll=None, on_hold=None, progress=None, interval=None,
-              start=True, **kwargs):
+    def watch(self, options=None, *, on_result=None, on_file=None,
+              on_error=None, on_poll=None, on_hold=None, progress=None,
+              interval=None, start=True, **kwargs):
         """Poll for new scans and download them as they appear.
 
         Returns a :class:`~pyincucyte.watch.Watcher` running in its own thread,
         so a pipeline can carry on and call ``stop()`` when it is done.
+
+        ``on_result`` fires once per poll with the whole result; ``on_file``
+        fires per written file, which is what lets a downstream step start on
+        one well while the next is still downloading.
 
         Pass ``batch_frames`` and/or ``batch_after`` to download in chunks
         instead of frame by frame - ``batch_after="7d"`` collects a week at a
@@ -1001,8 +1283,8 @@ class IncucyteClient:
         if interval is not None:
             options = options.replace(interval_minutes=int(interval))
         watcher = Watcher(self, options, on_result=on_result,
-                          on_error=on_error, on_poll=on_poll, on_hold=on_hold,
-                          progress=progress)
+                          on_file=on_file, on_error=on_error, on_poll=on_poll,
+                          on_hold=on_hold, progress=progress)
         if start:
             watcher.start()
         return watcher
@@ -1010,6 +1292,14 @@ class IncucyteClient:
     # -- lifecycle --------------------------------------------------------
 
     def close(self):
+        for source in self._timeline_sources:
+            try:
+                source.close()
+            except Exception:
+                self.log.debug("could not close timeline source", exc_info=True)
+        self._timeline_sources.clear()
+        if self._preview_transport is not None:
+            self._preview_transport.close()
         engine.close_sessions()
 
     def __enter__(self):
@@ -1143,7 +1433,107 @@ def _scans_from(scan_times, reference):
     return kept
 
 
-def _output_file(item, plan, size):
+def _median_gap(scan_times):
+    """The median gap between scan times, in seconds, or None under two.
+
+    The median rather than the mean: an instrument that paused overnight leaves
+    one enormous gap, and a mean over it describes no cadence the run ever
+    used.  PySCNSlice derives it the same way, so the two agree whenever both
+    do the arithmetic.
+    """
+    stamps = []
+    for scan_time in scan_times or ():
+        try:
+            stamps.append(engine.parse_scan_datetime(str(scan_time)))
+        except (ValueError, TypeError):
+            continue
+    if len(stamps) < 2:
+        return None
+    stamps.sort()
+    gaps = sorted((b - a).total_seconds() for a, b in zip(stamps, stamps[1:]))
+    return round(gaps[len(gaps) // 2], 3)
+
+
+def _interval_s(scan_times, plan):
+    """The cadence this file was acquired at, and where that came from.
+
+    Preferring the file's own frames means a well the device skipped for a day
+    reports the cadence *it* saw.  A per-scan layout holds one moment, so it
+    falls back to the run's scan times and says so.
+    """
+    value = _median_gap(scan_times)
+    if value is not None:
+        return derived(value, "derived from this file's scan times")
+    value = _median_gap(plan.scan_times)
+    if value is not None:
+        return derived(value, "derived from the run's scan times")
+    return derived(
+        None, "fewer than two scan times to derive an interval from")
+
+
+def _pixel_size(vessel):
+    """Microns per pixel, read off the vessel record rather than inferred."""
+    value = getattr(vessel, "pixel_size_um", None) if vessel else None
+    if value is None:
+        return derived(
+            None, "the vessel record states no MicronsPerPixel")
+    return derived(value, "read from the vessel's ImageSize")
+
+
+def _frames_expected(item, plan):
+    """How many frames this file should hold once the run finishes.
+
+    A time stack should hold every moment its vessel was scanned in the window,
+    so one holding fewer missed wells or channels at those moments - a real
+    discrepancy, and the reason this is not simply ``frames``.  A per-scan
+    file is one moment by construction.
+    """
+    if not item.get("frames"):
+        return 1
+    reference = plan.reference_times.get(item.get("vessel_id"))
+    return len(_scans_from(plan.scan_times, reference))
+
+
+def _window_is_closed(plan):
+    """True when no later run of this recipe could find a new scan in it.
+
+    Only a *stated* end counts.  ``end_at=None`` and ``end_at="now"`` resolve
+    to the moment the plan was built, which is in the past a second later
+    without the experiment having finished, and ``"-24h"`` slides forward with
+    the clock.  A fixed date does not move, so once it has passed nothing more
+    can enter the window.
+    """
+    options = getattr(plan, "options", None)
+    end_at = getattr(options, "end_at", None)
+    if not end_at or end_at == END_NOW:
+        return False
+    if parse_duration(end_at) is not None or parse_frame_count(end_at):
+        return False
+    window = getattr(plan, "window", None)
+    return bool(window) and window[1] < datetime.now()
+
+
+def _is_complete(item, plan, stated=None):
+    """Will this file gain more frames?  None where nobody can honestly say.
+
+    A per-scan layout writes one moment per file, so such a file is finished
+    the moment it lands however the run was started.  A time stack is extended
+    in place on every later poll, so its answer belongs to whatever is driving
+    the run: a watcher says False while it is polling and True on the flush
+    that ends it.  Left to itself, a download can still be sure when the window
+    has a stated end that has passed - and where it cannot, it says None rather
+    than guessing that the instrument has stopped scanning.  None and False are
+    not the same answer downstream: a consumer skips a stack still filling, and
+    must not skip every stack nobody has vouched for.
+    """
+    if not item.get("frames"):
+        return True
+    if stated is not None:
+        return bool(stated)
+    return True if _window_is_closed(plan) else None
+
+
+def _output_file(item, plan, size, complete=None):
     """Turn one finished engine work item into an :class:`OutputFile`."""
     labels = plan.channel_labels or ch.IMAGE_TYPE_LABELS
     vessel = plan.vessel(item.get("vessel_id"))
@@ -1173,6 +1563,10 @@ def _output_file(item, plan, size):
         except (ValueError, TypeError):
             elapsed = ""
 
+    image_types = list(image_types)
+    names = [labels.get(t, ch.image_type_label(t)) for t in image_types]
+    scan_times = [t for t in scan_times if t]
+
     return OutputFile(
         processed=_item_processed(item),
         processing=(plan.options.processing_description
@@ -1182,9 +1576,19 @@ def _output_file(item, plan, size):
         vessel_name=vessel.name if vessel else "",
         well=wl.well_name(row, col), row=row, col=col, site=site,
         layout=plan.layout, axes=LAYOUT_AXES[plan.layout],
-        channels=[labels.get(t, ch.image_type_label(t)) for t in image_types],
-        image_types=list(image_types),
-        scan_times=[t for t in scan_times if t],
+        # The one-based index is written down rather than left as "the
+        # position in stack order, plus one" for a consumer to re-derive.
+        channels=[
+            {"index": position + 1, "name": name, "image_type": image_type,
+             "source": "read from the vessel's channel labels"}
+            for position, (name, image_type)
+            in enumerate(zip(names, image_types))],
+        image_types=image_types,
+        complete=_is_complete(item, plan, complete),
+        frames_expected=_frames_expected(item, plan),
+        interval_s=_interval_s(scan_times, plan),
+        pixel_size_um=_pixel_size(vessel),
+        scan_times=scan_times,
         elapsed=elapsed, bytes=int(size or 0),
     )
 

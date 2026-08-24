@@ -35,7 +35,7 @@ from ..processing import Unmixing
 from ..wells import well_name, well_spec
 from . import theme as theme_mod
 from .dialogs import AboutDialog, LoginDialog, PlanDialog
-from .preview import PreviewWindow
+from .preview import PreviewWindow, TimelineWindow
 from .widgets import Card, LogView, SearchEntry, StatusBar, WellPlate, tip
 
 GUI_STATE_FILE = APP_DIR / "gui_state.json"
@@ -61,8 +61,7 @@ CUSTOM = "Custom..."
 
 LAYOUT_ORDER = ("separate", "channel_stack", "time_stack", "time_channel_stack")
 
-#: Wells are cheap to select and expensive to look at - one thumbnail is a
-#: full-size image off the device - so a preview stops at this many.
+#: Keep the static well wall legible and bound its full-TIFF compatibility path.
 PREVIEW_MAX_IMAGES = DEFAULT_MAX_IMAGES
 
 #: What the processing drop-downs show when a step is switched off.
@@ -149,6 +148,8 @@ class App:
         tools_menu = tk.Menu(menubar, tearoff=0)
         tools_menu.add_command(label="View well images...", accelerator="Ctrl+I",
                                command=self._view_images)
+        tools_menu.add_command(label="View time course...", accelerator="Ctrl+T",
+                               command=self._view_timeline)
         tools_menu.add_command(label="Copy CLI command",
                                command=self._copy_cli_command)
         tools_menu.add_command(label="Sign in...", command=self._login)
@@ -187,6 +188,8 @@ class App:
             "<Control-w>": self._start_watch, "<Control-W>": self._start_watch,
             "<Control-q>": self.on_close, "<Control-Q>": self.on_close,
             "<Control-i>": self._view_images, "<Control-I>": self._view_images,
+            "<Control-t>": self._view_timeline,
+            "<Control-T>": self._view_timeline,
             "<F5>": self._refresh_vessels,
             "<Escape>": self._stop,
         }
@@ -356,6 +359,13 @@ class App:
         tip(self.view_btn,
             "Fetch a thumbnail of each selected well from the most recent scan, "
             "to check this is the right plate before downloading it.",
+            self.theme)
+        self.timeline_btn = ttk.Button(buttons, text="View time course",
+                                       command=self._view_timeline)
+        self.timeline_btn.pack(side="left", padx=(theme_mod.PAD_S, 0))
+        tip(self.timeline_btn,
+            "Open a lazy time slider. Reduced viewer tiles are used where the "
+            "device supports them; the full-image fallback remains bounded.",
             self.theme)
 
         self.well_spec_var = tk.StringVar(value="all")
@@ -713,7 +723,7 @@ class App:
         self.busy = busy
         state = "disabled" if busy else "normal"
         for widget in (self.download_btn, self.preview_btn, self.watch_btn,
-                       self.refresh_btn, self.view_btn):
+                       self.refresh_btn, self.view_btn, self.timeline_btn):
             widget.configure(state=state)
         self.stop_btn.configure(state="normal" if busy else "disabled")
         self.status.set_busy(busy)
@@ -1393,7 +1403,7 @@ class App:
         self.say(f"{scan.label}: {result.summary()}")
         if result.skipped:
             self.say(f"Only the first {PREVIEW_MAX_IMAGES} wells are shown - "
-                     f"each thumbnail is a full-size image off the device.",
+                     f"the static well wall is capped at that size.",
                      "muted")
         for message in result.errors[:3]:
             self.say(message, "warn")
@@ -1407,6 +1417,51 @@ class App:
                 parent=self.root)
             return
         PreviewWindow(self.root, self.theme, result)
+
+    def _view_timeline(self):
+        """A bounded single-well scrubber over the selected export window."""
+        if not (self.client.credentials.token_valid
+                or self.client.credentials.can_refresh):
+            self.say("Sign in before viewing a time course.", "warn")
+            self._prompt_login()
+            return
+        ids = self._selected_vessel_ids()
+        if not ids:
+            self.say("Select a vessel first, then View time course.", "warn")
+            return
+        vessel_id = self.active_vessel if self.active_vessel in ids else ids[0]
+        try:
+            options = self._current_options()
+        except ValueError as exc:
+            messagebox.showerror("Cannot open time course", str(exc),
+                                 parent=self.root)
+            return
+        self._run_worker(
+            self._view_timeline_worker, vessel_id,
+            self.selected_wells.get(vessel_id), self._selected_channels(), options)
+
+    def _view_timeline_worker(self, vessel_id, wells, channels, options):
+        self.say(f"Vessel {vessel_id}: building a bounded time course ...")
+        result = self.client.timeline(
+            vessel_id, wells=wells, channels=channels or None,
+            start_from=options.start_from, end_at=options.end_at,
+            output=options.output or None, calibrate=options.calibrate,
+            background=options.background, unmix=options.unmix,
+            progress=self._progress, cancel=self.cancel_event)
+        if self.cancel_event.is_set():
+            result.close()
+            self.say("Time-course preview cancelled.", "muted")
+            return
+        self.say(f"{result.title}: {result.summary()}")
+        self._post(self._open_timeline_window, result)
+
+    def _open_timeline_window(self, result):
+        if result.frame_count <= 0:
+            messagebox.showinfo("Nothing to show", "No scan times matched.",
+                                parent=self.root)
+            result.close()
+            return
+        TimelineWindow(self.root, self.theme, result)
 
     def _download(self):
         options = self._validate()
