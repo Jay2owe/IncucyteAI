@@ -97,8 +97,27 @@ drops away.
 2. Add proxy-stack generation to the export pass.
 3. Extend preview to sample by temporal stride.
 4. Build the scrub window in whichever toolkit step 1 points to.
-5. Package with PyInstaller in one-folder mode, `--windowed` so no console
-   flashes up, then wrap with Inno Setup for a Start Menu entry and uninstaller.
+5. **Done** - `packaging/pyincucyte.spec` freezes it one-folder with no console.
+   Build to a local directory, never into this checkout (it is inside Dropbox):
+
+   ```powershell
+   $B = "$env:TEMP\pyincucyte-build"
+   pyinstaller packaging/pyincucyte.spec --noconfirm --distpath $B\dist --workpath $Build
+   ```
+
+   Result: 77 MB, against 260 MB for Circadian Workbench - this package carries
+   numpy, Pillow and tifffile but no scipy, pandas or plotly. The frozen `.exe`
+   was launched against a scratch `PYINCUCYTE_HOME` and the window opened.
+
+   Still to do: an Inno Setup script. Copy
+   `CircadianWorkbench/packaging/circadian-workbench.iss`, drop its WebView2
+   check (there is no webview here) and change the names.
+
+   Two things that bit while doing the workbench, both already handled in this
+   spec: the entry point cannot be the GUI module itself (PyInstaller runs the
+   entry script as `__main__` with no parent package, so relative imports fail -
+   hence `packaging/entry.py`), and the exclude list is load-bearing rather than
+   tidiness. **`tkinter` must not be excluded here** - it is the interface.
 
 PyIncucyte is the pilot for all four projects: it needs no redesign, so it
 proves the packaging recipe before that recipe is spent on anything harder.
