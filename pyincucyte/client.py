@@ -32,7 +32,8 @@ from . import processing
 from . import manifest as manifest_mod
 from . import wells as wl
 from .config import ConfigStore, Credentials
-from .errors import HostNotSetError, NotLoggedInError, VesselNotFoundError
+from .errors import (HostNotSetError, IncucyteError, NotLoggedInError,
+                     VesselNotFoundError)
 from .models import (
     DownloadResult, ExportPlan, OutputFile, ProgressEvent, Vessel, VesselScan,
     LAYOUT_AXES, derived, layout_flags, resolve_layout,
@@ -431,7 +432,12 @@ class IncucyteClient:
         return {"wells": wells, "channels": channels, "sites": sites,
                 "image_count": len(infos), "coefficients": coefficients,
                 "pyramid_levels": scan.get("ImagePyramidLevels") or [],
-                "unmixing": processing.Unmixing.from_scan(scan)}
+                "unmixing": processing.Unmixing.from_scan(scan),
+                # The rest of the payload - the scan pattern, the optics, the
+                # per-colour acquisition times and the stop-after schedule.
+                # Only `protocol` reads it, and re-fetching it there would cost
+                # a second call for a payload already in hand.
+                "raw": scan}
 
     def find_vessels(self, name=None, *, vessel=None, owner=None, plate=None,
                      channel=None, scanned_only=False, refresh=False):
@@ -636,6 +642,79 @@ class IncucyteClient:
             raise VesselNotFoundError(
                 "No scan matched, so there is no saved unmixing to read.")
         return scans[0].unmixing or processing.Unmixing()
+
+    def protocol(self, target=None, *, names=None, name_source=None, scan=True,
+                 progress=None, cancel=None, **find):
+        """How this run was set up, as a drawable
+        :class:`~pyincucyte.protocol.Protocol`.
+
+        Metadata only - no pixel is read.  It is the cheapest useful question
+        there is about a plate: what is it imaging, at how many wells, how
+        often, and how far has it got::
+
+            print(incucyte.protocol(38))
+            incucyte.protocol("Cry1").save("protocol.svg")
+
+        ``names`` overrides the channel names, as ``preview`` does, so a recipe
+        that renamed a colour reaches the drawing and the drawing can say the
+        name was overridden rather than read off the vessel.
+
+        ``scan=False`` describes the plan alone.  Finding a scan is not
+        optional - a payload has to be asked for at a moment - but sweeping the
+        run's whole lifetime is, and on a month-long experiment that is the
+        difference between one call and thirty.  What it costs is the achieved
+        cadence, the progress, and whether the instrument is acquiring: the
+        three things that make this a picture of a run rather than of a plan.
+        """
+        from . import protocol as protocol_mod
+
+        cancel = _as_event(cancel)
+        found = self._scans_to_preview(target, progress=progress,
+                                       cancel=cancel, **find)
+        if not found:
+            raise VesselNotFoundError(
+                "No scan matched, so there is no protocol to draw.")
+        latest = found[0]
+        vessel = latest.vessel
+        # A second GetScanVessel for the one scan being drawn.  The payload
+        # holds the scan pattern, the optics and the acquisition times, and
+        # keeping it on every VesselScan a timeline builds would cost a
+        # megabyte a frame for a field nothing else reads.
+        detail = self.scan_detail(latest.vessel_id, latest.scan_time) or {}
+
+        scan_times, state = (), None
+        if scan:
+            scan_times = self._vessel_scan_times(vessel, progress=progress,
+                                                 cancel=cancel)
+            try:
+                state = self.device_state()
+            except IncucyteError:
+                # A drawing of how the run was set up is still worth having
+                # when the status route is the one thing that is unwell.
+                state = None
+
+        return protocol_mod.read_protocol(
+            vessel, detail.get("raw") or {}, scan_times=scan_times,
+            state=state, imaged=latest.wells or detail.get("wells"),
+            names=names, name_source=name_source or "",
+            scan_time=latest.scan_time, scan=scan)
+
+    def _vessel_scan_times(self, vessel, *, progress=None, cancel=None):
+        """Every scan time between a vessel's own first and last, inclusive.
+
+        Scan times are device-wide - the route takes a date, not a vessel - so
+        this is the tray's cadence bounded by this plate's own lifetime, not
+        this plate's cadence.  Verifying each one against the vessel costs a
+        call per timepoint, which for a week of five-minute scans is two
+        thousand calls to sharpen a number that is already right whenever the
+        tray runs one schedule.  ``protocol`` says which it is on the page.
+        """
+        if not vessel or not vessel.first_scan:
+            return ()
+        times = self.scan_times_between(vessel.first_scan,
+                                        vessel.last_scan or datetime.now(),
+                                        progress=progress, cancel=cancel)
+        return tuple(_scans_from(times, vessel.first_scan))
 
     def preview(self, target=None, *, wells=None, channels=None, site=0,
                 size=None, contrast="auto", max_images=None, workers=4,

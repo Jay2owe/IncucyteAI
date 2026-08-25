@@ -34,7 +34,7 @@ from ..preview import DEFAULT_MAX_IMAGES
 from ..processing import Unmixing
 from ..wells import well_name, well_spec
 from . import theme as theme_mod
-from .dialogs import AboutDialog, LoginDialog, PlanDialog
+from .dialogs import AboutDialog, LoginDialog, PlanDialog, ProtocolWindow
 from .preview import PreviewWindow, TimelineWindow
 from .widgets import Card, LogView, SearchEntry, StatusBar, WellPlate, tip
 
@@ -150,6 +150,9 @@ class App:
                                command=self._view_images)
         tools_menu.add_command(label="View time course...", accelerator="Ctrl+T",
                                command=self._view_timeline)
+        tools_menu.add_command(label="Acquisition protocol...",
+                               accelerator="Ctrl+R",
+                               command=self._view_protocol)
         tools_menu.add_command(label="Copy CLI command",
                                command=self._copy_cli_command)
         tools_menu.add_command(label="Sign in...", command=self._login)
@@ -190,6 +193,8 @@ class App:
             "<Control-i>": self._view_images, "<Control-I>": self._view_images,
             "<Control-t>": self._view_timeline,
             "<Control-T>": self._view_timeline,
+            "<Control-r>": self._view_protocol,
+            "<Control-R>": self._view_protocol,
             "<F5>": self._refresh_vessels,
             "<Escape>": self._stop,
         }
@@ -1417,6 +1422,50 @@ class App:
                 parent=self.root)
             return
         PreviewWindow(self.root, self.theme, result)
+
+    # -- how the run was set up ------------------------------------------
+
+    def _view_protocol(self):
+        """The acquisition protocol, drawn: what is this plate actually doing?"""
+        if not (self.client.credentials.token_valid
+                or self.client.credentials.can_refresh):
+            self.say("Sign in before reading the protocol.", "warn")
+            self._prompt_login()
+            return
+        ids = self._selected_vessel_ids()
+        if not ids:
+            self.say("Select a vessel first, then Acquisition protocol.", "warn")
+            return
+        vessel_id = self.active_vessel if self.active_vessel in ids else ids[0]
+        self._run_worker(self._protocol_worker, vessel_id)
+
+    def _protocol_worker(self, vessel_id):
+        self._post(self.status.set_message, "Reading the protocol...")
+        self.say(f"Vessel {vessel_id}: reading how the run was set up ...")
+        protocol = self.client.protocol(vessel_id, progress=self._progress,
+                                        cancel=self.cancel_event)
+        if self.cancel_event.is_set():
+            self.say("Cancelled.", "muted")
+            return
+        self.say(f"{protocol.title()}: {len(protocol.steps)} channel(s), "
+                 f"{protocol.n_wells} well(s), "
+                 f"{protocol.frames_per_cycle} image(s) per cycle.")
+        for note in protocol.notes:
+            self.say(f"  {note}", "warn")
+        self._post(self._open_protocol_window, protocol)
+
+    def _open_protocol_window(self, protocol):
+        ProtocolWindow(self.root, self.theme, protocol,
+                       on_save=self._save_protocol)
+
+    def _save_protocol(self, protocol, path, dark):
+        """Called from the protocol window. Writing a PNG goes to a worker."""
+        self._run_worker(self._save_protocol_worker, protocol, path, dark)
+
+    def _save_protocol_worker(self, protocol, path, dark):
+        self._post(self.status.set_message, "Saving the drawing...")
+        written = protocol.save(path, theme="dark" if dark else "light")
+        self.say(f"Wrote {written}", "success")
 
     def _view_timeline(self):
         """A bounded single-well scrubber over the selected export window."""

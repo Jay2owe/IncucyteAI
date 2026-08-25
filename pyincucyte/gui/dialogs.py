@@ -2,7 +2,7 @@
 
 import threading
 import tkinter as tk
-from tkinter import ttk
+from tkinter import filedialog, ttk
 
 from .. import __version__
 from ..engine import APP_DIR
@@ -232,6 +232,93 @@ class PlanDialog(ModalDialog):
         self.clipboard_append(self.options.cli_command())
         self.copied_var.set("Copied")
         self.after(1800, lambda: self.copied_var.set(""))
+
+
+class ProtocolWindow(tk.Toplevel):
+    """The acquisition protocol, drawn - the same picture the CLI prints.
+
+    Deliberately not modal: this is a reference you leave open beside the export
+    settings while you set them up, not a question to answer.  The drawing shown
+    is the ASCII one, because it is the same geometry as the SVG and needs no
+    image decoder; ``Save`` writes the real figure.
+    """
+
+    WIDTH = 108
+
+    def __init__(self, parent, theme, protocol, on_save=None):
+        super().__init__(parent)
+        self.theme = theme
+        self.protocol_record = protocol
+        self.on_save = on_save
+        self.title(f"Acquisition protocol - {protocol.title()}")
+        self.configure(background=theme["bg"])
+        self.transient(parent)
+        self.protocol("WM_DELETE_WINDOW", self.destroy)
+        self.bind("<Escape>", lambda e: self.destroy())
+
+        card = Card(self, theme=theme)
+        card.pack(fill="both", expand=True, padx=theme_mod.PAD_L,
+                  pady=theme_mod.PAD_L)
+        body = card.body
+
+        ttk.Label(body, text="How this run was set up",
+                  style="Title.TLabel").pack(anchor="w")
+        ttk.Label(body, style="Muted.TLabel", wraplength=760,
+                  text="Read off the instrument's own metadata - no image was "
+                       "fetched. Requested and achieved are different facts "
+                       "and both are on the drawing.").pack(
+            anchor="w", pady=(2, theme_mod.PAD_L))
+
+        text = tk.Text(body, wrap="none", bd=0, highlightthickness=1,
+                       background=theme["surface_alt"], foreground=theme["text"],
+                       highlightbackground=theme["border"],
+                       font=theme.font_mono, height=26, width=self.WIDTH + 2,
+                       padx=theme_mod.PAD_M, pady=theme_mod.PAD_M)
+        text.pack(fill="both", expand=True)
+        text.insert("1.0", "\n".join(protocol.lines(width=self.WIDTH)))
+        text.configure(state="disabled")
+        self.text = text
+
+        buttons = ttk.Frame(body, style="Surface.TFrame")
+        buttons.pack(fill="x", pady=(theme_mod.PAD_L, 0))
+        self.dark_var = tk.BooleanVar(value=False)
+        dark = ttk.Checkbutton(buttons, text="Dark drawing",
+                               variable=self.dark_var)
+        dark.pack(side="left")
+        tip(dark, "Save the figure on a dark background, for a dark slide.",
+            theme)
+        save_btn = ttk.Button(buttons, text="Save drawing...",
+                              style="Accent.TButton", command=self._save)
+        save_btn.pack(side="right")
+        tip(save_btn,
+            "SVG needs nothing and scales; PNG and PDF need matplotlib, which "
+            "the packaged app does not ship.", theme)
+        ttk.Button(buttons, text="Copy", command=self._copy).pack(
+            side="right", padx=(0, theme_mod.PAD_S))
+        ttk.Button(buttons, text="Close", command=self.destroy).pack(
+            side="right", padx=(0, theme_mod.PAD_S))
+
+        self.minsize(700, 520)
+
+    def _copy(self):
+        self.clipboard_clear()
+        self.clipboard_append("\n".join(
+            self.protocol_record.lines(width=self.WIDTH)))
+
+    def _save(self):
+        if self.on_save is None:
+            return
+        path = filedialog.asksaveasfilename(
+            parent=self, title="Save the protocol drawing",
+            defaultextension=".svg",
+            initialfile=f"{self.protocol_record.vessel_id}-protocol.svg",
+            filetypes=[("SVG drawing", "*.svg"), ("PNG image", "*.png"),
+                       ("PDF document", "*.pdf")])
+        if not path:
+            return
+        # Writing a PNG goes through matplotlib and takes about a second, so
+        # the app writes it on a worker like everything else.
+        self.on_save(self.protocol_record, path, bool(self.dark_var.get()))
 
 
 class AboutDialog(ModalDialog):

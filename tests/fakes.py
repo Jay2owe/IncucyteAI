@@ -80,7 +80,10 @@ class FakeDevice:
                  channels=(1, 2), missing_scans=(), calibration=None,
                  unmixes=None, pixels=None, activity="Idle", drawer="Closed",
                  user_id=7, next_scan=None, refuse=None, pixel_for=None,
-                 wells_for=None):
+                 wells_for=None, acquisition_ms=(300, 400),
+                 color_names=("Green", "Red"), sites_per_well=1,
+                 stop_after_scan_count=None, schedule_job=None,
+                 scan_vessel=None):
         self.vessels = list(vessels or [vessel_record()])
         self.scans = list(scans or ["2026-03-01T09:00:00", "2026-03-01T12:00:00"])
         self.wells = list(wells)
@@ -99,6 +102,16 @@ class FakeDevice:
         #: miss a timepoint the rest of the plate has.  The real instrument
         #: does this whenever a scan is interrupted part way across the tray.
         self.wells_for = dict(wells_for or {})
+        #: the acquisition plan GetScanVessel carries, which only `protocol`
+        #: reads.  Milliseconds, as the device states them.
+        self.acquisition_ms = tuple(acquisition_ms)
+        self.color_names = tuple(color_names)
+        self.sites_per_well = sites_per_well
+        self.stop_after_scan_count = stop_after_scan_count
+        self.schedule_job = schedule_job
+        #: a whole payload to answer with instead, for a test that needs one
+        #: shaped unlike any this fake builds.
+        self.scan_vessel = scan_vessel
         #: what the instrument says it is doing, by DeviceActivityTypeCode name.
         self.activity = activity
         self.drawer = drawer
@@ -137,7 +150,8 @@ class FakeDevice:
                     scale, bias, median = self.calibration.get(t, (None, 0.0, 0.0))
                     infos.append(image_info(r, c, t, scale=scale, bias=bias,
                                             median=median))
-            scan = {"ImageInfos": infos}
+            scan = dict(self.scan_vessel_payload(when))
+            scan["ImageInfos"] = infos
             if self.unmixes:
                 scan["ColorUnmixes"] = {"$values": list(self.unmixes)}
             return {"Data": scan}
@@ -164,6 +178,62 @@ class FakeDevice:
             self.saved_unmixes.append(payload)
             return {"Data": True}
         raise AssertionError(f"unexpected route {route}")
+
+    # -- the acquisition plan ---------------------------------------------
+
+    def scan_vessel_payload(self, when=""):
+        """The rest of a ``GetScanVessel`` response, beside its ImageInfos.
+
+        Shaped after ``.tmp/scan_vessel.json``, which is a real capture off the
+        instrument: the acquisition times are in milliseconds, the optical
+        module states its wavelengths and calibrated units, and the scan
+        pattern lists the wells as zero-based row/column pairs.  ``protocol``
+        is the only thing that reads any of it.
+        """
+        if self.scan_vessel is not None:
+            return dict(self.scan_vessel)
+        colours = {
+            "Color1": {"ColorName": self.color_names[0],
+                       "AcquisitionTime": self.acquisition_ms[0],
+                       "StareTime": 180, "FrameCount": 0,
+                       "ChannelType": 1, "Collected": 2 in self.channels},
+            "Color2": {"ColorName": self.color_names[1],
+                       "AcquisitionTime": self.acquisition_ms[1],
+                       "StareTime": 180, "FrameCount": 0,
+                       "ChannelType": 2, "Collected": 3 in self.channels},
+        }
+        return {
+            "ID": self.vessels[0].get("VesselID") if self.vessels else 38,
+            "ScanTime": when,
+            "Channels": {"Phase": {"Collected": 1 in self.channels},
+                         "BrightField": {"Collected": False},
+                         "Colors": colours},
+            "OpticsConfig": {
+                "Objective": {"Name": "4x", "MagnificationFactor": 0.22025},
+                "Cube": {"Name": "S3/SX1 G/R Optical Module",
+                         "Colors": {
+                             "Color1": {"Name": "Green", "Units": "GCU",
+                                        "WaveLength": 524},
+                             "Color2": {"Name": "Red", "Units": "RCU",
+                                        "WaveLength": 635}}},
+            },
+            "ScanPattern": {
+                "Name": "Standard", "ImagesPerSwell": self.sites_per_well,
+                "Magnification": 3, "IsWholeWellSamplePattern": False,
+                "Swells": [{"RowZeroBased": r, "ColumnZeroBased": c}
+                           for (r, c) in self.wells],
+            },
+            "VesselType": {"Name": "24-well Sarstedt", "SizeInSwells": "6, 4"},
+            "ImageSize": {"Width_pixels": 1536, "Height_pixels": 1152,
+                          "MicronsPerPixel": 2.824051},
+            "ScheduleJob": self.schedule_job,
+            "ScheduleDurationMode": 1,
+            "StopAfterScanCount": self.stop_after_scan_count,
+            "StopAfterDateTime": None, "StopAfterHours": None,
+            "IsScheduleDurationExpired": False,
+            "TotalTrayCount": 3, "TrayPositionIndex": 1,
+            "PostScanDelaySeconds": 0,
+        }
 
     # -- device state -----------------------------------------------------
 

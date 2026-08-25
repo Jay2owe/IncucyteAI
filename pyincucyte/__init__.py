@@ -63,6 +63,7 @@ from .models import (  # noqa: E402
 from .device import DeviceState, ScanPattern  # noqa: E402
 from .options import ExportOptions  # noqa: E402
 from .preview import PreviewImage, PreviewSet  # noqa: E402
+from .protocol import Protocol, Step, read_protocol  # noqa: E402
 from .timeline import (  # noqa: E402
     HybridTimelineSource,
     TimelinePreview,
@@ -105,6 +106,9 @@ __all__ = [
     "ScanPattern",
     "PreviewImage",
     "PreviewSet",
+    "Protocol",
+    "Step",
+    "read_protocol",
     "TimelineSource",
     "HybridTimelineSource",
     "TimelinePreview",

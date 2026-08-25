@@ -100,6 +100,8 @@ pyincucyte find Cry1                   # which plate is that, and when
 pyincucyte preview -v 38 -w A1-B3      # look at the wells before fetching
 pyincucyte preview -v 38 --unmix green:12%red   # try a ratio before using it
 pyincucyte timeline -v 38 -w A1 -c phase        # scrub through the run lazily
+pyincucyte protocol -v 38              # how the run was set up, drawn
+pyincucyte protocol -v 38 -o run.svg   # ...as a figure
 pyincucyte --json preview-probe -v 38            # prove the tile route read-only
 pyincucyte plan -v 38 -o ./images --start-from first     # dry run
 
@@ -291,6 +293,48 @@ have separate fixed bounds, so a 2,000-frame slider never retains 2,000 arrays
 or Tk images. Existing timestamp-matched exported stacks and disposable
 `.pyincucyte-preview/` frames are read before the device; the fallback reads a
 bounded full TIFF, reduces it immediately, and releases the encoded payload.
+
+### What the run is actually doing
+
+The Incucyte software draws an experiment as nested boxes — a time loop around a
+well loop around a chain of channel nodes — and locks the picture inside the
+vendor software on the machine beside the instrument. Every fact in it is
+already on the wire:
+
+```python
+print(incucyte.protocol(38))                    # the drawing, in the terminal
+incucyte.protocol(38).save("protocol.svg")      # ...as a figure
+```
+
+```
++- Time loop:  200 x 3.0 h requested   -   3.0 h achieved -----------------------+
+| [############............] 61 of 200 timepoints acquired (30%), 7.0 days so far |
+|                                                                                 |
+| +- All wells (24)   24-well Sarstedt   2 sites each   A1, A2, A3, +21 more ---+ |
+| | +-------------------+    +--------------+    +--------------+               | |
+| | | Phase             |    | Cry1-GFP     |    | Per2-mCherry |               | |
+| | | transmitted light | -> | 300 ms       | -> | 400 ms       |               | |
+| | |                   |    | stare 180 ms |    | stare 180 ms |               | |
+| | |                   |    | 524 nm GCU   |    | 635 nm RCU   |               | |
+| | +-------------------+    +--------------+    +--------------+               | |
+| +-----------------------------------------------------------------------------+ |
++---------------------------------------------------------------------------------+
+```
+
+It says three things the vendor's own graph does not. The requested cadence and
+the **achieved** interval are both on the page and labelled as different facts —
+enough wells at a long enough exposure overrun the schedule, and the derived
+number is the one that is true. It says how far the run has got, and which wells
+the last scan actually reached. And every value carries where it came from: the
+vessel record, the scan payload, or the scan times.
+
+`-o` writes the drawing. `.svg` costs no plotting stack at all — which matters
+because the packaged desktop app excludes matplotlib outright; `.png` and `.pdf`
+go through matplotlib (`pip install PyIncucyte[figure]`). `--dark` matches a
+dark slide. Nothing here reads a pixel, and `--no-scan` skips sweeping the run's
+whole lifetime as well.
+
+In the app it is **Tools → Acquisition protocol** (Ctrl+R).
 
 ### Preprocessing
 

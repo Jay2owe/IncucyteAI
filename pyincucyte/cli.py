@@ -436,6 +436,50 @@ def cmd_preview(args):
     return 0
 
 
+def cmd_protocol(args):
+    """Draw how the run was set up, from the device's own metadata.
+
+    The same picture the Incucyte software shows in its experiment view - a
+    time loop around a well loop around the channel chain - except that it can
+    be seen from another machine, and it says which of the numbers on it were
+    requested and which actually happened.
+    """
+    client = make_client(args)
+    scans = _find_scans(args, client)
+    if not scans:
+        emit("No scan matched - nothing to draw.")
+        return 1
+
+    protocol = client.protocol(
+        scans[0], names=_split_names(args.channel_names),
+        name_source="the command line" if args.channel_names else "",
+        scan=not args.no_scan, progress=ConsoleProgress(not args.quiet))
+
+    written = None
+    if args.out:
+        written = protocol.save(args.out,
+                                theme="dark" if args.dark else "light")
+
+    if args.json:
+        payload = protocol.to_dict()
+        payload["written"] = str(written) if written else ""
+        emit_json(payload)
+        return 0
+
+    for line in protocol.lines(width=max(int(args.width), 48)):
+        emit(line)
+    if written:
+        emit(f"\n  Wrote {written}")
+    return 0
+
+
+def _split_names(spec):
+    """``--channel-names Phase,Cry1-GFP`` into a list, or None."""
+    if not spec:
+        return None
+    return [part.strip() for part in str(spec).split(",") if part.strip()]
+
+
 def cmd_timeline(args):
     """Open a bounded lazy scrubber over a vessel's scan times."""
     client = make_client(args)
@@ -1005,6 +1049,32 @@ def build_parser():
                            help=literal(f"Preview a background subtraction: "
                                         f"{BACKGROUND_HELP}"))
 
+    p_protocol = sub.add_parser(
+        "protocol", help="How the run was set up: the time loop, the wells "
+                         "and the channel chain, drawn")
+    add_finder_args(p_protocol)
+    p_protocol.add_argument("--out", "-o", metavar="FILE",
+                            help="Write the drawing here: .svg costs nothing, "
+                                 ".png and .pdf need matplotlib. A folder "
+                                 "means <vessel>-protocol.svg inside it.")
+    p_protocol.add_argument("--dark", action="store_true",
+                            help="The dark palette, for a dark slide")
+    p_protocol.add_argument("--no-scan", dest="no_scan", action="store_true",
+                            help="The plan alone: do not sweep the run's whole "
+                                 "lifetime. Much faster on a long experiment, "
+                                 "and it costs the achieved cadence, the "
+                                 "progress and whether the instrument is "
+                                 "acquiring.")
+    p_protocol.add_argument("--channel-names", dest="channel_names",
+                            metavar="NAMES",
+                            help="Override the device's channel names, in "
+                                 "acquisition order (Phase,Cry1-GFP)")
+    # Not through literal(): there is no literal % here, and escaping the one
+    # in %(default)s stops argparse substituting it.
+    p_protocol.add_argument("--width", type=int, default=96, metavar="COLUMNS",
+                            help="Terminal width for the drawing "
+                                 "(default: %(default)s)")
+
     p_timeline = sub.add_parser(
         "timeline", help="Scrub through a run without loading every image")
     add_finder_args(p_timeline)
@@ -1084,6 +1154,7 @@ COMMANDS = {
     "probe": cmd_probe, "login": cmd_login, "logout": cmd_logout, "gui": cmd_gui,
     "vessels": cmd_vessels, "scans": cmd_scans, "plan": cmd_plan,
     "find": cmd_find, "preview": cmd_preview, "timeline": cmd_timeline,
+    "protocol": cmd_protocol,
     "preview-probe": cmd_preview_probe,
     "download": cmd_download, "watch": cmd_watch, "status": cmd_status,
     "scan-now": cmd_scan_now, "unmix": cmd_unmix,
