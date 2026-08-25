@@ -7,6 +7,42 @@ knows which well, channel and timepoint every plane belongs to.
 
 Watch mode merges into the same manifest, so it stays a complete index of the
 folder however many polls it took to fill.
+
+Each file entry is written in the SCN pipeline's **shared handoff contract**,
+defined in ``PySCNSlice/docs/scn-pipeline-plan.md`` and written the same way by
+PyLV200, so one reader serves all three acquisition stages:
+
+``path``, ``axes``
+    the file, and the axis string its TIFF declares - ``TCYX``, ``TYX``, ``YX``.
+``channels``
+    one ``{index, name, image_type, source}`` per plane on the channel axis.
+    ``index`` counts from **one**, as ImageJ and PySCNSlice's ``scn_channel``
+    count, and describes the file rather than the vessel: a well that missed a
+    channel would otherwise shift every name after the gap by one.
+``frames``
+    timepoints the file holds *now*.  A time stack is extended in place on
+    every poll, so this is true when read and stale a moment later.
+``complete``
+    whether it can still gain frames.  Without it a consumer silently skips a
+    stack that grew from 40 frames to 400.  ``null`` where nobody can honestly
+    say - not the same answer as ``false``, and it must not be treated as one.
+``frames_expected``
+    how many it should hold once the run finishes, so a well that missed
+    timepoints is visible as such rather than as a short recording.
+``blank_planes``
+    planes allocated but not acquired.  Always 0 here: nothing is written until
+    every plane has been downloaded and checked.
+``field``
+    which well this is, as ``{"kind": "well", "name": "A1"}`` - the
+    cross-instrument spelling of what ``well`` says in this package's own terms.
+``interval_s``, ``pixel_size_um``
+    each ``{"value": ..., "source": ...}``, because a cadence derived from
+    timestamps and one read off the instrument are different facts, and
+    ``null`` with a reason beats a plausible number.
+
+Two contract fields are deliberately absent.  ``registered`` and ``valid_mask``
+belong to whatever aligns the pixels: an instrument does not know whether its
+output was later registered, and this one produces no valid-field mask at all.
 """
 
 import csv
@@ -15,7 +51,13 @@ import os
 from datetime import datetime
 from pathlib import Path
 
-MANIFEST_VERSION = 1
+#: 2 moved each file entry onto the SCN pipeline's shared handoff contract.
+#: ``channels`` holds one record per plane rather than a bare name, ``frames``
+#: replaces ``frame_count``, ``interval_s`` replaces ``interval_seconds``, and
+#: ``complete``, ``frames_expected``, ``blank_planes``, ``field`` and
+#: ``pixel_size_um`` are new.  A reader that wants the old names should key on
+#: this number rather than sniffing the shape.
+MANIFEST_VERSION = 2
 
 #: Default manifest filename, written into the output folder.
 MANIFEST_FILENAME = "pyincucyte-manifest.json"
@@ -25,8 +67,11 @@ INDEX_FILENAME = "pyincucyte-index.csv"
 
 CSV_COLUMNS = [
     "path", "vessel_id", "vessel_name", "well", "row", "col", "site",
-    "layout", "axes", "channels", "image_types", "frame_count",
+    "layout", "axes", "channels", "image_types", "frames",
+    "frames_expected", "complete", "blank_planes",
     "first_scan_time", "last_scan_time", "elapsed", "bytes",
+    "interval_s", "interval_s_source",
+    "pixel_size_um", "pixel_size_um_source",
     "processed", "processing",
 ]
 
@@ -75,16 +120,46 @@ def _file_entry(output_file):
                                if output_file.scan_times else None)
     data["last_scan_time"] = (output_file.scan_times[-1]
                               if output_file.scan_times else None)
-    data["frame_count"] = output_file.frame_count
     return data
 
 
+def _entry_channel_names(entry):
+    """The display names out of a contract entry's channel records."""
+    names = []
+    for record in entry.get("channels") or ():
+        name = record.get("name") if isinstance(record, dict) else record
+        if name:
+            names.append(str(name))
+    return names
+
+
+def _split_derived(row, key):
+    """Flatten a ``{value, source}`` pair into two CSV columns.
+
+    A spreadsheet cannot hold the pair, and a bare number in a column would
+    lose exactly the distinction the pair exists to make, so the provenance
+    gets a column of its own rather than being dropped.
+    """
+    value = row.get(key)
+    if isinstance(value, dict):
+        row[key] = value.get("value")
+        row[f"{key}_source"] = value.get("source")
+    return row
+
+
 def _stats(entries):
+    # Three counts rather than one flag, because "still filling" and "nobody
+    # said" are different answers and a folder can hold both at once.
+    states = [e.get("complete") for e in entries]
     return {
         "file_count": len(entries),
         "bytes_total": sum(e.get("bytes", 0) for e in entries),
         "wells": sorted({e.get("well") for e in entries if e.get("well")}),
-        "channels": sorted({c for e in entries for c in e.get("channels", [])}),
+        "channels": sorted({name for e in entries
+                            for name in _entry_channel_names(e)}),
+        "complete_files": sum(1 for s in states if s is True),
+        "filling_files": sum(1 for s in states if s is False),
+        "unstated_files": sum(1 for s in states if s is None),
     }
 
 
@@ -150,8 +225,12 @@ def write_index_csv(manifest, path):
         writer.writeheader()
         for entry in manifest.get("files", []):
             row = dict(entry)
-            row["channels"] = ";".join(str(c) for c in entry.get("channels", []))
+            # A spreadsheet column cannot hold the channel records, so it
+            # gets the names; the JSON keeps the indices beside them.
+            row["channels"] = ";".join(_entry_channel_names(entry))
             row["image_types"] = ";".join(str(c) for c in entry.get("image_types", []))
+            _split_derived(row, "interval_s")
+            _split_derived(row, "pixel_size_um")
             writer.writerow(row)
     return path
 

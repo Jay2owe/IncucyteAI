@@ -36,6 +36,11 @@ from .errors import ExportError, StackNotExtendable
 #: TIFF tags that only ever belong to the first page of an ImageJ stack.
 FIRST_PAGE_ONLY = (270, 50838, 50839)
 
+#: TIFF tags copied onto page 0 but not onto later pages.  Tifffile writes its
+#: Software tag once; preserving that layout makes an appended stack expose
+#: the same per-page tag sets as one freshly written whole.
+FIRST_PAGE_KEEP = (305,)
+
 TAG_DESCRIPTION = 270
 TAG_STRIP_OFFSETS = 273
 TAG_STRIP_BYTE_COUNTS = 279
@@ -258,8 +263,11 @@ def _page_entries(layout, offset, description=None, metadata_tags=()):
     """Tags for one page: page 0's set, with what changes per page replaced."""
     byteorder = layout.byteorder
     entries = []
+    is_first = description is not None
     for code, dtype, count, raw in layout.tags:
         if code in FIRST_PAGE_ONLY:
+            continue
+        if code in FIRST_PAGE_KEEP and not is_first:
             continue
         if code == TAG_STRIP_OFFSETS:
             entries.append((code, TYPE_LONG, 1, _long(byteorder, offset)))

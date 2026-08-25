@@ -26,10 +26,14 @@ def frame(value, shape=SHAPE, dtype=np.uint16):
 
 def write_stack(path, planes, axes="TYX", labels=None, **kwargs):
     """Write a stack the same way the engine does, to append to afterwards."""
+    data = np.stack(planes)
     metadata = {"axes": axes, "mode": "grayscale"}
     if labels is not None:
-        metadata["Labels"] = list(labels)
-    tifffile.imwrite(str(path), np.stack(planes), imagej=True,
+        channel_labels = list(labels)
+        channels = data.shape[axes.index("C")]
+        plane_count = int(np.prod(data.shape[:-2]))
+        metadata["Labels"] = channel_labels * (plane_count // channels)
+    tifffile.imwrite(str(path), data, imagej=True,
                      metadata=metadata, photometric="minisblack", **kwargs)
 
 
@@ -70,23 +74,44 @@ class StackSurgeryTests(unittest.TestCase):
             with tifffile.TiffFile(str(whole)) as rewritten:
                 self.assertEqual(extended.imagej_metadata,
                                  rewritten.imagej_metadata)
+                self.assertEqual(extended.pages[0].description,
+                                 rewritten.pages[0].description)
+                self.assertEqual(
+                    [[tag.code for tag in page.tags]
+                     for page in extended.pages],
+                    [[tag.code for tag in page.tags]
+                     for page in rewritten.pages])
                 self.assertEqual(extended.series[0].shape,
                                  rewritten.series[0].shape)
 
     def test_a_two_channel_stack_grows_by_whole_timepoints(self):
         path = self.tmp / "hyper.tif"
-        write_stack(path, [np.stack([frame(0), frame(1)]),
-                           np.stack([frame(10), frame(11)])],
-                    axes="TCYX", labels=["Phase", "Green"])
+        timepoints = [np.stack([frame(0), frame(1)]),
+                      np.stack([frame(10), frame(11)]),
+                      np.stack([frame(20), frame(21)])]
+        write_stack(path, timepoints[:2], axes="TCYX",
+                    labels=["Phase", "Green"])
 
         tiffstack.append_planes(path, [frame(20), frame(21)],
-                                labels=["Phase", "Green"])
+                                labels=["Phase", "Green"] * 3)
+        whole = self.tmp / "whole-hyper.tif"
+        write_stack(whole, timepoints, axes="TCYX",
+                    labels=["Phase", "Green"])
 
         with tifffile.TiffFile(str(path)) as handle:
-            self.assertEqual(handle.series[0].shape, (3, 2, *SHAPE))
-            self.assertEqual(handle.series[0].axes, "TCYX")
-            self.assertEqual(handle.imagej_metadata["Labels"],
-                             ["Phase", "Green"])
+            with tifffile.TiffFile(str(whole)) as rewritten:
+                self.assertEqual(handle.series[0].shape, (3, 2, *SHAPE))
+                self.assertEqual(handle.series[0].axes, "TCYX")
+                self.assertEqual(handle.imagej_metadata["Labels"],
+                                 ["Phase", "Green"] * 3)
+                self.assertEqual(handle.imagej_metadata,
+                                 rewritten.imagej_metadata)
+                self.assertEqual(handle.pages[0].description,
+                                 rewritten.pages[0].description)
+                self.assertEqual(
+                    [[tag.code for tag in page.tags] for page in handle.pages],
+                    [[tag.code for tag in page.tags]
+                     for page in rewritten.pages])
 
     def test_half_a_timepoint_is_refused(self):
         path = self.tmp / "hyper.tif"
@@ -280,7 +305,7 @@ class DownloadTests(unittest.TestCase):
         with tifffile.TiffFile(str(self.stack_path())) as handle:
             self.assertEqual(handle.series[0].shape, (3, 2, 6, 8))
             self.assertEqual(handle.imagej_metadata["Labels"],
-                             ["Phase", "Green"])
+                             ["Phase", "GFP"] * 3)
         self.assertEqual(len(self.device.fetches), 2)   # both channels, once
 
     def test_turning_it_off_writes_the_stack_whole(self):

@@ -799,7 +799,8 @@ def collect_scan_images(host, token, vessel_id, scan_time, output_dir,
 
 def collect_scan_hyperstacks(host, token, vessel_id, scan_time, output_dir,
                              state=None, wells=None, channels=None,
-                             reference_time=None, recipe=None):
+                             reference_time=None, recipe=None,
+                             channel_labels=None):
     """Collect ImageJ hyperstacks to create for a scan.
 
     A hyperstack item groups all selected channel payloads for one
@@ -855,6 +856,10 @@ def collect_scan_hyperstacks(host, token, vessel_id, scan_time, output_dir,
             continue
 
         ordered_types = sorted(selected_types, key=image_type_sort_key)
+        labels = [
+            (channel_labels or {}).get(img_type, image_type_label(img_type))
+            for img_type in ordered_types
+        ]
         ch_tag = channel_tag(ordered_types)
         well_letter = chr(65 + row)
         well_name = f"{well_letter}{col + 1}"
@@ -881,6 +886,7 @@ def collect_scan_hyperstacks(host, token, vessel_id, scan_time, output_dir,
             "scan_time": scan_time,
             "channels": [by_type[img_type] for img_type in ordered_types],
             "channel_types": ordered_types,
+            "labels": labels,
         })
 
     return to_download
@@ -890,7 +896,7 @@ def collect_time_stacks(host, token, vessel_id, scan_times, output_dir,
                         state=None, wells=None, channels=None,
                         reference_time=None, channel_hyperstack=False,
                         progress_callback=None, stop_event=None, max_workers=1,
-                        recipe=None, append=True):
+                        recipe=None, append=True, channel_labels=None):
     """Collect time stacks to create across multiple scan times.
 
     When channel_hyperstack is False, returns one stack per well/site/channel.
@@ -1017,7 +1023,10 @@ def collect_time_stacks(host, token, vessel_id, scan_times, output_dir,
             fname = f"VID{vessel_id}_{well_name}_{ch_tag}_timestack{tag}.tif"
             state_key = (f"timestack_hyper_{vessel_id}_{row}_{col}_{site}_"
                          f"{ch_tag}{tag}")
-            labels = [image_type_label(img_type) for img_type in selected_types]
+            labels = [
+                (channel_labels or {}).get(img_type, image_type_label(img_type))
+                for img_type in selected_types
+            ]
             frame_times = [frame["scan_time"] for frame in frames]
             fpath = output_dir / fname
             state_info = downloaded_state.get(state_key, {})
@@ -1051,7 +1060,9 @@ def collect_time_stacks(host, token, vessel_id, scan_times, output_dir,
             state_info = downloaded_state.get(state_key, {})
             if fpath.exists() and state_info.get("scan_times") == frame_times:
                 continue
-            labels = [image_type_label(img_type)]
+            labels = [
+                (channel_labels or {}).get(img_type, image_type_label(img_type))
+            ]
             have = appendable_prefix(fpath, state_info, frame_times, labels,
                                      channel_hyperstack=False) if append else 0
             to_download.append({
@@ -1069,7 +1080,8 @@ def collect_scan_items_parallel(host, token, vessel_id, scan_times, output_dir,
                                 state=None, wells=None, channels=None,
                                 reference_time=None, hyperstack=False,
                                 max_workers=4, progress_callback=None,
-                                stop_event=None, recipe=None):
+                                stop_event=None, recipe=None,
+                                channel_labels=None):
     """Collect per-scan image or hyperstack download items using parallel scan checks."""
     scan_times = sorted(scan_times, key=parse_scan_datetime)
     total_scans = len(scan_times)
@@ -1087,10 +1099,14 @@ def collect_scan_items_parallel(host, token, vessel_id, scan_times, output_dir,
     def collect_one(scan_time):
         if stop_event and stop_event.is_set():
             return scan_time, []
-        items = collector(
-            host, token, vessel_id, scan_time, output_dir,
-            state=state, wells=wells, channels=channels,
-            reference_time=reference_time, recipe=recipe)
+        kwargs = {
+            "state": state, "wells": wells, "channels": channels,
+            "reference_time": reference_time, "recipe": recipe,
+        }
+        if hyperstack:
+            kwargs["channel_labels"] = channel_labels
+        items = collector(host, token, vessel_id, scan_time, output_dir,
+                          **kwargs)
         return scan_time, items
 
     completed = 0
@@ -1301,11 +1317,29 @@ def _write_imagej_stack(path, arrays, shape, dtype, axes, labels=None):
         "mode": "grayscale",
     }
     if labels is not None:
-        metadata["Labels"] = labels
+        if "C" not in axes:
+            raise ValueError("Channel labels require a C axis")
+        channel_labels = list(labels)
+        channel_count = shape[axes.index("C")]
+        if len(channel_labels) != channel_count:
+            raise ValueError(
+                f"Got {len(channel_labels)} channel labels for "
+                f"{channel_count} channels")
+        plane_count = 1
+        for axis, size in zip(axes, shape):
+            if axis not in "YX":
+                plane_count *= size
+        metadata["Labels"] = _imagej_plane_labels(
+            channel_labels, plane_count // channel_count)
 
     tifffile.imwrite(str(path), arrays, shape=shape, dtype=dtype,
                      imagej=True, metadata=metadata,
                      photometric="minisblack")
+
+
+def _imagej_plane_labels(channel_labels, repetitions):
+    """Repeat channel names once for every timepoint in TIFF plane order."""
+    return list(channel_labels) * repetitions
 
 
 def write_imagej_hyperstack(path, channel_arrays, labels):
@@ -1382,10 +1416,12 @@ def _download_hyperstack(host, token, item, state, state_lock, max_retries=3,
                          cache=None):
     """Download selected channels and write a single ImageJ hyperstack TIFF."""
     arrays = []
-    labels = []
-    for channel_item in item["channels"]:
+    labels = list(item.get("labels") or [])
+    for index, channel_item in enumerate(item["channels"]):
         channel_item = dict(channel_item)
-        channel_item["fname"] = f"{item['fname']}:{image_type_label(channel_item['img_type'])}"
+        label = (labels[index] if index < len(labels)
+                 else image_type_label(channel_item["img_type"]))
+        channel_item["fname"] = f"{item['fname']}:{label}"
         img_bytes, error = _fetch_payload(host, token, channel_item, max_retries,
                                           cache=cache)
         if error:
@@ -1393,9 +1429,12 @@ def _download_hyperstack(host, token, item, state, state_lock, max_retries=3,
         try:
             arrays.append(_payload_array(host, token, channel_item, img_bytes,
                                          max_retries, cache=cache))
-            labels.append(image_type_label(channel_item["img_type"]))
         except Exception as e:
             return None, f"SKIP {item['fname']}: could not read channel TIFF ({e})"
+
+    if len(labels) != len(arrays):
+        labels = [image_type_label(channel["img_type"])
+                  for channel in item["channels"]]
 
     try:
         write_imagej_hyperstack(item["fpath"], arrays, labels)
@@ -1615,7 +1654,8 @@ def extend_time_stack(host, token, item, state, state_lock, max_retries=3,
         host, token, item, frames, max_retries=max_retries,
         unit_progress_callback=unit_progress_callback,
         stop_event=stop_event, cache=cache)
-    labels = item["labels"] if item.get("channel_hyperstack") else None
+    labels = (_imagej_plane_labels(item["labels"], len(item["frames"]))
+              if item.get("channel_hyperstack") else None)
 
     try:
         append_planes(item["fpath"], planes, labels=labels)

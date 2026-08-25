@@ -26,6 +26,7 @@ from .models import (
     LAYOUT_DESCRIPTIONS, LAYOUTS, human_bytes, layout_from_flags, resolve_layout,
 )
 from .preview import DEFAULT_MAX_IMAGES, DEFAULT_SIZE
+from .timeline import DEFAULT_TIMELINE_SIZE
 from .processing import BACKGROUND_HELP, UNMIX_HELP, Unmixing
 from .options import (
     END_NOW, ExportOptions, MOMENT_HELP, SPAN_HELP, START_FIRST, START_TODAY,
@@ -435,6 +436,121 @@ def cmd_preview(args):
     return 0
 
 
+def cmd_protocol(args):
+    """Draw how the run was set up, from the device's own metadata.
+
+    The same picture the Incucyte software shows in its experiment view - a
+    time loop around a well loop around the channel chain - except that it can
+    be seen from another machine, and it says which of the numbers on it were
+    requested and which actually happened.
+    """
+    client = make_client(args)
+    scans = _find_scans(args, client)
+    if not scans:
+        emit("No scan matched - nothing to draw.")
+        return 1
+
+    protocol = client.protocol(
+        scans[0], names=_split_names(args.channel_names),
+        name_source="the command line" if args.channel_names else "",
+        scan=not args.no_scan, progress=ConsoleProgress(not args.quiet))
+
+    written = None
+    if args.out:
+        written = protocol.save(args.out,
+                                theme="dark" if args.dark else "light")
+
+    if args.json:
+        payload = protocol.to_dict()
+        payload["written"] = str(written) if written else ""
+        emit_json(payload)
+        return 0
+
+    for line in protocol.lines(width=max(int(args.width), 48)):
+        emit(line)
+    if written:
+        emit(f"\n  Wrote {written}")
+    return 0
+
+
+def _split_names(spec):
+    """``--channel-names Phase,Cry1-GFP`` into a list, or None."""
+    if not spec:
+        return None
+    return [part.strip() for part in str(spec).split(",") if part.strip()]
+
+
+def cmd_timeline(args):
+    """Open a bounded lazy scrubber over a vessel's scan times."""
+    client = make_client(args)
+    progress = ConsoleProgress(not args.quiet)
+    if args.at:
+        found = _find_scans(args, client)
+        if not found:
+            emit("No scan matched - nothing to show.")
+            return 0
+        target = found[:1]
+        find = {}
+    else:
+        target = args.name
+        find = {"vessel": args.vessel, "owner": args.owner,
+                "plate": args.plate, "channel": args.channel}
+    result = client.timeline(
+        target, wells=args.wells, channels=args.channels, site=args.site,
+        size=args.size, contrast=args.contrast, anchors=args.anchors,
+        frame_cache=args.frame_cache, render_cache=args.render_cache,
+        proxy_dir=args.proxy_dir, local_stack=args.local_stack,
+        output=args.output,
+        start_from=args.since or START_FIRST, end_at=args.until or END_NOW,
+        max_frames=args.most_recent, calibrate=bool(args.calibrate),
+        background=args.background or "", unmix=args.unmix or "",
+        progress=progress, **find)
+    saved = result.save(args.save) if args.save else []
+    if args.json:
+        payload = result.to_dict()
+        payload["saved"] = [str(path) for path in saved]
+        emit_json(payload)
+    else:
+        emit(f"\n=== {result.title} ===\n")
+        emit(result.summary())
+        if saved:
+            emit(f"{len(saved)} PNGs written to {args.save}")
+    if not args.no_show:
+        result.show()
+    else:
+        result.close()
+    return 0
+
+
+def cmd_preview_probe(args):
+    """Prove reduced viewer tile decoding without saving biological pixels."""
+    client = make_client(args)
+    scans = _find_scans(args, client)
+    if not scans:
+        emit("No scan matched - nothing to probe.")
+        return 0
+    report = client.probe_preview_tiles(
+        scans[0], wells=args.wells, channels=args.channels, site=args.site,
+        compare_full=not args.no_compare,
+        progress=ConsoleProgress(not args.quiet))
+    if args.json:
+        emit_json(report)
+        return 0
+    emit(f"\nVessel {report['vessel_id']} - {report['scan_time']}")
+    emit(f"Levels: {len(report['levels'])}; lowest resolution: "
+         f"{report.get('lowest_resolution_level')}")
+    for channel in report.get("channels", {}).values():
+        emit(f"\n{channel['name']} - {channel['route']}")
+        for level in channel["levels"]:
+            if level.get("error"):
+                emit(f"  level {level['level']}: {level['error']}")
+            else:
+                emit(f"  level {level['level']}: "
+                     f"{level['decoded_shape']} - {level['bytes']:,} bytes - "
+                     f"{level.get('orientation', 'not compared')}")
+    return 0
+
+
 def cmd_plan(args):
     client = make_client(args)
     options = options_from_args(args)
@@ -662,6 +778,16 @@ def cmd_manifest(args):
     emit(f"  Channels:    {', '.join(stats.get('channels', [])) or '-'}")
     emit(f"  Scan times:  {len(manifest.get('scan_times', [])):,}")
     emit(f"  Runs:        {len(manifest.get('runs', []))}")
+    emit(f"  Finished:    {stats.get('complete_files', 0):,} of "
+         f"{stats.get('file_count', 0):,}")
+    filling = stats.get("filling_files", 0)
+    unstated = stats.get("unstated_files", 0)
+    if filling:
+        emit(f"  Still filling: {filling:,} - a time stack gains frames on "
+             f"every poll, so these are not finished")
+    if unstated:
+        emit(f"  Not stated:  {unstated:,} - downloaded without anything "
+             f"saying whether the experiment had ended")
     return 0
 
 
@@ -906,8 +1032,8 @@ def build_parser():
                            help="Display stretch (default: auto)")
     p_preview.add_argument("--max-images", dest="max_images", type=int,
                            default=DEFAULT_MAX_IMAGES, metavar="N",
-                           help=f"Stop after N images - each one is a full-size "
-                                f"download (default {DEFAULT_MAX_IMAGES})")
+                           help=f"Stop the static well wall after N images "
+                                f"(default {DEFAULT_MAX_IMAGES})")
     p_preview.add_argument("--save", metavar="DIR",
                            help="Also write the thumbnails there as PNGs")
     p_preview.add_argument("--no-show", dest="no_show", action="store_true",
@@ -922,6 +1048,87 @@ def build_parser():
     p_preview.add_argument("--background", metavar="LEVEL",
                            help=literal(f"Preview a background subtraction: "
                                         f"{BACKGROUND_HELP}"))
+
+    p_protocol = sub.add_parser(
+        "protocol", help="How the run was set up: the time loop, the wells "
+                         "and the channel chain, drawn")
+    add_finder_args(p_protocol)
+    p_protocol.add_argument("--out", "-o", metavar="FILE",
+                            help="Write the drawing here: .svg costs nothing, "
+                                 ".png and .pdf need matplotlib. A folder "
+                                 "means <vessel>-protocol.svg inside it.")
+    p_protocol.add_argument("--dark", action="store_true",
+                            help="The dark palette, for a dark slide")
+    p_protocol.add_argument("--no-scan", dest="no_scan", action="store_true",
+                            help="The plan alone: do not sweep the run's whole "
+                                 "lifetime. Much faster on a long experiment, "
+                                 "and it costs the achieved cadence, the "
+                                 "progress and whether the instrument is "
+                                 "acquiring.")
+    p_protocol.add_argument("--channel-names", dest="channel_names",
+                            metavar="NAMES",
+                            help="Override the device's channel names, in "
+                                 "acquisition order (Phase,Cry1-GFP)")
+    # Not through literal(): there is no literal % here, and escaping the one
+    # in %(default)s stops argparse substituting it.
+    p_protocol.add_argument("--width", type=int, default=96, metavar="COLUMNS",
+                            help="Terminal width for the drawing "
+                                 "(default: %(default)s)")
+
+    p_timeline = sub.add_parser(
+        "timeline", help="Scrub through a run without loading every image")
+    add_finder_args(p_timeline)
+    for action in p_timeline._actions:
+        if action.dest == "most_recent":
+            action.default = None
+            action.help = "Keep only the newest N positions (default: all)"
+    p_timeline.add_argument("--wells", "-w",
+                            help="Well filter; the window starts at the first")
+    p_timeline.add_argument("--channels", "-c",
+                            help=f"Channel filter ({CHANNEL_HELP})")
+    p_timeline.add_argument("--site", type=int, default=0,
+                            help="Which site within each well (default 0)")
+    p_timeline.add_argument(
+        "--size", type=int, default=DEFAULT_TIMELINE_SIZE,
+        help=f"Preview edge in pixels (default {DEFAULT_TIMELINE_SIZE})")
+    p_timeline.add_argument("--contrast", default="auto",
+                            choices=["auto", "minmax", "raw"],
+                            help="Display stretch (default: auto)")
+    p_timeline.add_argument("--anchors", type=int, default=100, metavar="N",
+                            help="Evenly spaced initial frames (default 100)")
+    p_timeline.add_argument("--frame-cache", type=int, default=128, metavar="N",
+                            help="Native frames kept in memory (default 128)")
+    p_timeline.add_argument("--render-cache", type=int, default=96, metavar="N",
+                            help="Display frames kept in memory (default 96)")
+    p_timeline.add_argument("--proxy-dir", metavar="DIR",
+                            help="Reuse disposable native preview frames here")
+    p_timeline.add_argument("--local-stack", metavar="TIFF",
+                            help="Read an existing local time stack first")
+    p_timeline.add_argument("--output", "-o", metavar="DIR",
+                            help="Reuse exported stacks and preview proxies here")
+    p_timeline.add_argument("--save", metavar="DIR",
+                            help="Save the initial anchor previews as PNGs")
+    p_timeline.add_argument("--no-show", dest="no_show", action="store_true",
+                            help="Do not open the scrubber window")
+    p_timeline.add_argument("--calibrate", action="store_true",
+                            help="Apply the acquisition calibration")
+    p_timeline.add_argument("--unmix", metavar="SPEC",
+                            help=literal(f"Preview an unmixing: {UNMIX_HELP}"))
+    p_timeline.add_argument("--background", metavar="LEVEL",
+                            help=literal(f"Preview background subtraction: "
+                                         f"{BACKGROUND_HELP}"))
+
+    p_preview_probe = sub.add_parser(
+        "preview-probe", help="Test the private reduced-tile route read-only")
+    add_finder_args(p_preview_probe)
+    p_preview_probe.add_argument("--wells", "-w",
+                                 help="Probe the first matching acquired well")
+    p_preview_probe.add_argument("--channels", "-c",
+                                 help=f"Channel filter ({CHANNEL_HELP})")
+    p_preview_probe.add_argument("--site", type=int, default=0)
+    p_preview_probe.add_argument(
+        "--no-compare", action="store_true",
+        help="Do not fetch a full TIFF for the orientation comparison")
 
     p_plan = sub.add_parser("plan", help="Show what a download would fetch")
     add_selection_args(p_plan)
@@ -946,7 +1153,9 @@ def build_parser():
 COMMANDS = {
     "probe": cmd_probe, "login": cmd_login, "logout": cmd_logout, "gui": cmd_gui,
     "vessels": cmd_vessels, "scans": cmd_scans, "plan": cmd_plan,
-    "find": cmd_find, "preview": cmd_preview,
+    "find": cmd_find, "preview": cmd_preview, "timeline": cmd_timeline,
+    "protocol": cmd_protocol,
+    "preview-probe": cmd_preview_probe,
     "download": cmd_download, "watch": cmd_watch, "status": cmd_status,
     "scan-now": cmd_scan_now, "unmix": cmd_unmix,
     "manifest": cmd_manifest, "preset": cmd_preset,

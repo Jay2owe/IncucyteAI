@@ -98,6 +98,35 @@ def _plural(count, word):
     return f"{count:,} {word}" if count == 1 else f"{count:,} {word}s"
 
 
+def derived(value, source):
+    """A value paired with where it came from.
+
+    The pipeline's shared manifest shape carries provenance on anything that
+    was not read straight off an instrument, so a consumer - or Jamie in six
+    months - can tell a measured 1800 apart from a typed one.  ``None`` still
+    gets a reason: "the device does not report it" and "nobody has looked" are
+    different answers to somebody deciding whether to trust a number.
+    """
+    return {"value": value, "source": source}
+
+
+def microns_per_pixel(record):
+    """The pixel size a raw vessel record states, in microns, or None.
+
+    ``GetAllSearchVessels`` carries it on every vessel as
+    ``ImageSize.MicronsPerPixel``.  Nothing else in this package knows it, and
+    every micron-denominated measurement downstream needs it.
+    """
+    size = record.get("ImageSize") if isinstance(record, dict) else None
+    if not isinstance(size, dict):
+        return None
+    try:
+        value = float(size.get("MicronsPerPixel"))
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
 # ---------------------------------------------------------------------------
 # Vessel
 # ---------------------------------------------------------------------------
@@ -117,6 +146,9 @@ class Vessel:
     last_scan: datetime = None
     channel_labels: dict = field(default_factory=dict)
     active_channels: set = field(default_factory=set)
+    #: Microns per pixel, read straight off the vessel record - not inferred
+    #: from the objective.  None when the device did not state one.
+    pixel_size_um: float = None
     raw: dict = field(default_factory=dict, repr=False)
 
     @classmethod
@@ -151,6 +183,7 @@ class Vessel:
             last_scan=_dt(record.get("LastScanDateTime")),
             channel_labels=ch.labels_for_vessel(vessel_channels),
             active_channels=ch.active_channels(vessel_channels),
+            pixel_size_um=microns_per_pixel(record),
             raw=record,
         )
 
@@ -182,6 +215,7 @@ class Vessel:
             "last_scan": self.last_scan.isoformat() if self.last_scan else None,
             "channel_labels": {str(k): v for k, v in self.channel_labels.items()},
             "active_channels": sorted(self.active_channels),
+            "pixel_size_um": self.pixel_size_um,
         }
 
 
@@ -215,6 +249,9 @@ class VesselScan:
     coefficients: dict = field(default_factory=dict, repr=False)
     #: What the Incucyte software has saved for this vessel, ready to adjust.
     unmixing: object = None
+    #: Reduced viewer resolutions advertised by GetScanVessel.  Kept in their
+    #: raw JSON shape because the private route is capability-detected later.
+    pyramid_levels: list = field(default_factory=list, repr=False)
     client: object = field(default=None, repr=False)
 
     # -- identity ---------------------------------------------------------
@@ -299,6 +336,7 @@ class VesselScan:
                 for c in sorted(self.channels, key=ch.image_type_sort_key)],
             "sites": sorted(self.sites),
             "image_count": self.image_count,
+            "pyramid_levels": len(self.pyramid_levels),
             "unmixing": str(self.unmixing or ""),
         }
 
@@ -312,7 +350,14 @@ class VesselScan:
 
 @dataclass
 class OutputFile:
-    """One file written to disk, described in pipeline-ready terms."""
+    """One file written to disk, described in pipeline-ready terms.
+
+    The field names are the SCN pipeline's shared handoff contract, defined in
+    ``PySCNSlice/docs/scn-pipeline-plan.md`` and written the same way by
+    PyLV200, so one reader serves all three.  ``to_dict()`` is that contract on
+    the wire; ``well``/``row``/``col``/``site`` and the rest sit beside it as
+    this package's own plate vocabulary.
+    """
 
     path: Path
     vessel_id: int
@@ -322,7 +367,13 @@ class OutputFile:
     site: int = 0
     layout: str = "separate"
     axes: str = "YX"
-    channels: list = field(default_factory=list)     # display names, stack order
+    #: One entry per plane on the channel axis, in stack order:
+    #: ``{index, name, image_type, source}``.  ``index`` counts from **one**,
+    #: the way ImageJ and PySCNSlice's ``scn_channel`` count, and describes
+    #: *the written stack* rather than the vessel - a well that missed a
+    #: channel would otherwise shift every name after the gap by one.  Use
+    #: :attr:`channel_names` for just the names.
+    channels: list = field(default_factory=list)
     image_types: list = field(default_factory=list)  # device channel numbers
     scan_times: list = field(default_factory=list)   # ISO strings, stack order
     elapsed: str = ""                                # e.g. "01d06h30m"
@@ -331,13 +382,61 @@ class OutputFile:
     processed: bool = False      # were these pixels altered after download?
     processing: str = ""         # ...and how, in one line
 
+    # -- what the next stage of the pipeline reads -------------------------
+    #: Will this file gain more frames?  None where nobody can honestly say.
+    complete: bool = None
+    #: How many frames it should hold once the run finishes, or None.
+    frames_expected: int = None
+    #: Planes allocated but not yet acquired.  Always 0 here: nothing is
+    #: written until every plane has been downloaded and checked.
+    blank_planes: int = 0
+    #: ``{"value": seconds, "source": ...}`` - the acquisition cadence.
+    interval_s: dict = None
+    #: ``{"value": microns, "source": ...}`` - the pixel size.
+    pixel_size_um: dict = None
+
+    @property
+    def channel_names(self):
+        """Just the display names, in stack order - ``["Phase", "GFP"]``."""
+        return [c.get("name") for c in self.channels]
+
+    @property
+    def frames(self):
+        """Timepoints this file holds *now*.
+
+        A time stack is extended in place on every poll, so this is true when
+        it is read and stale a moment later.  :attr:`complete` is what says
+        whether it will change again.
+        """
+        return max(1, len(self.scan_times))
+
+    #: What :attr:`frames` was called before the pipeline's shared contract
+    #: settled on one name for it.  Kept so existing scripts keep working.
     @property
     def frame_count(self):
-        return max(1, len(self.scan_times))
+        return self.frames
+
+    @property
+    def missing_frames(self):
+        """Frames the run has that this file does not, or None if unknown.
+
+        A time stack should hold every moment its vessel was scanned, so a
+        stack holding fewer has wells or channels the device missed at those
+        moments.  That is a different thing from a stack still filling, which
+        is what :attr:`complete` says.
+        """
+        if self.frames_expected is None:
+            return None
+        return max(0, self.frames_expected - self.frames)
 
     def to_dict(self):
         data = asdict(self)
         data["path"] = str(self.path)
+        # Two contract names that cannot be dataclass fields here: ``frames``
+        # is derived from the scan times, and ``field`` would shadow
+        # ``dataclasses.field`` inside the class body.
+        data["frames"] = self.frames
+        data["field"] = {"kind": "well", "name": self.well}
         return data
 
 
@@ -606,6 +705,7 @@ class DownloadResult:
 __all__ = [
     "LAYOUTS", "LAYOUT_DESCRIPTIONS", "LAYOUT_LABELS", "LAYOUT_AXES",
     "LAYOUT_ALIASES", "resolve_layout", "layout_flags", "layout_from_flags",
-    "human_bytes", "Vessel", "VesselScan", "OutputFile", "ExportPlan",
+    "human_bytes", "derived", "microns_per_pixel",
+    "Vessel", "VesselScan", "OutputFile", "ExportPlan",
     "DownloadResult", "ProgressEvent",
 ]

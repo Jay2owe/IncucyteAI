@@ -227,9 +227,34 @@ class StackDownloadTests(unittest.TestCase):
                 with tifffile.TiffFile(path) as tif:
                     self.assertEqual(tif.series[0].shape, (2, 2, 2, 3))
                     self.assertEqual(tif.series[0].axes, "TCYX")
+                    self.assertEqual(tif.imagej_metadata["Labels"],
+                                     ["Phase", "Green"] * 2)
                     np.testing.assert_array_equal(tif.asarray(), expected)
 
         self._with_fake_payloads(payloads, run_test)
+
+    def test_a_whole_time_hyperstack_matches_pylv200s_single_z_layout(self):
+        """A singleton Z axis is omitted by ImageJ, so both writers should
+        produce exactly the same TIFF when given the same planes and names."""
+        data = np.arange(3 * 2 * 4 * 5, dtype=np.uint16).reshape(3, 2, 4, 5)
+        labels = ["Phase", "GFP"]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pyincucyte_path = Path(tmpdir) / "pyincucyte.tif"
+            pylv200_path = Path(tmpdir) / "pylv200.tif"
+            downloader._write_imagej_stack(
+                pyincucyte_path, iter(data), data.shape, data.dtype,
+                "TCYX", labels)
+            tifffile.imwrite(
+                pylv200_path, data[:, None], imagej=True,
+                metadata={
+                    "axes": "TZCYX",
+                    "mode": "grayscale",
+                    "Labels": labels * data.shape[0],
+                })
+
+            self.assertEqual(pyincucyte_path.read_bytes(),
+                             pylv200_path.read_bytes())
 
 
 if __name__ == "__main__":

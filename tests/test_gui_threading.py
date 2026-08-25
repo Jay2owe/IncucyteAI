@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 from pyincucyte.gui import app as app_module
 from pyincucyte.gui.app import App
+from pyincucyte.gui.preview import TimelineWindow
 
 
 class GuiThreadingTests(unittest.TestCase):
@@ -24,6 +25,68 @@ class GuiThreadingTests(unittest.TestCase):
         callback, args, kwargs = app.ui_queue.get_nowait()
         callback(*args, **kwargs)
         self.assertEqual(calls, ["from worker"])
+
+    def test_timeline_worker_only_puts_results_on_its_queue(self):
+        window = object.__new__(TimelineWindow)
+        window.timeline = SimpleNamespace(size=64)
+        window._cancel = threading.Event()
+        window._results = queue.Queue()
+        window.source = SimpleNamespace(
+            render_frame=lambda *args, **kwargs: "pixels",
+            frame_info=lambda *args: "info",
+            neighbours=lambda index: (),
+            prefetch=lambda *args, **kwargs: None,
+        )
+        worker = threading.Thread(
+            target=window._load_frame,
+            args=(4, 7, ("A1", 0, 1, "auto")))
+        worker.start()
+        worker.join()
+        self.assertEqual(window._results.get_nowait(),
+                         (4, 7, ("A1", 0, 1, "auto"),
+                          "pixels", "info", ""))
+
+    def test_late_timeline_result_is_ignored_after_selection_changes(self):
+        window = object.__new__(TimelineWindow)
+        window._closing = False
+        window._generation = 2
+        window._results = queue.Queue()
+        window._results.put((1, 4, ("A1", 0, 1, "auto"),
+                             "stale pixels", None, ""))
+        window._selection = lambda: ("A2", 0, 1, "auto")
+        window.after = lambda *_args: "next poll"
+        TimelineWindow._poll_results(window)
+        self.assertEqual(window._poll_job, "next poll")
+
+    def test_parent_window_destruction_cancels_and_closes_the_timeline(self):
+        window = object.__new__(TimelineWindow)
+        window._closing = False
+        window._cleanup_started = False
+        window._cancel = threading.Event()
+        shutdowns = []
+        closes = []
+        window._workers = SimpleNamespace(
+            shutdown=lambda **kwargs: shutdowns.append(kwargs))
+        window.timeline = SimpleNamespace(close=lambda: closes.append(True))
+
+        started = []
+
+        class ImmediateThread:
+            def __init__(self, target, **_kwargs):
+                self.target = target
+
+            def start(self):
+                started.append(True)
+                self.target()
+
+        with patch("pyincucyte.gui.preview.threading.Thread", ImmediateThread):
+            TimelineWindow._on_destroy(
+                window, SimpleNamespace(widget=window))
+
+        self.assertTrue(window._cancel.is_set())
+        self.assertEqual(started, [True])
+        self.assertEqual(shutdowns, [{"wait": True, "cancel_futures": True}])
+        self.assertEqual(closes, [True])
 
 
 class FakeWatcher:

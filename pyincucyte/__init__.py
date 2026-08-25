@@ -15,7 +15,7 @@ Two ways in.  A desktop app::
             start_from="first")
 
     for image in result.files:
-        segment(image.path, well=image.well, channels=image.channels)
+        segment(image.path, well=image.well, channels=image.channel_names)
 
 ``result.files`` carries the well, channel names, timepoints and axis order for
 every file, and the same information is written to ``pyincucyte-manifest.json``
@@ -63,6 +63,13 @@ from .models import (  # noqa: E402
 from .device import DeviceState, ScanPattern  # noqa: E402
 from .options import ExportOptions  # noqa: E402
 from .preview import PreviewImage, PreviewSet  # noqa: E402
+from .protocol import Protocol, Step, read_protocol  # noqa: E402
+from .timeline import (  # noqa: E402
+    HybridTimelineSource,
+    TimelinePreview,
+    TimelineSource,
+    choose_frames,
+)
 from .processing import Recipe, Unmixing  # noqa: E402
 from .config import ConfigStore, Credentials  # noqa: E402
 from .state import StateStore  # noqa: E402
@@ -99,6 +106,13 @@ __all__ = [
     "ScanPattern",
     "PreviewImage",
     "PreviewSet",
+    "Protocol",
+    "Step",
+    "read_protocol",
+    "TimelineSource",
+    "HybridTimelineSource",
+    "TimelinePreview",
+    "choose_frames",
     "Recipe",
     "Unmixing",
     "Watcher",

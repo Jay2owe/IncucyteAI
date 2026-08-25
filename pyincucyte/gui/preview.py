@@ -7,7 +7,10 @@ app it is just another Toplevel and returns immediately.
 """
 
 import base64
+import queue
+import threading
 import tkinter as tk
+from concurrent.futures import ThreadPoolExecutor
 from tkinter import filedialog, messagebox, ttk
 
 from . import theme as theme_mod
@@ -241,4 +244,351 @@ def show_preview(preview_set, parent=None, title=None, block=None, dark=None):
     return window
 
 
-__all__ = ["PreviewWindow", "show_preview", "TILE_PAD", "DEFAULT_COLUMNS"]
+class TimelineWindow(tk.Toplevel):
+    """One bounded image canvas with lazy time, well, and channel controls."""
+
+    def __init__(self, parent, theme, timeline, title=None):
+        super().__init__(parent)
+        self.theme = theme
+        self.timeline = timeline
+        self.source = timeline.source
+        self.photo = None               # exactly one live Tk image reference
+        self.current_array = None
+        self.current_index = 0
+        self._generation = 0
+        self._slider_job = None
+        self._play_job = None
+        self._poll_job = None
+        self._closing = False
+        self._cleanup_started = False
+        self._cancel = threading.Event()
+        self._results = queue.Queue()
+        self._workers = ThreadPoolExecutor(
+            max_workers=2, thread_name_prefix="pyincucyte-preview")
+
+        self.title(title or timeline.title)
+        self.configure(background=theme["bg"])
+        if parent is not None and parent.winfo_viewable():
+            self.transient(parent)
+        self.protocol("WM_DELETE_WINDOW", self._close)
+        self.bind("<Destroy>", self._on_destroy, add="+")
+        self.bind("<Escape>", lambda _event: self._close())
+        self.bind("<Left>", lambda _event: self._step(-1))
+        self.bind("<Right>", lambda _event: self._step(1))
+        self.bind("<space>", lambda _event: self._toggle_play())
+
+        self._build()
+        self.geometry("720x680")
+        self.minsize(520, 480)
+        self._poll_job = self.after(40, self._poll_results)
+        self._request_current()
+
+    def _build(self):
+        header = ttk.Frame(self, style="Toolbar.TFrame", padding=theme_mod.PAD_M)
+        header.pack(side="top", fill="x")
+        ttk.Label(header, text=self.timeline.title,
+                  style="Heading.TLabel").pack(side="left")
+        ttk.Button(header, text="Close", command=self._close).pack(side="right")
+        save = ttk.Button(header, text="Save frame...", command=self._save_frame)
+        save.pack(side="right", padx=theme_mod.PAD_S)
+        tip(save, "Save the displayed, contrast-stretched preview as PNG. "
+                  "It is not quantitative data.", self.theme)
+
+        selectors = ttk.Frame(self, padding=(theme_mod.PAD_M, theme_mod.PAD_S))
+        selectors.pack(side="top", fill="x")
+        selectors.columnconfigure(1, weight=1)
+        selectors.columnconfigure(3, weight=1)
+        selectors.columnconfigure(5, weight=1)
+
+        self.well_var = tk.StringVar(value=self.timeline.well)
+        self.channel_var = tk.StringVar(
+            value=self.source.channel_labels.get(self.timeline.channel,
+                                                  str(self.timeline.channel)))
+        self.site_var = tk.StringVar(value=f"Site {self.timeline.site + 1}")
+        self.contrast_var = tk.StringVar(value=self.timeline.contrast)
+        self._channels_by_label = {
+            self.source.channel_labels.get(number, str(number)): number
+            for number in self.source.available_channels
+        }
+        self._sites_by_label = {
+            f"Site {number + 1}": number for number in self.source.available_sites
+        }
+
+        ttk.Label(selectors, text="Well").grid(row=0, column=0, sticky="w")
+        well = ttk.Combobox(
+            selectors, textvariable=self.well_var,
+            values=self.source.available_wells, state="readonly", width=10)
+        well.grid(row=0, column=1, sticky="ew", padx=(theme_mod.PAD_XS,
+                                                       theme_mod.PAD_M))
+        ttk.Label(selectors, text="Channel").grid(row=0, column=2, sticky="w")
+        channel = ttk.Combobox(
+            selectors, textvariable=self.channel_var,
+            values=list(self._channels_by_label), state="readonly", width=16)
+        channel.grid(row=0, column=3, sticky="ew", padx=(theme_mod.PAD_XS,
+                                                          theme_mod.PAD_M))
+        ttk.Label(selectors, text="Site").grid(row=0, column=4, sticky="w")
+        site = ttk.Combobox(
+            selectors, textvariable=self.site_var,
+            values=list(self._sites_by_label), state="readonly", width=9)
+        site.grid(row=0, column=5, sticky="ew", padx=(theme_mod.PAD_XS, 0))
+
+        ttk.Label(selectors, text="Contrast").grid(
+            row=1, column=0, sticky="w", pady=(theme_mod.PAD_S, 0))
+        contrast = ttk.Combobox(
+            selectors, textvariable=self.contrast_var,
+            values=("auto", "minmax", "raw"), state="readonly", width=10)
+        contrast.grid(row=1, column=1, sticky="w",
+                      padx=(theme_mod.PAD_XS, theme_mod.PAD_M),
+                      pady=(theme_mod.PAD_S, 0))
+        for widget in (well, channel, site, contrast):
+            widget.bind("<<ComboboxSelected>>",
+                        lambda _event: self._request_current())
+
+        body = ttk.Frame(self, style="Card.TFrame", padding=theme_mod.PAD_S)
+        body.pack(side="top", fill="both", expand=True,
+                  padx=theme_mod.PAD_M, pady=(0, theme_mod.PAD_S))
+        self.canvas = tk.Canvas(body, background=self.theme["surface"],
+                                highlightthickness=0, borderwidth=0)
+        self.canvas.pack(fill="both", expand=True)
+        self._image_item = self.canvas.create_image(0, 0, anchor="center")
+        self._message_item = self.canvas.create_text(
+            0, 0, text="Loading...", fill=self.theme["muted"],
+            anchor="center", justify="center")
+        self.canvas.bind("<Configure>", self._centre_canvas)
+
+        controls = ttk.Frame(self, padding=(theme_mod.PAD_M, theme_mod.PAD_XS))
+        controls.pack(side="top", fill="x")
+        ttk.Button(controls, text="Previous", command=lambda: self._step(-1)).pack(
+            side="left")
+        self.play_button = ttk.Button(controls, text="Play",
+                                      command=self._toggle_play)
+        self.play_button.pack(side="left", padx=theme_mod.PAD_S)
+        ttk.Button(controls, text="Next", command=lambda: self._step(1)).pack(
+            side="left")
+        self.position_var = tk.IntVar(value=0)
+        self.slider = ttk.Scale(
+            controls, from_=0, to=max(0, self.source.frame_count - 1),
+            variable=self.position_var, command=self._on_slider)
+        self.slider.pack(side="left", fill="x", expand=True,
+                         padx=theme_mod.PAD_M)
+        self.position_label = ttk.Label(controls, style="Muted.TLabel", width=18,
+                                        anchor="e")
+        self.position_label.pack(side="right")
+
+        status = ttk.Frame(self, style="Toolbar.TFrame",
+                           padding=(theme_mod.PAD_M, theme_mod.PAD_S))
+        status.pack(side="bottom", fill="x")
+        self.status_var = tk.StringVar(value=self.timeline.summary())
+        ttk.Label(status, textvariable=self.status_var,
+                  style="Muted.TLabel").pack(side="left")
+
+    def _selection(self):
+        return (self.well_var.get(),
+                self._sites_by_label.get(self.site_var.get(), 0),
+                self._channels_by_label.get(self.channel_var.get(),
+                                            self.timeline.channel),
+                self.contrast_var.get())
+
+    def _centre_canvas(self, event=None):
+        width = event.width if event is not None else self.canvas.winfo_width()
+        height = event.height if event is not None else self.canvas.winfo_height()
+        centre = (max(1, width) // 2, max(1, height) // 2)
+        self.canvas.coords(self._image_item, *centre)
+        self.canvas.coords(self._message_item, *centre)
+
+    def _invalidate(self):
+        self._generation += 1
+        return self._generation
+
+    def _on_slider(self, value):
+        if self._closing:
+            return
+        generation = self._invalidate()
+        index = max(0, min(self.source.frame_count - 1,
+                           int(round(float(value)))))
+        self.position_label.configure(
+            text=f"{index + 1:,} / {self.source.frame_count:,}")
+        if self._slider_job is not None:
+            self.after_cancel(self._slider_job)
+        self._slider_job = self.after(
+            80, lambda: self._request_index(index, generation))
+
+    def _request_current(self):
+        if self._closing:
+            return
+        index = max(0, min(self.source.frame_count - 1,
+                           int(self.position_var.get())))
+        self._request_index(index, self._invalidate())
+
+    def _request_index(self, index, generation):
+        self._slider_job = None
+        if self._closing or generation != self._generation:
+            return
+        selection = self._selection()
+        self.current_index = index
+        self.position_var.set(index)
+        self.position_label.configure(
+            text=f"{index + 1:,} / {self.source.frame_count:,}")
+        self.canvas.itemconfigure(self._message_item, text="Loading...", state="normal")
+        self.status_var.set(self.source.frame_label(index))
+        self._workers.submit(self._load_frame, generation, index, selection)
+
+    def _load_frame(self, generation, index, selection):
+        well, site, channel, contrast = selection
+        try:
+            array = self.source.render_frame(
+                well, site, channel, index, size=self.timeline.size,
+                contrast=contrast, cancel=self._cancel)
+            info = self.source.frame_info(well, site, channel, index)
+            self._results.put((generation, index, selection, array, info, ""))
+        except Exception as exc:
+            self._results.put((generation, index, selection, None, None, str(exc)))
+            return
+        if not self._cancel.is_set():
+            self.source.prefetch(well, site, channel,
+                                 self.source.neighbours(index),
+                                 cancel=self._cancel)
+
+    def _poll_results(self):
+        if self._closing:
+            return
+        try:
+            while True:
+                generation, index, selection, array, info, error = (
+                    self._results.get_nowait())
+                if (generation != self._generation
+                        or selection != self._selection()):
+                    continue
+                if error:
+                    self.photo = None
+                    self.current_array = None
+                    self.canvas.itemconfigure(self._image_item, image="")
+                    self.canvas.itemconfigure(
+                        self._message_item, text=f"No image\n{error[:180]}",
+                        state="normal")
+                    self.status_var.set(error)
+                    continue
+                self.current_array = array
+                self.photo = _photo_image(array, master=self)
+                self.canvas.itemconfigure(self._image_item, image=self.photo)
+                self.canvas.itemconfigure(self._message_item, state="hidden")
+                source = info.source if info is not None else "preview"
+                size = info.source_bytes if info is not None else 0
+                self.status_var.set(
+                    f"{self.source.frame_label(index)} - {source} - {size:,} bytes")
+        except queue.Empty:
+            pass
+        self._poll_job = self.after(40, self._poll_results)
+
+    def _step(self, amount):
+        if self.source.frame_count <= 0:
+            return
+        index = max(0, min(self.source.frame_count - 1,
+                           int(self.position_var.get()) + int(amount)))
+        self.position_var.set(index)
+        self._request_current()
+
+    def _toggle_play(self):
+        if self._play_job is not None:
+            self.after_cancel(self._play_job)
+            self._play_job = None
+            self.play_button.configure(text="Play")
+            return
+        self.play_button.configure(text="Pause")
+        self._play_tick()
+
+    def _play_tick(self):
+        if self._closing or self._play_job is None and self.play_button.cget("text") != "Pause":
+            return
+        index = int(self.position_var.get())
+        if index >= self.source.frame_count - 1:
+            self.position_var.set(0)
+        else:
+            self.position_var.set(index + 1)
+        self._request_current()
+        self._play_job = self.after(350, self._play_tick)
+
+    def _save_frame(self):
+        if self.current_array is None:
+            messagebox.showinfo("Nothing to save", "Wait for a frame to load first.",
+                                parent=self)
+            return
+        path = filedialog.asksaveasfilename(
+            parent=self, title="Save preview frame", defaultextension=".png",
+            filetypes=(("PNG image", "*.png"),))
+        if not path:
+            return
+        try:
+            from PIL import Image
+
+            Image.fromarray(self.current_array).save(path, format="PNG")
+        except OSError as exc:
+            messagebox.showerror("Could not save", str(exc), parent=self)
+
+    def _close(self):
+        if self._closing:
+            return
+        self._closing = True
+        self._cancel.set()
+        if self._slider_job is not None:
+            self.after_cancel(self._slider_job)
+        if self._play_job is not None:
+            self.after_cancel(self._play_job)
+        if self._poll_job is not None:
+            self.after_cancel(self._poll_job)
+        self.destroy()
+
+        self._start_cleanup()
+
+    def _on_destroy(self, event):
+        """Release workers when the parent application destroys this window."""
+        if event.widget is not self:
+            return
+        self._closing = True
+        self._cancel.set()
+        self._start_cleanup()
+
+    def _start_cleanup(self):
+        if self._cleanup_started:
+            return
+        self._cleanup_started = True
+
+        def finish():
+            self._workers.shutdown(wait=True, cancel_futures=True)
+            self.timeline.close()
+
+        threading.Thread(target=finish, name="pyincucyte-preview-close",
+                         daemon=True).start()
+
+
+def show_timeline(timeline, parent=None, title=None, block=None, dark=None):
+    """Show a lazy :class:`~pyincucyte.timeline.TimelinePreview`."""
+    root = parent if parent is not None else tk._default_root
+    owns_root = root is None
+    if owns_root:
+        scale = theme_mod.enable_dpi_awareness()
+        root = tk.Tk()
+        root.withdraw()
+        theme = theme_mod.Theme(root, dark=dark, scale=scale)
+    else:
+        theme = getattr(root, "_pyincucyte_theme", None)
+        if theme is None:
+            theme = theme_mod.Theme(root, dark=dark)
+    window = TimelineWindow(root, theme, timeline, title=title)
+    if block is None:
+        block = owns_root
+    if owns_root:
+        window.protocol("WM_DELETE_WINDOW", lambda: (window._close(), root.destroy()))
+        window.bind("<Escape>", lambda _event: (window._close(), root.destroy()))
+    if block:
+        if owns_root:
+            root.mainloop()
+        else:
+            window.wait_window()
+    return window
+
+
+__all__ = [
+    "PreviewWindow", "TimelineWindow", "show_preview", "show_timeline",
+    "TILE_PAD", "DEFAULT_COLUMNS",
+]

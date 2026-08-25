@@ -9,7 +9,14 @@ analysing what has already landed::
 
     watcher = client.watch(options, on_result=lambda r: analyse(r.paths))
     ...
-    watcher.stop()
+    watcher.stop(flush=True)
+
+Pass ``on_file=`` instead of (or as well as) ``on_result=`` to be handed each
+file the moment it lands rather than once per poll with the lot.  A poll that
+collects 96 wells otherwise delivers nothing until all 96 have arrived, and the
+step after this one is about thirty seconds of single-threaded work per field -
+so starting well A1 while B1 is still downloading is most of what makes the
+pipeline feel continuous rather than batched.
 
 **Chunking.**  By default a frame is downloaded the moment it appears.  Set
 ``batch_frames`` and/or ``batch_after`` on the options and the watcher instead
@@ -65,12 +72,14 @@ class Watcher:
     chunks instead: see the module docstring.
     """
 
-    def __init__(self, client, options, *, on_result=None, on_error=None,
-                 on_poll=None, on_hold=None, progress=None,
+    def __init__(self, client, options, *, on_result=None, on_file=None,
+                 on_error=None, on_poll=None, on_hold=None, progress=None,
                  name="pyincucyte-watch"):
         self.client = client
         self.options = options
         self.on_result = on_result
+        #: Called with each OutputFile as it lands, rather than once per poll.
+        self.on_file = on_file
         self.on_error = on_error
         self.on_poll = on_poll
         self.on_hold = on_hold
@@ -235,22 +244,30 @@ class Watcher:
                                 cancel=self.stop_event)
         return self._collect(plan)
 
-    def flush(self):
+    def flush(self, final=None):
         """Download whatever is being held right now, chunk ready or not.
 
         This is how the tail of an experiment is collected: a part-full chunk
         that will never reach its frame count because the instrument has
         stopped scanning.
+
+        A flush after :meth:`stop` is the end of the run, so what it writes is
+        marked ``complete`` in the manifest - the difference between a stack
+        still filling and one a downstream step can safely outline.  Pass
+        ``final`` to say so explicitly either way.
         """
         # A flush is usually the last thing that happens after stop(), so it
         # cannot share the already-set stop event or it would cancel itself.
-        cancel = (threading.Event() if self.stop_event.is_set()
-                  else self.stop_event)
+        stopped = self.stop_event.is_set()
+        cancel = threading.Event() if stopped else self.stop_event
+        if final is None:
+            final = stopped
         plan = self.client.plan(self.options, progress=self.progress,
                                 cancel=cancel)
-        return self._collect(plan, force=True, cancel=cancel)
+        return self._collect(plan, force=True, cancel=cancel,
+                             complete=bool(final))
 
-    def _collect(self, plan, force=False, cancel=None):
+    def _collect(self, plan, force=False, cancel=None, complete=False):
         """Decide whether this plan's frames go now or wait for a bigger chunk."""
         pending = plan.new_scan_times
         self._pending_frames = len(pending)
@@ -260,8 +277,11 @@ class Watcher:
             self._emit_hold()
             return None
 
+        # A watcher exists to keep adding frames, so what it writes mid-run is
+        # explicitly unfinished; only the flush that ends the run says done.
         result = self.client.download(
-            plan, progress=self.progress,
+            plan, progress=self.progress, on_file=self.on_file,
+            complete=complete,
             cancel=self.stop_event if cancel is None else cancel)
         self._pending_frames = 0
         self._pending_since = None

@@ -44,6 +44,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Only a .png or .pdf protocol drawing needs it; the .svg needs nothing, and
+# the packaged desktop app excludes matplotlib outright.
+figure = [
+    "matplotlib>=3.7",
+]
 dev = [
     "build>=1.2",
     "twine>=5.0",

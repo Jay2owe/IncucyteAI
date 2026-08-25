@@ -74,6 +74,9 @@ Worth knowing:
   each selected well from the most recent scan into a scrollable window,
   captioned with the well and the experiment's own channel names — the
   quickest way to be sure a vessel id is the plate you meant.
+- **View time course** (Ctrl+T) opens one image with a time slider, playback,
+  well/channel selectors and contrast controls. It samples at most 100 frames
+  initially and loads uncached positions only when they are requested.
 - **Scanned only** keeps just the wells the instrument actually imaged in the
   most recent scan — wells with no data are shown dimmed on the plate.
 - **Copy CLI command** (Tools menu, and in the confirm dialog) turns whatever is
@@ -96,6 +99,10 @@ pyincucyte vessels                     # what is on the device
 pyincucyte find Cry1                   # which plate is that, and when
 pyincucyte preview -v 38 -w A1-B3      # look at the wells before fetching
 pyincucyte preview -v 38 --unmix green:12%red   # try a ratio before using it
+pyincucyte timeline -v 38 -w A1 -c phase        # scrub through the run lazily
+pyincucyte protocol -v 38              # how the run was set up, drawn
+pyincucyte protocol -v 38 -o run.svg   # ...as a figure
+pyincucyte --json preview-probe -v 38            # prove the tile route read-only
 pyincucyte plan -v 38 -o ./images --start-from first     # dry run
 
 pyincucyte download -v 38 -o ./images --start-from first
@@ -259,11 +266,75 @@ for tile in preview:
     tile.well, tile.channel, tile.array      # "A1", "Cry1-GFP", uint8 2-D
 ```
 
-Two things to know. The device has no thumbnail route, so every tile is a
-full-size image off the wire — hence `max_images` (24 by default), and hence the
-in-memory cache that makes a second look free. And the tiles are downsampled and
-contrast-stretched so a 16-bit fluorescence frame is visible at all: they are
-for recognition, never for measurement.
+Compatible Incucyte releases expose an undocumented image pyramid: like the
+progressively smaller copies used by an online map, it lets the viewer request
+a reduced tile instead of the full TIFF. PyIncucyte detects those routes per
+session and falls back to the established full-TIFF export route when they are
+missing or malformed. `max_images` (24 by default) still bounds the static wall.
+The tiles are downsampled and contrast-stretched for recognition, never
+measurement.
+
+For a long run, use the lazy timeline instead of asking the static wall to show
+every timepoint:
+
+```python
+timeline = incucyte.timeline(
+    38, wells="A1-B3", channels="phase", output="./run-01",
+    start_from="first", end_at="now")
+timeline.show()
+
+timeline.source.get_frame("A1", 0, 1, 1337)  # native reduced values on demand
+timeline.close()
+```
+
+The first view uses at most 100 evenly spaced frames. A cache miss fetches that
+frame and the window preloads a small neighbourhood. Native and rendered caches
+have separate fixed bounds, so a 2,000-frame slider never retains 2,000 arrays
+or Tk images. Existing timestamp-matched exported stacks and disposable
+`.pyincucyte-preview/` frames are read before the device; the fallback reads a
+bounded full TIFF, reduces it immediately, and releases the encoded payload.
+
+### What the run is actually doing
+
+The Incucyte software draws an experiment as nested boxes — a time loop around a
+well loop around a chain of channel nodes — and locks the picture inside the
+vendor software on the machine beside the instrument. Every fact in it is
+already on the wire:
+
+```python
+print(incucyte.protocol(38))                    # the drawing, in the terminal
+incucyte.protocol(38).save("protocol.svg")      # ...as a figure
+```
+
+```
++- Time loop:  200 x 3.0 h requested   -   3.0 h achieved -----------------------+
+| [############............] 61 of 200 timepoints acquired (30%), 7.0 days so far |
+|                                                                                 |
+| +- All wells (24)   24-well Sarstedt   2 sites each   A1, A2, A3, +21 more ---+ |
+| | +-------------------+    +--------------+    +--------------+               | |
+| | | Phase             |    | Cry1-GFP     |    | Per2-mCherry |               | |
+| | | transmitted light | -> | 300 ms       | -> | 400 ms       |               | |
+| | |                   |    | stare 180 ms |    | stare 180 ms |               | |
+| | |                   |    | 524 nm GCU   |    | 635 nm RCU   |               | |
+| | +-------------------+    +--------------+    +--------------+               | |
+| +-----------------------------------------------------------------------------+ |
++---------------------------------------------------------------------------------+
+```
+
+It says three things the vendor's own graph does not. The requested cadence and
+the **achieved** interval are both on the page and labelled as different facts —
+enough wells at a long enough exposure overrun the schedule, and the derived
+number is the one that is true. It says how far the run has got, and which wells
+the last scan actually reached. And every value carries where it came from: the
+vessel record, the scan payload, or the scan times.
+
+`-o` writes the drawing. `.svg` costs no plotting stack at all — which matters
+because the packaged desktop app excludes matplotlib outright; `.png` and `.pdf`
+go through matplotlib (`pip install PyIncucyte[figure]`). `--dark` matches a
+dark slide. Nothing here reads a pixel, and `--no-scan` skips sweeping the run's
+whole lifetime as well.
+
+In the app it is **Tools → Acquisition protocol** (Ctrl+R).
 
 ### Preprocessing
 
@@ -368,16 +439,60 @@ manifest = json.load(open("run-01/pyincucyte-manifest.json"))
 index = pd.read_csv("run-01/pyincucyte-index.csv")
 ```
 
+Each file entry is written in the **shared handoff contract** the SCN analysis
+pipeline uses, so one reader serves this package, PyLV200 and PySCNSlice alike:
+
+| Field | What it saves you working out |
+| --- | --- |
+| `channels` | `{index, name, image_type, source}` per plane, `index` counting from **one** as ImageJ does. The index describes the written stack, not the vessel — a well that missed a channel would otherwise shift every name after the gap by one |
+| `frames` | Timepoints the file holds *now* |
+| `complete` | Whether it can still gain frames. A time stack is extended in place on every poll, so `frames` is true when read and stale a moment later. `null` means nobody can honestly say — which is **not** the same as `false` |
+| `frames_expected` | How many it should hold once the run finishes, so a well the instrument skipped is visible as such rather than as a short recording |
+| `blank_planes` | Planes allocated but not acquired — always 0 here, since nothing is written until every plane is downloaded and checked |
+| `field` | `{"kind": "well", "name": "A1"}` — the cross-instrument spelling of what `well` says in this package's own terms |
+| `interval_s` | `{"value": 1800, "source": "derived from this file's scan times"}` — the cadence, and where the number came from |
+| `pixel_size_um` | `{"value": 2.824051, "source": "read from the vessel's ImageSize"}` — read off the instrument, not inferred from the objective |
+
+`null` with a stated reason is deliberate: a plausible number nobody can trace is
+worse than an honest gap. The CSV index carries the same values with the
+provenance in its own `_source` column, and the channel names in place of the
+records a spreadsheet column cannot hold.
+
+Two contract fields are deliberately absent. `registered` and `valid_mask`
+belong to whatever aligns the pixels — an instrument does not know whether its
+output was later registered, and this one produces no valid-field mask at all.
+
+On the Python side `OutputFile` uses the same names, with `channel_names` for
+when you just want `["Phase", "GFP"]`.
+
 ### Watching, without blocking
 
 ```python
 watcher = incucyte.watch(options, on_result=lambda r: analyse(r.paths))
 ...                                  # your pipeline carries on
-watcher.stop(wait=30)
+watcher.stop(wait=30, flush=True)    # flush collects the tail and marks it done
 ```
 
 `Watcher` also works as a context manager, and `run_forever()` blocks if that is
 what you want.
+
+### Starting the next step before the poll finishes
+
+`on_result` fires once per poll with the whole result. A poll that collects 96
+wells therefore delivers nothing until all 96 have landed. Pass `on_file`
+instead — or as well — to be handed each file the moment it is written:
+
+```python
+incucyte.watch(options, on_file=lambda image: outline(image.path,
+                                                      well=image.well))
+```
+
+It works the same way on `download()` and `fetch()`, and is handed the same
+`OutputFile` that ends up in `result.files`. A callback that raises is logged and
+does not stop the download.
+
+Files a watcher writes mid-run are marked `complete: false`; the flush that ends
+the run marks them `true`. Pass `complete=` to `download()` to state it yourself.
 
 ### Downloading in chunks instead of frame by frame
 
@@ -550,6 +665,8 @@ PyIncucyte/
     cache.py        source-payload cache, so rebuilt stacks do not re-download
     tiffstack.py    add frames to an ImageJ stack without rewriting it
     preview.py      find a vessel by name, and look at its wells
+    pyramid.py      private reduced viewer-tile transport and decoder
+    timeline.py     lazy frame provider, bounded caches and local proxy reuse
     processing.py   optional preprocessing: calibration, background, unmixing
     watch.py        Watcher - poll and download in a background thread,
                     frame by frame or in held chunks
@@ -558,7 +675,7 @@ PyIncucyte/
     cli.py          command line
     compat.py       the import names retired in 0.3
     gui/            desktop app: theme.py, widgets.py, dialogs.py, app.py,
-                    preview.py (the thumbnail window)
+                    preview.py (the thumbnail wall and time scrubber)
   tests/            run with: python -m pytest
 ```
 
