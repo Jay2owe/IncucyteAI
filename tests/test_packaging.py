@@ -62,6 +62,18 @@ class GuiFromTheCommandLineTests(unittest.TestCase):
             self.assertEqual(cli.cmd_gui(cli.parse_args(["gui"])), 0)
         launched.assert_called_once_with()
 
+    def test_frozen_entry_can_run_a_scheduled_cli_pass(self):
+        import importlib.util
+
+        path = ROOT / "packaging" / "entry.py"
+        spec = importlib.util.spec_from_file_location("packaging_entry", path)
+        entry = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(entry)
+        with mock.patch("pyincucyte.cli.main", return_value=7) as cli_main:
+            self.assertEqual(entry.run([
+                "--scheduled-cli", "watch", "-v", "38", "--once"]), 7)
+        cli_main.assert_called_once_with(["watch", "-v", "38", "--once"])
+
 
 class RetiredImportNameTests(unittest.TestCase):
     def test_the_old_name_is_the_same_module_object(self):

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "PyIncucyte"
-version = "0.3.0"
+version = "0.3.1"
 description = "Download Incucyte live-cell imaging TIFFs from Python, a CLI, or a desktop app."
 readme = "README.md"
 license = "BSD-3-Clause"

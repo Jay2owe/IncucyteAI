@@ -1,0 +1,29 @@
+record_type,id,label,detail,group,x,y,width,height,source,target,edge_label
+meta,title,PyIncucyte automation code graph,,,,,,,,,
+meta,subtitle,Current code map distilled to the supported Python and command-line paths,,,,,,,,,
+meta,footer,"Current Graphify map: 3,987 nodes · 19,163 edges · simplified to the public automation path.",,,,,,,,,
+meta,claim,"PyIncucyte routes Auto-Organotypic, Python helpers, and one-shot command-line runs through one client, watcher, engine, and typed result boundary.",,,,,,,,,
+meta,master,pyincucyte-code-graph.svg,,,,,,,,,
+section,callers,CALLERS,,,0.35,9.06,,,,,
+section,public,PUBLIC BOUNDARY,,,0.35,7.62,,,,,
+section,implementation,IMPLEMENTATION,,,0.35,5.91,,,,,
+section,result,RESULT CONTRACT,,,0.35,1.94,,,,,
+node,chain,Auto-Organotypic automatic chain,imports the public client class,caller,1.9,8.43,3.8,0.9,,,
+node,python,Python script,pull() · watch_once(),caller,6.0,8.43,3.25,0.9,,,
+node,scheduler,Scheduled task / shell,--json watch --once,caller,10.1,8.43,3.25,0.9,,,
+node,package,pyincucyte/__init__.py,connect · pull · watch_once · IncucyteClient,public,3.35,6.93,5.55,0.95,,,
+node,cli,cli.py,download · watch --once · strict JSON,public,9.15,6.93,4.05,0.95,,,
+node,client,client.py,IncucyteClient · plan · pull · watch_once,core,6.0,5.23,8.4,0.95,,,
+node,watch,watch.py,one poll · durable resume · batch timing,watch,3.45,3.46,4.45,1.0,,,
+node,engine,engine.py,REST fetch · processing · TIFF export,engine,8.55,3.46,4.45,1.0,,,
+node,models,models.py,ExportPlan · DownloadResult · ProgressEvent · to_dict(),model,6.0,1.35,8.4,0.95,,,
+edge,e1,,,caller,,,,,chain,package,imports
+edge,e2,,,caller,,,,,python,package,calls
+edge,e3,,,caller,,,,,scheduler,cli,runs
+edge,e4,,,public,,,,,package,client,delegates
+edge,e5,,,public,,,,,cli,client,calls
+edge,e6,,,watch,,,,,client,watch,poll once
+edge,e7,,,engine,,,,,client,engine,pull
+edge,e8,,,watch,,,,,watch,engine,
+edge,e9,,,model,,,,,watch,models,returns
+edge,e10,,,model,,,,,engine,models,returns

@@ -46,10 +46,12 @@ so you supply it. Any one of these is enough:
 ```bash
 export PYINCUCYTE_HOST=incucyte.your-lab       # once per machine
 pyincucyte --host incucyte.your-lab probe      # per command (--host is global)
-pyincucyte --host incucyte.your-lab login      # saves it with the credentials
+pyincucyte --host incucyte.your-lab login --name "Lab Incucyte"
 ```
 
-In the app, type it into the **Host** box. In Python,
+In the app, use **Sign in** to add an address and optional device name; the
+header chooser then switches between saved devices. Each device keeps its own
+login and token. In Python,
 `IncucyteClient("incucyte.your-lab")`
 or let it read the saved login. Without one you get `HostNotSetError` before
 anything reaches the network, not a failed request.
@@ -62,31 +64,40 @@ anything reaches the network, not a failed request.
 pyincucyte gui        # or: pyincucyte-gui, python -m pyincucyte.gui
 ```
 
-Sign in, pick a vessel, paint the wells you want, choose a layout, press
-**Download**. Everything long-running happens on a worker thread, so the window
-stays usable and **Cancel** in the status bar always works.
+![The PyIncucyte window: vessels, wells, export, summary and activity log](https://raw.githubusercontent.com/Jay2owe/PyIncucyte/main/docs/figures/pyincucyte-app.png)
+
+Sign in, pick a vessel, paint the wells you want, choose a layout, then choose
+one clearly separate action: **Preview images**, inspect the **Preview
+download**, **Download** once, keep the folder current with **Sync**, or create a
+**Scheduled download**. Everything long-running happens on a worker thread, so
+the window stays usable and **Cancel** in the status bar always works.
 
 Worth knowing:
 
-- **Preview** (Ctrl+P) counts exactly what would be downloaded and lists the
-  filenames, without fetching a single image.
-- **View images** (Ctrl+I, or double-click a vessel) pulls a thumbnail of
-  each selected well from the most recent scan into a scrollable window,
-  captioned with the well and the experiment's own channel names — the
-  quickest way to be sure a vessel id is the plate you meant.
+- **Preview images** (Ctrl+P, Ctrl+I, or double-click a vessel) puts the selected
+  wells into their physical plate grid. Phase, Green, and Red are selected one
+  at a time, and the Z-stack control scrolls through the image positions in the
+  most recent scan without laying channels out as separate tiles.
+- **Preview download** (Ctrl+E) counts exactly what would be downloaded and
+  lists the filenames, without fetching a single image.
+- **Sync** (Ctrl+W) remains open, checks for new scans at the chosen interval,
+  and downloads them as they appear.
+- **Scheduled download** asks Windows to run one synchronization at a chosen
+  interval. It survives closing PyIncucyte and rebooting the computer.
 - **View time course** (Ctrl+T) opens one image with a time slider, playback,
   well/channel selectors and contrast controls. It samples at most 100 frames
   initially and loads uncached positions only when they are requested.
 - **Scanned only** keeps just the wells the instrument actually imaged in the
   most recent scan — wells with no data are shown dimmed on the plate.
-- **Copy CLI command** (Tools menu, and in the confirm dialog) turns whatever is
-  on screen into the equivalent `pyincucyte` command, ready to paste into a
-  pipeline script or a scheduled task.
+- **Copy Python code** and **Copy CLI command** (Tools menu, and in the confirm
+  dialog) turn the current settings into either a runnable `IncucyteClient`
+  script or the equivalent `pyincucyte` command-line interface command.
 - **Presets** (File menu) save the whole recipe as JSON. The same file works as
   `pyincucyte download --preset my-run.json` and as `ExportOptions.load(...)`.
 - The plate picker takes click, drag-to-paint, shift-click for a block, and a
   click on a row letter or column number to flip a whole line.
-- Light and dark themes follow Windows, and **View → Toggle dark mode** overrides.
+- Light and dark themes follow Windows, and the **Dark mode** header option
+  overrides the system choice.
 - Settings, window size and per-vessel well selections are remembered. Settings
   saved by earlier versions are migrated on first run.
 
@@ -94,7 +105,9 @@ Worth knowing:
 
 ```bash
 pyincucyte probe                       # is the instrument reachable?
-pyincucyte login                       # saves credentials
+pyincucyte login                       # saves credentials for the active device
+pyincucyte --host incucyte-2 login --name "Incucyte 2"
+pyincucyte --host incucyte-2 vessels  # use that saved device explicitly
 pyincucyte vessels                     # what is on the device
 pyincucyte find Cry1                   # which plate is that, and when
 pyincucyte preview -v 38 -w A1-B3      # look at the wells before fetching
@@ -110,6 +123,8 @@ pyincucyte download -v 38 -o ./images --wells D2-D5 --channels phase,green \
                     --layout time_stack
 pyincucyte watch    -v 38 -o ./images -i 10 --start-from first
 pyincucyte watch    -v 38 -o ./images -i 60 --start-from first --batch-after 7d
+pyincucyte watch    -v 38 -o ./images --start-from first --batch-after 7d --once
+pyincucyte schedule -v 38 -o D:\runs\plate38 --batch-after 7d --every 1h
 
 pyincucyte download -v 38 -o ./images --calibrate --unmix device
 
@@ -187,7 +202,6 @@ still works.
 | `-d`, `--date` | Shorthand for a single day |
 | `-t`, `--scan-time` | Only scan times containing this text |
 | `--workers` | Parallel fetches (default 4) |
-| `--green-lut` / `--no-green-lut` | Recolour Phase as green RGB (display only) |
 | `--calibrate` / `--no-calibrate` | Write fluorescence in calibrated units, 32-bit float |
 | `--unmix` | `device`, or a term like `green:8%red` (also on `preview`) |
 | `--background` | `device`, or a number of raw counts |
@@ -198,12 +212,27 @@ still works.
 | `-i`, `--interval` | `watch` only: poll interval in minutes |
 | `--batch-frames` | `watch` only: hold new frames until N are waiting |
 | `--batch-after` | `watch` only: ...or until the oldest has waited `7d` / `12h` |
+| `--once` | `watch` only: poll once and stop, for a scheduled task |
 
 ---
 
 ## The Python API
 
 This is the part an automated pipeline should use.
+
+For a single pull or scheduled poll, the package-level helpers match PyLV200:
+
+```python
+import pyincucyte
+
+result = pyincucyte.pull(38, out="./run-01", start_from="first")
+result = pyincucyte.watch_once(38, out="./run-01", start_from="first")
+```
+
+Both use the saved login, close the connection when finished, and return a
+`DownloadResult`. `watch_once` returns `None` while a requested batch is still
+being held. Results, plans, vessels, scans, files, and progress events expose
+`to_dict()` records whose values can be passed directly to `json.dumps`.
 
 ```python
 from pyincucyte import IncucyteClient
@@ -417,6 +446,12 @@ every file entry, so a later pipeline stage can always tell what it is reading.
 
 ### What you get back
 
+![DownloadResult contains OutputFile records, each containing one channel record per plane](https://raw.githubusercontent.com/Jay2owe/PyIncucyte/main/docs/figures/result-object.png)
+
+Containment is the point: one file entry answers every question about the stack
+it describes, so the next stage never has to join anything. PyLV200 writes the
+same shape under the names `PullResult` / `channel_refs`.
+
 `DownloadResult` carries `.files` (typed `OutputFile` records), `.paths`,
 `.errors`, `.cancelled`, `.bytes_total`, `.duration_seconds` and `.summary()`.
 Failures are collected, not raised — one unreadable well never aborts a plate.
@@ -440,7 +475,7 @@ index = pd.read_csv("run-01/pyincucyte-index.csv")
 ```
 
 Each file entry is written in the **shared handoff contract** the SCN analysis
-pipeline uses, so one reader serves this package, PyLV200 and PySCNSlice alike:
+pipeline uses, so one reader serves this package, PyLV200 and Auto-Organotypic alike:
 
 | Field | What it saves you working out |
 | --- | --- |
@@ -533,6 +568,66 @@ print(watcher.pending_frames, watcher.hold_description)
 to wait. One caution: a poll re-checks the whole window whether or not the chunk
 is due, so pair a long chunk with a lazy `interval` (an hour, not ten minutes).
 
+### One poll, from a scheduled task
+
+`--once` polls a single time and exits, so the schedule belongs to Windows
+rather than to a resident process. Nothing is held between firings and nothing
+needs to be: `batch_after` runs from each frame's own acquisition time and
+`batch_frames` counts the instrument against the resume ledger, so the poll
+after a reboot decides exactly what the poll before it would have decided.
+
+`pyincucyte schedule` registers that task, and registers it so it keeps
+running:
+
+```bash
+pyincucyte schedule -v 38 -o D:\runs\plate38 -s first --batch-after 7d --every 1h
+```
+
+Windows asks for this account's credential in its own prompt — it goes straight
+to Windows, never through PyIncucyte — and the task then runs on a rebooted,
+locked machine. `--at-logon` skips the question and waits for somebody to log
+in instead. `--wake` wakes a sleeping computer for each check, `--list` shows
+what is scheduled and how each one is doing, and `--remove <name>` deletes one.
+
+Writing the `schtasks` line by hand is the thing to avoid, and not for
+convenience. Measured on a real Windows 11 machine, a task created from the
+plain flags comes back with five defaults that quietly stop it:
+
+| Windows default | after the computer is turned off |
+|---|---|
+| `LogonType` = InteractiveToken | runs **only while that user is logged on** |
+| `StartWhenAvailable` false | a firing missed while it was off is never caught up |
+| `DisallowStartIfOnBatteries` true | never starts unplugged |
+| `StopIfGoingOnBatteries` true | killed mid-download when the power goes |
+| `WakeToRun` false | a sleeping computer sleeps through every check |
+
+None of the five can be set through `schtasks` flags, so `schedule` registers
+from a task definition and then reads all five back off the registered task.
+Created is not the same as will run.
+
+The exit code is the whole interface, and they are the three `pylv200` uses so
+a task written for one instrument reads the same as one written for the other:
+
+| code | meaning | what a task should do |
+|------|---------|-----------------------|
+| 0 | a chunk was due and was downloaded | run whatever comes next |
+| 1 | nothing written — still holding, or nothing new | nothing |
+| 2 | the instrument could not be reached, or the poll failed | look at it |
+
+Run it hourly and a seven-day chunk fires once a week: 167 firings in 168 write
+nothing and cost one metadata pass each. A bad argument exits 2, not 1, and so
+does an unexpected crash — exit 1 means "nothing was due", which is a normal
+poll, so it can never also mean "it broke".
+
+Put the global `--json` option before the command for one strict JSON document
+on standard output; progress stays on standard error. Success returns the same
+`DownloadResult.to_dict()` shape as Python. Failures use
+`{"ok": false, "error": {"type": "...", "message": "..."}, "command": "watch"}`.
+
+```bash
+pyincucyte --json watch -v 38 -o ./images --start-from first --once
+```
+
 ### Talking back to the instrument
 
 Everything above reads. Three calls write, and they are the only ones in the
@@ -607,6 +702,8 @@ A time stack has to contain every frame, so one new scan invalidates the whole
 file. Done naively that means re-downloading and rewriting the entire
 experiment on every poll, and it gets worse with every hour of the run. Two
 things stop it.
+
+![An ImageJ stack keeps its directory at the end, so new planes are written where it was and the four-byte header pointer is repointed last](https://raw.githubusercontent.com/Jay2owe/PyIncucyte/main/docs/figures/stack-append.png)
 
 **New frames are added to the file, not rewritten into a new one.** An ImageJ
 stack keeps its directory of frames *after* the pixel data — like a book with

@@ -17,3 +17,11 @@ __pycache__/
 *.tif
 *.tiff
 *.wsdl
+
+# generated from the code by graphify, and stale the moment anything changes.
+# Rebuild it rather than reading a committed copy - the command is in AGENTS.md
+graphify-out/
+
+# local agent config, per push-guard - it is this machine, not the project
+.claude/
+.codex/

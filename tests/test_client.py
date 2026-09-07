@@ -1,5 +1,6 @@
 """End-to-end tests of the importable API against a fake device."""
 
+import json
 import unittest
 from datetime import datetime
 from pathlib import Path
@@ -7,6 +8,7 @@ from tempfile import TemporaryDirectory
 
 import tifffile
 
+import pyincucyte
 from pyincucyte import ExportOptions, IncucyteClient
 from pyincucyte.manifest import INDEX_FILENAME, MANIFEST_FILENAME, load_manifest
 from pyincucyte.models import ProgressEvent
@@ -133,6 +135,47 @@ class PlanTests(ClientTestCase):
     def test_unknown_option_name_is_reported(self):
         with self.assertRaises(TypeError):
             self.client.make_options(None, wels="A1")
+
+
+class AutomationTests(ClientTestCase):
+    def test_pull_accepts_a_target_and_out_like_pylv200(self):
+        with patched(self.device):
+            result = self.client.pull(
+                38, out=self.tmp / "pull", channels="phase",
+                start_from="2026-03-01", end_at="2026-03-01")
+        self.assertTrue(result.ok)
+        self.assertEqual(result.file_count, 4)
+
+    def test_top_level_pull_closes_its_own_saved_connection(self):
+        with patched(self.device):
+            result = pyincucyte.pull(
+                38, store=self.store, out=self.tmp / "top-level",
+                channels="phase", start_from="2026-03-01",
+                end_at="2026-03-01")
+        self.assertTrue(result.ok)
+        self.assertEqual(result.file_count, 4)
+
+    def test_top_level_watch_once_resumes_without_a_resident_process(self):
+        kwargs = dict(
+            store=self.store, out=self.tmp / "watched", channels="phase",
+            start_from="2026-03-01", end_at="2026-03-01")
+        with patched(self.device):
+            first = pyincucyte.watch_once(38, **kwargs)
+            second = pyincucyte.watch_once(38, **kwargs)
+        self.assertEqual(first.file_count, 4)
+        self.assertEqual(second.file_count, 0)
+
+    def test_public_results_are_strict_json_without_a_custom_encoder(self):
+        with patched(self.device):
+            vessel = self.client.vessels()[0]
+            plan = self.client.plan(self.options())
+            result = self.client.download(plan)
+        records = [vessel.to_dict(), plan.to_dict(), result.to_dict(),
+                   ProgressEvent("reading", done=float("nan")).to_dict()]
+        encoded = json.dumps(records, allow_nan=False)
+        self.assertIn('"done": null', encoded)
+        self.assertTrue(records[2]["ok"])
+        self.assertEqual(records[2]["status"], "written")
 
 
 class DownloadTests(ClientTestCase):

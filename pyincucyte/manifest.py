@@ -9,14 +9,14 @@ Watch mode merges into the same manifest, so it stays a complete index of the
 folder however many polls it took to fill.
 
 Each file entry is written in the SCN pipeline's **shared handoff contract**,
-defined in ``PySCNSlice/docs/scn-pipeline-plan.md`` and written the same way by
+defined in ``Auto-Organotypic/docs/scn-pipeline-plan.md`` and written the same way by
 PyLV200, so one reader serves all three acquisition stages:
 
 ``path``, ``axes``
     the file, and the axis string its TIFF declares - ``TCYX``, ``TYX``, ``YX``.
 ``channels``
     one ``{index, name, image_type, source}`` per plane on the channel axis.
-    ``index`` counts from **one**, as ImageJ and PySCNSlice's ``scn_channel``
+    ``index`` counts from **one**, as ImageJ and Auto-Organotypic's ``scn_channel``
     count, and describes the file rather than the vessel: a well that missed a
     channel would otherwise shift every name after the gap by one.
 ``frames``

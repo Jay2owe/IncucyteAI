@@ -104,6 +104,13 @@ class Card(ttk.Frame):
         self.title_var = tk.StringVar(value=title or "")
 
         self.body = ttk.Frame(self, style="Surface.TFrame")
+        self._body_pack = {
+            "fill": "both",
+            "expand": True,
+            "padx": pad,
+            "pady": (theme_mod.PAD_M if title is not None else pad, pad),
+        }
+        self.body_visible = True
         if title is not None:
             self.header = ttk.Frame(self, style="Surface.TFrame")
             self.header.pack(fill="x", padx=pad, pady=(pad, 0))
@@ -112,11 +119,18 @@ class Card(ttk.Frame):
             self.title_label.pack(side="left")
             self.actions = ttk.Frame(self.header, style="Surface.TFrame")
             self.actions.pack(side="right")
-        self.body.pack(fill="both", expand=True, padx=pad,
-                       pady=(theme_mod.PAD_M if title is not None else pad, pad))
+        self.body.pack(**self._body_pack)
 
     def set_title(self, text):
         self.title_var.set(text)
+
+    def set_body_visible(self, visible):
+        """Show or fold the content while leaving the card header visible."""
+        self.body_visible = bool(visible)
+        if self.body_visible:
+            self.body.pack(**self._body_pack)
+        else:
+            self.body.pack_forget()
 
 
 # ---------------------------------------------------------------------------
@@ -150,7 +164,7 @@ class WellPlate(ttk.Frame):
         self._geometry = (0, 0, 0, 0)  # cell, gap, left, top
 
         self.canvas = tk.Canvas(
-            self, highlightthickness=0, bd=0,
+            self, height=180, highlightthickness=0, bd=0,
             background=theme["surface"], cursor="hand2")
         self.canvas.pack(fill="both", expand=True)
 
@@ -222,12 +236,18 @@ class WellPlate(ttk.Frame):
             self.canvas.winfo_width() or 480)
         return int(top + self.rows * (cell + gap) + gap)
 
-    def _compute_geometry(self, width):
+    def _compute_geometry(self, width, height=None):
         label = max(16, int(11 * self.theme.scale))
         usable = max(60, width - label - 8)
         gap = 2
         cell = int((usable - gap * (self.cols + 1)) / max(1, self.cols))
         cell = max(self.min_cell, min(self.max_cell, cell))
+        if height is not None and height > label + gap:
+            vertical = int(
+                (height - label - gap * (self.rows + 1)) / max(1, self.rows))
+            # A compact window must show every well, even when that requires
+            # going below the normal mouse-target size.
+            cell = max(8, min(cell, vertical))
         # Centre the plate when it does not fill the card, so a 6-well vessel
         # does not sit in the corner of a wide panel.
         plate_width = self.cols * (cell + gap) + gap
@@ -244,7 +264,8 @@ class WellPlate(ttk.Frame):
             return
 
         c = self.theme.colors
-        cell, gap, left, top = self._compute_geometry(width)
+        cell, gap, left, top = self._compute_geometry(
+            width, canvas.winfo_height())
         self._geometry = (cell, gap, left, top)
         font = (self.theme.family, max(6, int(cell * 0.42)))
         label_width = max(16, int(11 * self.theme.scale))
@@ -271,7 +292,7 @@ class WellPlate(ttk.Frame):
                 self._cell_ids[(row, col)] = item
 
         height = int(top + self.rows * (cell + gap) + gap)
-        canvas.configure(height=height, scrollregion=(0, 0, width, height))
+        canvas.configure(scrollregion=(0, 0, width, height))
 
     def _rounded_rect(self, x0, y0, x1, y1, r, **kwargs):
         points = [

@@ -5,12 +5,18 @@ counts what is waiting and decides.  So most of these tests assert on what did
 not happen - no files, an empty ledger - as much as on what did.
 """
 
+import json
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta
+from io import StringIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest import mock
 
 from pyincucyte import ExportOptions, IncucyteClient
+from pyincucyte import cli
+from pyincucyte.errors import IncucyteError
 from pyincucyte.state import STATE_FILENAME
 from pyincucyte.watch import format_age
 
@@ -324,6 +330,99 @@ class ReportingTests(WatchTestCase):
             watcher = self.watcher(batch_frames=9)
             watcher.poll_once()
         self.assertIn("held=2", repr(watcher))
+
+
+class WatchOnceTests(WatchTestCase):
+    """``--once``: one poll, and an exit code a scheduled task can branch on.
+
+    Three codes and not two, because a task has three things to do with the
+    answer.  0 means a chunk landed and whatever runs next should run; 1 means
+    nothing was written and is not an error; 2 means somebody should look.  The
+    same numbers pylv200 uses, so a task written for one instrument reads the
+    same as one written for the other.
+    """
+
+    def run_once(self, *extra):
+        argv = ["watch", "-v", "38", "-o", str(self.out), "-c", "phase",
+                "-s", "first", "--once", *extra]
+        with patched(self.device),                 mock.patch.object(cli, "make_client", return_value=self.client):
+            return cli.main(argv)
+
+    def test_a_poll_that_writes_files_exits_zero(self):
+        self.assertEqual(self.run_once(), 0)
+        self.assertEqual(len(self.files()), 4)
+
+    def test_json_mode_emits_one_result_document(self):
+        stdout, stderr = StringIO(), StringIO()
+        argv = ["--json", "watch", "-v", "38", "-o", str(self.out),
+                "-c", "phase", "-s", "first", "--once"]
+        with patched(self.device), \
+                mock.patch.object(cli, "make_client", return_value=self.client), \
+                redirect_stdout(stdout), redirect_stderr(stderr):
+            code = cli.main(argv)
+
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(code, 0)
+        self.assertEqual(payload["status"], "written")
+        self.assertEqual(payload["file_count"], 4)
+        self.assertNotIn("Watch mode", stdout.getvalue())
+        self.assertIn("Watch mode", stderr.getvalue())
+
+    def test_a_held_chunk_exits_one_and_writes_nothing(self):
+        # The rule the whole design rests on: nothing is written on behalf of
+        # frames that are still waiting, or the next poll treats them as
+        # collected and they are lost.
+        self.assertEqual(self.run_once("--batch-frames", "9"),
+                         cli.NOTHING_WRITTEN)
+        self.assertEqual(self.files(), [])
+        self.assertNotIn("VID38", self.ledger())
+
+    def test_a_poll_that_finds_nothing_new_also_exits_one(self):
+        # Different words, same code: a scheduled task does the same thing for
+        # both, which is nothing, but a person reading the log wants to know
+        # which of the two it was.
+        self.assertEqual(self.run_once(), 0)
+        self.assertEqual(self.run_once(), cli.NOTHING_WRITTEN)
+
+    def test_an_unreachable_instrument_exits_two(self):
+        # poll_once raises where pylv200's poll returns.  Uncaught this is a
+        # traceback and Python's own exit 1, which collides with "nothing
+        # written" and would leave a task looking like a quiet week.
+        with mock.patch.object(type(self.client), "plan",
+                               side_effect=IncucyteError("no route to host")):
+            self.assertEqual(self.run_once(), 2)
+        self.assertEqual(self.files(), [])
+
+    def test_a_chunk_that_comes_due_between_firings_exits_zero(self):
+        # Three separate firings, each its own process as far as the watcher is
+        # concerned: nothing carries over but the ledger and the folder.
+        self.assertEqual(self.run_once("--batch-frames", "4"),
+                         cli.NOTHING_WRITTEN)
+        with patched(self.device):
+            self.add_scan(hours=1)
+        self.assertEqual(self.run_once("--batch-frames", "4"),
+                         cli.NOTHING_WRITTEN)
+        with patched(self.device):
+            self.add_scan(minutes=30)
+        self.assertEqual(self.run_once("--batch-frames", "4"), 0)
+        self.assertEqual(len(self.files()), 8)
+
+    def test_without_once_the_watcher_still_runs_forever(self):
+        # The regression a careless branch causes.  Ctrl-C is how the resident
+        # form stops, and it still exits 0.
+        seen = []
+        with patched(self.device),                 mock.patch.object(cli, "make_client", return_value=self.client),                 mock.patch.object(type(self.client.watch(self.options(),
+                                                         start=False)),
+                                  "run_forever",
+                                  side_effect=lambda self=None: seen.append(1)):
+            code = cli.main(["watch", "-v", "38", "-o", str(self.out),
+                             "-c", "phase", "-s", "first"])
+        self.assertEqual(code, 0)
+        self.assertEqual(seen, [1])
+
+    def test_once_is_off_by_default(self):
+        args = cli.parse_args(["watch", "-v", "38", "-o", "o"])
+        self.assertFalse(args.once)
 
 
 class FormatAgeTests(unittest.TestCase):

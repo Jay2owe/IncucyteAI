@@ -10,12 +10,12 @@ download from the Incucyte  ->  find the SCN  ->  outline / orient / crop  ->
 register, filter, trace  ->  test the rhythm  ->  render videos
 ```
 
-The stage after this one is PySCNSlice, which reads a folder of stacks plus
+The stage after this one is Auto-Organotypic, which reads a folder of stacks plus
 `pyincucyte-manifest.json` and outlines the suprachiasmatic nucleus in each.
 
 Sibling plans:
 
-- `PySCNSlice/docs/scn-pipeline-plan.md` — the consumer, and the canonical
+- `Auto-Organotypic/docs/scn-pipeline-plan.md` — the consumer, and the canonical
   handoff contract
 - `PyLV200/SCN_PIPELINE_PLAN.md` — the other acquisition stage, which needs
   considerably more work than this one
@@ -25,7 +25,7 @@ Sibling plans:
 All of it landed in `models.py`, `client.py`, `manifest.py` and `watch.py`; no
 written pixel, filename or request path changed. 444 tests pass offline, 29 of
 them new in `tests/test_pipeline_handoff.py`, and the output was read back with
-PySCNSlice's own `sources.read_manifest` — `scn_channel` for red resolves to 2,
+Auto-Organotypic's own `sources.read_manifest` — `scn_channel` for red resolves to 2,
 `complete` reads `true` for a finished pull and `false` for a live one, and both
 derived values arrive intact.
 
@@ -34,7 +34,7 @@ plan's own draft of it. `channels` holds one `{index, name, image_type,
 source}` record per plane; `frames` replaced `frame_count` and `interval_s`
 replaced this plan's `interval_seconds`; `field`, `complete`, `frames_expected`
 and `blank_planes` are new. `registered` and `valid_mask` are deliberately not
-written — PySCNSlice's plan says they belong to whatever aligns the pixels, and
+written — Auto-Organotypic's plan says they belong to whatever aligns the pixels, and
 an instrument cannot know whether its output was later registered.
 
 That took the sibling with it, in the same pass: `sources._from_incucyte` now
@@ -123,7 +123,7 @@ manifest is true at the moment it was written and stale immediately afterwards.
 
 Add `complete` and, where it is known, `frames_expected`.
 
-Without it PySCNSlice cannot resume a live run correctly: its skip rule keys on
+Without it Auto-Organotypic cannot resume a live run correctly: its skip rule keys on
 its own report existing, so a stack that grew from 40 frames to 400 is silently
 skipped and never re-outlined. With it, the consumer can also decline to outline
 a stack that is still filling, which matters because the newest frames are the
@@ -183,7 +183,7 @@ Recorded here so nobody 'fixes' it. That layout writes one `YX` TIFF per well
 would treat as a recording and spend thirty seconds outlining.
 
 It is already marked in the manifest as `axes: "YX"`, which is all a consumer
-needs to refuse it. **The refusal belongs in PySCNSlice**, which knows what its
+needs to refuse it. **The refusal belongs in Auto-Organotypic**, which knows what its
 own step costs; this package has no business knowing that, and adding a warning
 here would put an assumption about a downstream consumer into a general-purpose
 downloader.
@@ -213,6 +213,6 @@ Items 1 through 3 are all edits to the same two places — `models.OutputFile` a
 independent and can wait until the reactive path is actually being built. Item 5
 is a decision already made.
 
-None of this blocks PySCNSlice from starting its adapter: it can be built
+None of this blocks Auto-Organotypic from starting its adapter: it can be built
 against a checked-in fixture of the manifest shape and updated as these fields
 appear. Each field landed here is a piece of guesswork removed from there.

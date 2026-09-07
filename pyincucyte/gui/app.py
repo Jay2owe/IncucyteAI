@@ -32,10 +32,15 @@ from ..options import (
 )
 from ..preview import DEFAULT_MAX_IMAGES
 from ..processing import Unmixing
+from .. import cli as cli_mod
+from .. import schedule as schedule_mod
 from ..wells import well_name, well_spec
 from . import theme as theme_mod
-from .dialogs import AboutDialog, LoginDialog, PlanDialog, ProtocolWindow
-from .preview import PreviewWindow, TimelineWindow
+from .dialogs import (
+    AboutDialog, ExportSettingsDialog, LoginDialog, PlanDialog, ProtocolWindow,
+    ScheduleDialog,
+)
+from .preview import PreviewWindow, TimelineWindow, preferred_preview_channel
 from .widgets import Card, LogView, SearchEntry, StatusBar, WellPlate, tip
 
 GUI_STATE_FILE = APP_DIR / "gui_state.json"
@@ -67,6 +72,56 @@ PREVIEW_MAX_IMAGES = DEFAULT_MAX_IMAGES
 #: What the processing drop-downs show when a step is switched off.
 PROCESSING_OFF = "off"
 
+#: Action-specific settings checkpoints.  The section profiles are deliberately
+#: different: a one-off download must not look like a live synchronization, and
+#: a dry-run estimate must not expose controls that cannot affect its execution.
+EXPORT_PROMPTS = {
+    "download": {
+        "title": "Download once",
+        "mode_label": "ONE-OFF DOWNLOAD",
+        "description": "Choose the files and processing for this download.",
+        "note": "Next: review the exact file list, then confirm before anything is written.",
+        "confirm_text": "Review files",
+        "sections": ("output", "channels", "layout", "window", "workers",
+                     "options", "processing"),
+        "tone": "accent",
+        "minimum_size": (1050, 820),
+    },
+    "expected": {
+        "title": "Preview this download",
+        "mode_label": "PREVIEW DOWNLOAD",
+        "description": "Use the same file choices as a download and preview its result.",
+        "note": "No images are fetched and no files are changed.",
+        "confirm_text": "Preview download",
+        "sections": ("output", "channels", "layout", "window", "options",
+                     "processing"),
+        "tone": "success",
+        "minimum_size": (980, 760),
+    },
+    "sync": {
+        "title": "Keep a folder in sync",
+        "mode_label": "LIVE SYNC",
+        "description": "Download existing matches, then keep checking for new scans.",
+        "note": "PyIncucyte stays open until you press Stop.",
+        "confirm_text": "Start live sync",
+        "sections": ("output", "channels", "layout", "window", "workers",
+                     "interval", "batching", "options", "processing"),
+        "tone": "accent",
+        "minimum_size": (1050, 820),
+    },
+    "schedule": {
+        "title": "Schedule recurring downloads",
+        "mode_label": "WINDOWS SCHEDULE",
+        "description": "Choose what each unattended download should collect.",
+        "note": "Next: choose the Windows schedule. PyIncucyte can then be closed.",
+        "confirm_text": "Continue to schedule",
+        "sections": ("output", "channels", "layout", "window", "workers",
+                     "batching", "options", "processing"),
+        "tone": "warning",
+        "minimum_size": (1050, 820),
+    },
+}
+
 
 class App:
     """Controller and view for the main window."""
@@ -82,6 +137,7 @@ class App:
 
         self.store = ConfigStore()
         self.client = client or IncucyteClient(store=self.store)
+        self._device_hosts = {}
         self.vessels = []
         self.filtered_vessels = []
         self.selected_wells = {}       # vessel id -> set | None (None = all)
@@ -89,8 +145,7 @@ class App:
         self.recent_outputs = []
         self.active_vessel = None
         self.last_plan = None
-        self._sort_column = None
-        self._sort_reverse = False
+        self._set_initial_vessel_sort()
         self._rate_samples = []
         self._rate_last = None
 
@@ -119,6 +174,8 @@ class App:
 
     def _build_menu(self):
         menubar = tk.Menu(self.root)
+        self.dark_mode_var = tk.BooleanVar(
+            master=self.root, value=self.theme.dark)
 
         file_menu = tk.Menu(menubar, tearoff=0)
         file_menu.add_command(label="Choose output folder...", accelerator="Ctrl+O",
@@ -135,12 +192,16 @@ class App:
         menubar.add_cascade(label="File", menu=file_menu)
 
         export_menu = tk.Menu(menubar, tearoff=0)
-        export_menu.add_command(label="Preview plan", accelerator="Ctrl+P",
+        export_menu.add_command(label="Preview images...", accelerator="Ctrl+P",
+                                command=self._view_images)
+        export_menu.add_command(label="Preview download...", accelerator="Ctrl+E",
                                 command=self._preview)
         export_menu.add_command(label="Download now", accelerator="Ctrl+D",
                                 command=self._download)
-        export_menu.add_command(label="Start watching", accelerator="Ctrl+W",
-                                command=self._start_watch)
+        export_menu.add_command(label="Start continuous sync",
+                                accelerator="Ctrl+W", command=self._start_sync)
+        export_menu.add_command(label="Scheduled download...",
+                                command=self._schedule_download)
         export_menu.add_command(label="Stop", accelerator="Esc",
                                 command=self._stop)
         menubar.add_cascade(label="Export", menu=export_menu)
@@ -153,9 +214,12 @@ class App:
         tools_menu.add_command(label="Acquisition protocol...",
                                accelerator="Ctrl+R",
                                command=self._view_protocol)
+        tools_menu.add_command(label="Copy Python code",
+                               command=self._copy_python_code)
         tools_menu.add_command(label="Copy CLI command",
                                command=self._copy_cli_command)
-        tools_menu.add_command(label="Sign in...", command=self._login)
+        tools_menu.add_command(label="Add or update device...",
+                               command=self._login)
         tools_menu.add_command(label="Refresh vessels", accelerator="F5",
                                command=self._refresh_vessels)
         tools_menu.add_command(label="Test connection", command=self._probe)
@@ -168,11 +232,14 @@ class App:
         tools_menu.add_command(label="Save unmixing to instrument...",
                                command=self._save_unmix)
         tools_menu.add_separator()
-        tools_menu.add_command(label="Forget saved login", command=self._logout)
+        tools_menu.add_command(label="Forget current device login",
+                               command=self._logout)
         menubar.add_cascade(label="Tools", menu=tools_menu)
 
         view_menu = tk.Menu(menubar, tearoff=0)
-        view_menu.add_command(label="Toggle dark mode", command=self._toggle_dark)
+        view_menu.add_checkbutton(
+            label="Dark mode", variable=self.dark_mode_var,
+            command=self._apply_dark_mode)
         view_menu.add_command(label="Clear log", command=lambda: self.log.clear())
         view_menu.add_command(label="Copy log", command=lambda: self.log.copy())
         view_menu.add_command(label="Save log...", command=self._save_log)
@@ -186,9 +253,11 @@ class App:
 
         binds = {
             "<Control-o>": self._browse_output, "<Control-O>": self._browse_output,
-            "<Control-p>": self._preview, "<Control-P>": self._preview,
+            "<Control-p>": self._view_images,
+            "<Control-P>": self._view_images,
+            "<Control-e>": self._preview, "<Control-E>": self._preview,
             "<Control-d>": self._download, "<Control-D>": self._download,
-            "<Control-w>": self._start_watch, "<Control-W>": self._start_watch,
+            "<Control-w>": self._start_sync, "<Control-W>": self._start_sync,
             "<Control-q>": self.on_close, "<Control-Q>": self.on_close,
             "<Control-i>": self._view_images, "<Control-I>": self._view_images,
             "<Control-t>": self._view_timeline,
@@ -215,47 +284,33 @@ class App:
         self.status.pack(fill="x", side="bottom")
         ttk.Separator(outer).pack(fill="x", side="bottom")
 
-        self.splitter = ttk.PanedWindow(outer, orient="vertical")
-        self.splitter.pack(fill="both", expand=True, padx=pad)
+        self._init_export_settings()
+        self._build_activity_buffer(outer)
 
-        upper = ttk.Frame(self.splitter, style="TFrame")
-        self.splitter.add(upper, weight=4)
+        workspace = ttk.Frame(outer, style="TFrame")
+        workspace.pack(fill="both", expand=True, padx=pad)
+        workspace.columnconfigure(0, weight=3)
+        workspace.columnconfigure(1, weight=2)
+        self.left_column = workspace
+        # REGRESSION GUARD: an always-expanded well plate once consumed the
+        # whole column and crushed the vessel list down to its title bar.
+        workspace.rowconfigure(0, weight=1)
+        workspace.rowconfigure(1, weight=0)  # grows when a vessel is selected
 
-        self.columns = ttk.PanedWindow(upper, orient="horizontal")
-        self.columns.pack(fill="both", expand=True)
+        panels = self._main_panel_builders()
+        for build_panel in panels["top"]:
+            build_panel(workspace)
+        for region in ("bottom_left", "bottom_right"):
+            for build_panel in panels[region]:
+                build_panel(workspace)
 
-        left = ttk.Frame(self.columns, style="TFrame")
-        right = ttk.Frame(self.columns, style="TFrame")
-        self.columns.add(left, weight=3)
-        self.columns.add(right, weight=2)
-
-        for column in (left, right):
-            column.columnconfigure(0, weight=1)
-            column.rowconfigure(0, weight=1)   # absorbs spare height
-            column.rowconfigure(1, weight=0)   # always gets its natural height
-
-        self._build_vessels(left)
-        self._build_wells(left)
-        self._build_export(right)
-        self._build_summary(right)
-
-        lower = ttk.Frame(self.splitter, style="TFrame")
-        self.splitter.add(lower, weight=1)
-        self._build_log(lower)
-
-        self.root.after(150, self._place_sashes)
-
-    def _place_sashes(self):
-        """Give the log a third of the height and the vessel column 58% width."""
-        try:
-            height = self.splitter.winfo_height()
-            if height > 200:
-                self.splitter.sashpos(0, int(height * 0.68))
-            width = self.columns.winfo_width()
-            if width > 400:
-                self.columns.sashpos(0, int(width * 0.58))
-        except tk.TclError:
-            pass
+    def _main_panel_builders(self):
+        """The space-owning panels; export settings and activity stay off-canvas."""
+        return {
+            "top": (self._build_vessels,),
+            "bottom_left": (self._build_wells,),
+            "bottom_right": (self._build_summary,),
+        }
 
     # -- header ---------------------------------------------------------
 
@@ -270,15 +325,24 @@ class App:
             side="left", padx=(theme_mod.PAD_S, theme_mod.PAD_XL))
 
         ttk.Label(row, text="Device", style="Muted.TLabel").pack(side="left")
-        self.host_var = tk.StringVar(value=self.client.host or DEFAULT_HOST)
-        host_entry = ttk.Entry(row, textvariable=self.host_var, width=17)
-        host_entry.pack(side="left", padx=(theme_mod.PAD_S, theme_mod.PAD_L))
-        tip(host_entry, "The Incucyte's address on the site network. It is not "
-                        "reachable from outside.", self.theme)
+        self.host_var = tk.StringVar()
+        self.device_combo = ttk.Combobox(
+            row, textvariable=self.host_var, width=23, state="readonly")
+        self.device_combo.pack(
+            side="left", padx=(theme_mod.PAD_S, theme_mod.PAD_L))
+        self.device_combo.bind(
+            "<<ComboboxSelected>>", self._switch_device)
+        self._refresh_device_choices(self.client.host or DEFAULT_HOST)
+        tip(self.device_combo,
+            "Choose a saved Incucyte. Use Sign in to add another device or "
+            "change its friendly name and login.", self.theme)
 
         self.login_btn = ttk.Button(row, text="Sign in", style="Accent.TButton",
                                     command=self._login)
         self.login_btn.pack(side="right")
+        tip(self.login_btn,
+            "Add another Incucyte or update the selected device's friendly "
+            "name and login.", self.theme)
         self.refresh_btn = ttk.Button(row, text="Refresh",
                                       command=self._refresh_vessels)
         self.refresh_btn.pack(side="right", padx=theme_mod.PAD_S)
@@ -288,11 +352,20 @@ class App:
                                    style="Off.Pill.TLabel")
         self.conn_pill.pack(side="right", padx=theme_mod.PAD_L)
 
+        self.dark_mode_check = ttk.Checkbutton(
+            row, text="Dark mode", variable=self.dark_mode_var,
+            command=self._apply_dark_mode)
+        self.dark_mode_check.pack(side="right")
+        tip(self.dark_mode_check,
+            "Use the darker palette. This choice is remembered next time.",
+            self.theme)
+
     # -- vessels --------------------------------------------------------
 
     def _build_vessels(self, parent):
         card = Card(parent, title="VESSELS", theme=self.theme)
-        card.grid(row=0, column=0, sticky="nsew", pady=(0, theme_mod.PAD_M))
+        card.grid(row=0, column=0, columnspan=2, sticky="nsew",
+                  pady=(0, theme_mod.PAD_M))
 
         self.vessel_search = SearchEntry(card.actions, placeholder="Filter...",
                                          on_change=lambda v: self._populate_vessels())
@@ -303,13 +376,16 @@ class App:
         headings = (("id", "ID", 46), ("name", "Name", 190), ("owner", "Owner", 68),
                     ("plate", "Plate", 58), ("last", "Last scan", 110),
                     ("channels", "Channels", 150))
+        self._vessel_heading_labels = {
+            key: text for key, text, _width in headings}
         self.vessel_tree = ttk.Treeview(body, columns=columns, show="headings",
-                                        height=6, selectmode="extended")
+                                        height=4, selectmode="extended")
         for key, text, width in headings:
             self.vessel_tree.heading(
                 key, text=text, command=lambda k=key: self._sort_vessels(k))
             self.vessel_tree.column(key, width=width, stretch=(key == "name"),
                                     anchor="w")
+        self._update_vessel_headings()
         scroll = ttk.Scrollbar(body, orient="vertical",
                                command=self.vessel_tree.yview)
         self.vessel_tree.configure(yscrollcommand=scroll.set)
@@ -329,7 +405,8 @@ class App:
 
     def _build_wells(self, parent):
         card = Card(parent, title="WELLS", theme=self.theme)
-        card.grid(row=1, column=0, sticky="ew")
+        card.grid(row=1, column=0, sticky="ew",
+                  padx=(0, theme_mod.PAD_M), pady=(0, theme_mod.PAD_M))
         self.wells_card = card
 
         self.well_count_var = tk.StringVar(value="No vessel selected")
@@ -338,89 +415,155 @@ class App:
 
         body = card.body
         self.plate = WellPlate(body, self.theme, on_change=self._on_wells_changed,
-                               max_cell=38)
-        self.plate.pack(fill="x")
+                               max_cell=30)
         tip(self.plate,
             "Click a well to toggle it, drag to paint, shift-click for a block, "
             "and click a row letter or column number to flip a whole line.",
             self.theme)
 
         buttons = ttk.Frame(body, style="Surface.TFrame")
-        buttons.pack(fill="x", pady=(theme_mod.PAD_M, 0))
-        for label, command, hint in (
+        buttons.pack(side="bottom", fill="x", pady=(theme_mod.PAD_M, 0))
+        for column in range(4):
+            buttons.columnconfigure(column, weight=1, uniform="well_action")
+        for column, (label, command, hint) in enumerate((
             ("All", self.plate.select_all, "Select every well on the plate"),
             ("None", self.plate.clear, "Clear the selection"),
             ("Invert", self.plate.invert, "Swap selected and unselected"),
             ("Scanned only", self._select_scanned,
              "Keep only wells the instrument actually imaged in the last scan"),
-        ):
+        )):
             button = ttk.Button(buttons, text=label, command=command)
-            button.pack(side="left", padx=(0, theme_mod.PAD_S))
+            button.grid(row=0, column=column, sticky="ew",
+                        padx=(0 if column == 0 else theme_mod.PAD_XS,
+                              0 if column == 3 else theme_mod.PAD_XS))
             tip(button, hint, self.theme)
 
         self.view_btn = ttk.Button(buttons, text="View images",
                                    command=self._view_images)
-        self.view_btn.pack(side="left", padx=(theme_mod.PAD_M, 0))
+        self.view_btn.grid(row=1, column=0, columnspan=2, sticky="ew",
+                           pady=(theme_mod.PAD_S, 0),
+                           padx=(0, theme_mod.PAD_XS))
         tip(self.view_btn,
             "Fetch a thumbnail of each selected well from the most recent scan, "
             "to check this is the right plate before downloading it.",
             self.theme)
         self.timeline_btn = ttk.Button(buttons, text="View time course",
                                        command=self._view_timeline)
-        self.timeline_btn.pack(side="left", padx=(theme_mod.PAD_S, 0))
+        self.timeline_btn.grid(row=1, column=2, columnspan=2, sticky="ew",
+                               pady=(theme_mod.PAD_S, 0),
+                               padx=(theme_mod.PAD_XS, 0))
         tip(self.timeline_btn,
             "Open a lazy time slider. Reduced viewer tiles are used where the "
             "device supports them; the full-image fallback remains bounded.",
             self.theme)
 
         self.well_spec_var = tk.StringVar(value="all")
-        ttk.Label(buttons, textvariable=self.well_spec_var, style="Muted.TLabel",
-                  anchor="e").pack(side="right")
+
+        self.plate.pack(fill="both", expand=True)
+        self._set_wells_expanded(False)
+
+    def _set_wells_expanded(self, expanded):
+        """Reveal the plate only when there is a vessel to give it meaning."""
+        expanded = bool(expanded)
+        self.wells_card.set_body_visible(expanded)
+        self.left_column.rowconfigure(0, weight=0 if expanded else 1)
+        self.left_column.rowconfigure(1, weight=1 if expanded else 0)
+        self.wells_card.grid_configure(sticky="nsew" if expanded else "new")
+        if not expanded:
+            self.wells_card.set_title("WELLS")
+            self.well_count_var.set("Select a vessel to show wells")
 
     # -- export settings ------------------------------------------------
 
-    def _build_export(self, parent):
-        """A compact two-column form: caption on the left, control on the right."""
-        card = Card(parent, title="EXPORT", theme=self.theme)
-        card.grid(row=0, column=0, sticky="nsew", pady=(0, theme_mod.PAD_M))
-        self.export_card = card
-        body = card.body
+    def _init_export_settings(self):
+        """Create persistent values without putting the form on the main window."""
+        self.output_var = tk.StringVar(master=self.root)
+        self.channel_vars = {
+            PHASE: tk.BooleanVar(master=self.root, value=True),
+            COLOR1: tk.BooleanVar(master=self.root, value=False),
+            COLOR2: tk.BooleanVar(master=self.root, value=False),
+        }
+        self.layout_var = tk.StringVar(master=self.root, value="separate")
+        self.start_var = tk.StringVar(master=self.root, value="Today")
+        self.custom_date_var = tk.StringVar(master=self.root)
+        self.end_var = tk.StringVar(master=self.root, value="Now")
+        self.custom_end_var = tk.StringVar(master=self.root)
+        self.workers_var = tk.IntVar(master=self.root, value=4)
+        self.interval_var = tk.IntVar(master=self.root, value=10)
+        self.batch_frames_var = tk.IntVar(master=self.root, value=0)
+        self.batch_after_var = tk.StringVar(master=self.root, value="")
+        self.append_var = tk.BooleanVar(master=self.root, value=True)
+        self.manifest_var = tk.BooleanVar(master=self.root, value=True)
+        self.calibrate_var = tk.BooleanVar(master=self.root, value=False)
+        self.unmix_var = tk.StringVar(master=self.root, value=PROCESSING_OFF)
+        self.background_var = tk.StringVar(master=self.root,
+                                           value=PROCESSING_OFF)
+        self._release_export_widgets()
+
+    def _release_export_widgets(self):
+        """Forget controls destroyed with the last settings dialog."""
+        self.output_combo = None
+        self.channel_checks = {}
+        self.custom_date_entry = None
+        self.custom_end_entry = None
+        self.append_check = None
+
+    @staticmethod
+    def _configure_live(widget, **options):
+        """Configure a control only while its modal form still exists."""
+        if widget is None:
+            return
+        try:
+            widget.configure(**options)
+        except tk.TclError:
+            pass
+
+    def _build_export_form(self, body, sections):
+        """Build only the settings that belong to the selected export action."""
+        sections = set(sections)
         body.columnconfigure(1, weight=1)
         row = 0
 
         def caption(text, r):
-            ttk.Label(body, text=text, style="Muted.TLabel").grid(
+            label = ttk.Label(body, text=text, style="Muted.TLabel")
+            label.grid(
                 row=r, column=0, sticky="nw", padx=(0, theme_mod.PAD_M),
                 pady=(0, theme_mod.PAD_M))
+            return label
 
         def line(r):
             frame = ttk.Frame(body, style="Surface.TFrame")
             frame.grid(row=r, column=1, sticky="ew", pady=(0, theme_mod.PAD_M))
             return frame
 
+        def show(section, *widgets):
+            if section in sections:
+                return
+            for widget in widgets:
+                widget.destroy()
+
         # -- destination --------------------------------------------------
-        caption("Output", row)
+        row_caption = caption("Output", row)
         folder_row = line(row)
-        self.output_var = tk.StringVar()
+        folder_row.columnconfigure(0, weight=1)
         self.output_combo = ttk.Combobox(folder_row, textvariable=self.output_var,
-                                         values=[], width=24)
-        self.output_combo.pack(side="left", fill="x", expand=True)
+                                         values=self.recent_outputs, width=50)
         browse = ttk.Button(folder_row, text="...", width=3,
-                            command=self._browse_output)
-        browse.pack(side="left", padx=(theme_mod.PAD_XS, 0))
+                            command=lambda: self._browse_output(
+                                body.winfo_toplevel()))
         tip(browse, "Choose where images are written (Ctrl+O)", self.theme)
         open_btn = ttk.Button(folder_row, text="Open", width=5,
                               command=self._open_output_folder)
-        open_btn.pack(side="left", padx=(theme_mod.PAD_XS, 0))
+        self.output_combo.grid(row=0, column=0, sticky="ew")
+        browse.grid(row=0, column=1, padx=(theme_mod.PAD_XS, 0))
+        open_btn.grid(row=0, column=2, padx=(theme_mod.PAD_XS, 0))
         tip(open_btn, "Open this folder in the file browser", self.theme)
+        show("output", row_caption, folder_row)
         row += 1
 
         # -- channels -----------------------------------------------------
-        caption("Channels", row)
+        row_caption = caption("Channels", row)
         channel_row = line(row)
-        self.channel_vars = {PHASE: tk.BooleanVar(value=True),
-                             COLOR1: tk.BooleanVar(value=False),
-                             COLOR2: tk.BooleanVar(value=False)}
         self.channel_checks = {}
         for number, text in ((PHASE, "Phase"), (COLOR1, "Green"), (COLOR2, "Red")):
             check = ttk.Checkbutton(channel_row, text=text,
@@ -428,12 +571,12 @@ class App:
                                     command=self._refresh_summary)
             check.pack(side="left", padx=(0, theme_mod.PAD_M))
             self.channel_checks[number] = check
+        show("channels", row_caption, channel_row)
         row += 1
 
         # -- layout, two by two -------------------------------------------
-        caption("Layout", row)
+        row_caption = caption("Layout", row)
         layout_box = line(row)
-        self.layout_var = tk.StringVar(value="separate")
         for index, name in enumerate(LAYOUT_ORDER):
             radio = ttk.Radiobutton(layout_box, text=LAYOUT_LABELS[name],
                                     value=name, variable=self.layout_var,
@@ -441,12 +584,12 @@ class App:
             radio.grid(row=index % 2, column=index // 2, sticky="w",
                        padx=(0, theme_mod.PAD_M))
             tip(radio, LAYOUT_DESCRIPTIONS[name], self.theme)
+        show("layout", row_caption, layout_box)
         row += 1
 
         # -- time window --------------------------------------------------
-        caption("From", row)
+        row_caption = caption("From", row)
         range_row = line(row)
-        self.start_var = tk.StringVar(value="Today")
         self.start_combo = ttk.Combobox(range_row, textvariable=self.start_var,
                                         values=list(START_CHOICES),
                                         state="readonly", width=13)
@@ -458,18 +601,17 @@ class App:
             "instrument captures from midnight on; Last 48 hours is a rolling "
             "window ending now; Last 24 frames counts scan times rather than "
             "clock time, so it gives a fixed-length stack.", self.theme)
-        self.custom_date_var = tk.StringVar()
         self.custom_date_entry = ttk.Entry(range_row,
                                            textvariable=self.custom_date_var,
                                            width=16)
         self.custom_date_entry.bind("<FocusOut>",
                                     lambda e: self._refresh_summary())
         tip(self.custom_date_entry, MOMENT_HELP, self.theme)
+        show("window", row_caption, range_row)
         row += 1
 
-        caption("To", row)
+        row_caption = caption("To", row)
         end_row = line(row)
-        self.end_var = tk.StringVar(value="Now")
         self.end_combo = ttk.Combobox(end_row, textvariable=self.end_var,
                                       values=list(END_CHOICES),
                                       state="readonly", width=13)
@@ -481,7 +623,6 @@ class App:
             "the start, so First scan + 48 hours is the first two days of the "
             "experiment, and + 100 frames is its first 100 scan times.",
             self.theme)
-        self.custom_end_var = tk.StringVar()
         self.custom_end_entry = ttk.Entry(end_row,
                                           textvariable=self.custom_end_var,
                                           width=16)
@@ -490,47 +631,55 @@ class App:
         tip(self.custom_end_entry,
             f"{MOMENT_HELP}. A bare date includes the whole of that day.",
             self.theme)
+        show("window", row_caption, end_row)
         row += 1
 
-        # -- performance --------------------------------------------------
-        caption("Speed", row)
-        speed_row = line(row)
-        ttk.Label(speed_row, text="Workers", style="Muted.TLabel").pack(side="left")
-        self.workers_var = tk.IntVar(value=4)
-        workers = ttk.Spinbox(speed_row, from_=1, to=16, width=4,
+        # -- one pass performance -----------------------------------------
+        row_caption = caption("Download speed", row)
+        workers_row = line(row)
+        ttk.Label(workers_row, text="Parallel image requests",
+                  style="Muted.TLabel").pack(side="left")
+        workers = ttk.Spinbox(workers_row, from_=1, to=16, width=4,
                               textvariable=self.workers_var)
         workers.pack(side="left", padx=(theme_mod.PAD_S, theme_mod.PAD_L))
         tip(workers, "How many images to fetch at once. More is faster until the "
                      "instrument or the network becomes the limit.", self.theme)
-        ttk.Label(speed_row, text="Poll every", style="Muted.TLabel").pack(side="left")
-        self.interval_var = tk.IntVar(value=10)
-        interval = ttk.Spinbox(speed_row, from_=1, to=240, width=4,
+        show("workers", row_caption, workers_row)
+        row += 1
+
+        # -- live sync polling --------------------------------------------
+        row_caption = caption("Check for scans", row)
+        interval_row = line(row)
+        ttk.Label(interval_row, text="Every",
+                  style="Muted.TLabel").pack(side="left")
+        interval = ttk.Spinbox(interval_row, from_=1, to=240, width=4,
                                textvariable=self.interval_var)
         interval.pack(side="left", padx=theme_mod.PAD_S)
-        ttk.Label(speed_row, text="min", style="Muted.TLabel").pack(side="left")
-        tip(interval, "How often Watch checks the instrument for a new scan.",
+        ttk.Label(interval_row, text="minutes while PyIncucyte is open",
+                  style="Muted.TLabel").pack(side="left")
+        tip(interval, "How often continuous Sync checks for a new scan.",
             self.theme)
+        show("interval", row_caption, interval_row)
         row += 1
 
         # -- chunked watching ----------------------------------------------
-        caption("Batch", row)
+        row_caption = caption("Batch new frames", row)
         batch_row = line(row)
-        ttk.Label(batch_row, text="Every", style="Muted.TLabel").pack(side="left")
-        self.batch_frames_var = tk.IntVar(value=0)
+        ttk.Label(batch_row, text="Download after",
+                  style="Muted.TLabel").pack(side="left")
         batch_frames = ttk.Spinbox(batch_row, from_=0, to=9999, width=5,
                                    textvariable=self.batch_frames_var,
                                    command=self._refresh_summary)
         batch_frames.pack(side="left", padx=theme_mod.PAD_S)
         batch_frames.bind("<FocusOut>", lambda _e: self._refresh_summary())
         tip(batch_frames,
-            "Watch normally downloads a frame the moment it appears. Set a "
-            "number here and it waits until that many new frames are ready, "
-            "then fetches them in one go. 0 means download on sight.",
+            "Sync and Scheduled download normally collect a frame when it "
+            "appears. Set a number here to wait for a larger group. 0 means "
+            "download each new frame.",
             self.theme)
         ttk.Label(batch_row, text="frames, or after",
                   style="Muted.TLabel").pack(side="left",
                                              padx=(0, theme_mod.PAD_XS))
-        self.batch_after_var = tk.StringVar(value="")
         batch_after = ttk.Entry(batch_row, textvariable=self.batch_after_var,
                                 width=7)
         batch_after.pack(side="left")
@@ -540,22 +689,12 @@ class App:
             f"Leave blank for no time limit. '7d' collects a week at a time - "
             f"start it with the experiment and come back on Monday.",
             self.theme)
+        show("batching", row_caption, batch_row)
         row += 1
 
         # -- switches -----------------------------------------------------
-        caption("Options", row)
+        row_caption = caption("Output options", row)
         toggles = line(row)
-        self.green_lut_var = tk.BooleanVar(value=False)
-        self.green_lut_check = ttk.Checkbutton(
-            toggles, text="Green LUT on Phase", variable=self.green_lut_var,
-            command=self._refresh_summary)
-        self.green_lut_check.pack(side="left", padx=(0, theme_mod.PAD_M))
-        tip(self.green_lut_check,
-            "Recolours Phase as a green RGB image. Display only - it changes "
-            "pixel values, so leave it off for anything you will analyse.",
-            self.theme)
-
-        self.append_var = tk.BooleanVar(value=True)
         self.append_check = ttk.Checkbutton(
             toggles, text="Extend stacks", variable=self.append_var)
         self.append_check.pack(side="left", padx=(0, theme_mod.PAD_M))
@@ -565,7 +704,6 @@ class App:
             "of the file already on disk instead. Turn it off to write every "
             "stack whole.", self.theme)
 
-        self.manifest_var = tk.BooleanVar(value=True)
         manifest_check = ttk.Checkbutton(
             toggles, text="Write manifest", variable=self.manifest_var)
         manifest_check.pack(side="left")
@@ -573,12 +711,12 @@ class App:
             f"Writes {MANIFEST_FILENAME} and a CSV index listing every file with "
             f"its well, channel and timepoint - what an analysis pipeline reads "
             f"instead of parsing filenames.", self.theme)
+        show("options", row_caption, toggles)
         row += 1
 
         # -- preprocessing -------------------------------------------------
-        caption("Processing", row)
+        row_caption = caption("Image processing", row)
         processing_row = line(row)
-        self.calibrate_var = tk.BooleanVar(value=False)
         calibrate_check = ttk.Checkbutton(
             processing_row, text="Calibrated units",
             variable=self.calibrate_var, command=self._refresh_summary)
@@ -590,7 +728,6 @@ class App:
 
         ttk.Label(processing_row, text="Unmix", style="Muted.TLabel").pack(
             side="left", padx=(0, theme_mod.PAD_XS))
-        self.unmix_var = tk.StringVar(value=PROCESSING_OFF)
         unmix_box = ttk.Combobox(processing_row, textvariable=self.unmix_var,
                                  values=(PROCESSING_OFF, "device"), width=13)
         unmix_box.pack(side="left", padx=(0, theme_mod.PAD_M))
@@ -604,7 +741,6 @@ class App:
 
         ttk.Label(processing_row, text="Background", style="Muted.TLabel").pack(
             side="left", padx=(0, theme_mod.PAD_XS))
-        self.background_var = tk.StringVar(value=PROCESSING_OFF)
         background_box = ttk.Combobox(
             processing_row, textvariable=self.background_var,
             values=(PROCESSING_OFF, "device"), width=9)
@@ -615,63 +751,120 @@ class App:
             "Subtract a background level before unmixing. 'device' uses the "
             "level the instrument measured for each image, or type a number "
             "of raw counts.", self.theme)
+        show("processing", row_caption, processing_row)
+
+        vessel = self._vessel(self.active_vessel) if self.active_vessel else None
+        if vessel is not None:
+            self._sync_channel_checks(vessel)
+        self._on_layout_change()
+        self._on_window_change()
 
     # -- summary + actions ----------------------------------------------
 
     def _build_summary(self, parent):
         card = Card(parent, title="SUMMARY", theme=self.theme)
-        card.grid(row=1, column=0, sticky="ew")
+        card.grid(row=1, column=1, sticky="nsew",
+                  pady=(0, theme_mod.PAD_M))
         body = card.body
+        body.columnconfigure(0, weight=1)
+        body.rowconfigure(0, weight=1)
+
+        details = ttk.Frame(body, style="Surface.TFrame")
+        details.grid(row=0, column=0, sticky="new")
 
         self.summary_var = tk.StringVar(value="Select a vessel to begin.")
-        ttk.Label(body, textvariable=self.summary_var, style="Surface.TLabel",
-                  wraplength=340, justify="left").pack(anchor="w")
+        ttk.Label(details, textvariable=self.summary_var,
+                  style="Surface.TLabel", wraplength=350,
+                  justify="left").pack(anchor="w")
 
         self.estimate_var = tk.StringVar(value="")
-        ttk.Label(body, textvariable=self.estimate_var, style="Muted.TLabel",
-                  wraplength=340, justify="left").pack(
+        ttk.Label(details, textvariable=self.estimate_var,
+                  style="Muted.TLabel", wraplength=350,
+                  justify="left").pack(
             anchor="w", pady=(theme_mod.PAD_S, 0))
-
         self.window_var = tk.StringVar(value="")
-        ttk.Label(body, textvariable=self.window_var, style="Muted.TLabel",
-                  wraplength=340, justify="left").pack(
+        ttk.Label(details, textvariable=self.window_var,
+                  style="Muted.TLabel", wraplength=350,
+                  justify="left").pack(
             anchor="w", pady=(theme_mod.PAD_S, 0))
-
         self.example_var = tk.StringVar(value="")
-        ttk.Label(body, textvariable=self.example_var, style="Muted.TLabel",
-                  wraplength=340, justify="left").pack(
-            anchor="w", pady=(theme_mod.PAD_S, theme_mod.PAD_M))
+        ttk.Label(details, textvariable=self.example_var,
+                  style="Muted.TLabel", wraplength=350,
+                  justify="left").pack(
+            anchor="w", pady=(theme_mod.PAD_S, 0))
 
         actions = ttk.Frame(body, style="Surface.TFrame")
-        actions.pack(fill="x")
-        self.download_btn = ttk.Button(actions, text="Download",
-                                       style="Accent.TButton",
-                                       command=self._download)
-        self.download_btn.pack(side="left")
-        self.preview_btn = ttk.Button(actions, text="Preview",
-                                      command=self._preview)
-        self.preview_btn.pack(side="left", padx=theme_mod.PAD_S)
-        self.watch_btn = ttk.Button(actions, text="Watch",
-                                    command=self._start_watch)
-        self.watch_btn.pack(side="left")
-        self.stop_btn = ttk.Button(actions, text="Stop", style="Danger.TButton",
+        actions.grid(row=1, column=0, sticky="sew",
+                     pady=(theme_mod.PAD_L, 0))
+        primary = ttk.Frame(actions, style="Surface.TFrame")
+        primary.pack(fill="x")
+        secondary = ttk.Frame(actions, style="Surface.TFrame")
+        secondary.pack(fill="x", pady=(theme_mod.PAD_S, 0))
+
+        for row in (primary, secondary):
+            for column in range(4):
+                row.columnconfigure(column, weight=1, uniform="action")
+
+        specs = self._summary_action_specs()
+        self.download_btn = ttk.Button(
+            primary, text="Download", style="Accent.TButton",
+            command=specs["Download"])
+        self.download_btn.grid(row=0, column=0, columnspan=2, sticky="ew",
+                               padx=(0, theme_mod.PAD_XS))
+        self.sync_btn = ttk.Button(primary, text="Sync",
+                                   command=specs["Sync"])
+        self.sync_btn.grid(row=0, column=2, columnspan=2, sticky="ew",
+                           padx=(theme_mod.PAD_XS, 0))
+        self.schedule_btn = ttk.Button(
+            primary, text="Schedule...", command=specs["Schedule..."])
+        self.schedule_btn.grid(row=1, column=0, columnspan=2, sticky="ew",
+                               pady=(theme_mod.PAD_S, 0),
+                               padx=(0, theme_mod.PAD_XS))
+        self.stop_btn = ttk.Button(primary, text="Stop", style="Danger.TButton",
                                    command=self._stop, state="disabled")
-        self.stop_btn.pack(side="right")
+        self.stop_btn.grid(row=1, column=2, columnspan=2, sticky="ew",
+                           pady=(theme_mod.PAD_S, 0),
+                           padx=(theme_mod.PAD_XS, 0))
 
-        tip(self.preview_btn, "Count exactly what would be downloaded, without "
-                              "fetching anything (Ctrl+P)", self.theme)
-        tip(self.watch_btn, "Keep polling and download each new scan as it "
-                            "appears (Ctrl+W)", self.theme)
+        self.preview_btn = ttk.Button(
+            secondary, text="Preview images", command=specs["Preview images"])
+        self.preview_btn.grid(row=0, column=0, columnspan=2, sticky="ew",
+                              padx=(0, theme_mod.PAD_XS))
+        self.preview_download_btn = ttk.Button(
+            secondary, text="Preview download",
+            command=specs["Preview download"])
+        self.preview_download_btn.grid(
+            row=0, column=2, columnspan=2, sticky="ew",
+            padx=(theme_mod.PAD_XS, 0))
 
-    # -- log ------------------------------------------------------------
+        tip(self.download_btn, "Check export settings, then review the exact "
+                                "files before downloading (Ctrl+D).", self.theme)
+        tip(self.preview_btn, "Show the latest images from the selected wells "
+                              "(Ctrl+P).", self.theme)
+        tip(self.preview_download_btn,
+            "Check export settings, then preview the count and file list "
+            "without fetching images (Ctrl+E).", self.theme)
+        tip(self.sync_btn, "Check export settings, then keep downloading new "
+                           "scans as they appear (Ctrl+W).", self.theme)
+        tip(self.schedule_btn, "Check export settings, then ask Windows to run "
+                               "one download check on a recurring schedule.",
+            self.theme)
 
-    def _build_log(self, parent):
-        card = Card(parent, title="ACTIVITY", theme=self.theme)
-        card.pack(fill="both", expand=True, pady=(theme_mod.PAD_M, theme_mod.PAD_M))
-        self.log = LogView(card.body, self.theme, height=6)
-        self.log.pack(fill="both", expand=True)
-        ttk.Checkbutton(card.actions, text="Follow",
-                        variable=self.log.autoscroll).pack(side="right")
+    def _summary_action_specs(self):
+        """One tested mapping from visible action names to their behaviour."""
+        return {
+            "Download": self._download,
+            "Preview images": self._view_images,
+            "Preview download": self._preview,
+            "Sync": self._start_sync,
+            "Schedule...": self._schedule_download,
+        }
+
+    # -- activity history ----------------------------------------------
+
+    def _build_activity_buffer(self, parent):
+        """Keep diagnostic history available to View commands, without a panel."""
+        self.log = LogView(parent, self.theme, height=1)
 
     # ==================================================================
     # thread plumbing
@@ -727,9 +920,13 @@ class App:
     def _set_busy(self, busy):
         self.busy = busy
         state = "disabled" if busy else "normal"
-        for widget in (self.download_btn, self.preview_btn, self.watch_btn,
-                       self.refresh_btn, self.view_btn, self.timeline_btn):
+        for widget in (self.download_btn, self.preview_btn,
+                       self.preview_download_btn,
+                       self.sync_btn, self.schedule_btn, self.refresh_btn,
+                       self.view_btn, self.timeline_btn):
             widget.configure(state=state)
+        self.device_combo.configure(
+            state="disabled" if busy else "readonly")
         self.stop_btn.configure(state="normal" if busy else "disabled")
         self.status.set_busy(busy)
 
@@ -746,11 +943,83 @@ class App:
     # connection
     # ==================================================================
 
-    def _auto_connect(self):
-        credentials = self.store.load()
+    @staticmethod
+    def _device_label(credentials):
+        """Return a chooser label that is friendly but still unambiguous."""
+        name = (credentials.device_name or "").strip()
+        return (f"{name} — {credentials.host}"
+                if name else credentials.host)
+
+    def _refresh_device_choices(self, selected_host=None):
+        """Refresh the header chooser from the saved device profiles."""
+        devices = self.store.devices()
+        self._device_hosts = {
+            self._device_label(credentials): credentials.host
+            for credentials in devices
+        }
+        selected_host = str(
+            selected_host or self.store.active_host() or DEFAULT_HOST).strip()
+        selected_label = next(
+            (label for label, host in self._device_hosts.items()
+             if host == selected_host),
+            selected_host,
+        )
+        values = list(self._device_hosts)
+        if selected_label and selected_label not in values:
+            values.append(selected_label)
+            self._device_hosts[selected_label] = selected_host
+        self.device_combo.configure(values=values)
+        self.host_var.set(selected_label)
+
+    def _active_host(self):
+        """Resolve the chooser's friendly label to its network address."""
+        shown = self.host_var.get().strip()
+        return self._device_hosts.get(shown, shown)
+
+    def _clear_device_context(self):
+        """Remove selections that belong to the previously shown device."""
+        self.vessels = []
+        self.filtered_vessels = []
+        self.selected_wells = {}
+        self.scanned_wells = {}
+        self.active_vessel = None
+        self._set_initial_vessel_sort()
+        self._populate_vessels()
+        self._set_wells_expanded(False)
+
+    def _switch_device(self, _event=None):
+        """Activate the saved device chosen in the header."""
+        host = self._active_host()
+        if not host or host == self.client.host:
+            return
+        if self.busy or (self.watcher and self.watcher.is_running):
+            self._refresh_device_choices(self.client.host)
+            messagebox.showinfo(
+                "Download in progress",
+                "Stop the current download or synchronization before "
+                "switching devices.", parent=self.root)
+            return
+
+        old_client = self.client
+        credentials = self.store.select(host)
+        self.client = IncucyteClient(
+            host, store=self.store, credentials=credentials)
+        old_client.close()
+        self._clear_device_context()
+        self._update_connection()
+        self._save_state()
+        self.say(f"Switched to {self._device_label(credentials)}.", "success")
         if credentials.token_valid or credentials.can_refresh:
-            self.client = IncucyteClient(self.host_var.get().strip() or None,
-                                         store=self.store)
+            self._refresh_vessels()
+
+    def _auto_connect(self):
+        host = self._active_host()
+        credentials = self.store.load(host)
+        self.client = IncucyteClient(
+            host or None, store=self.store, credentials=credentials)
+        if credentials.token_valid or credentials.can_refresh:
+            self.store.select(credentials.host)
+            self._refresh_device_choices(credentials.host)
             self._update_connection()
             if credentials.token_valid:
                 self.say("Signed in with saved credentials.", "success")
@@ -766,9 +1035,10 @@ class App:
             hours = credentials.token_seconds_left / 3600
             unit = f"{hours:.1f}h" if hours >= 1 else \
                 f"{credentials.token_seconds_left / 60:.0f}m"
-            self.conn_var.set(f"{credentials.username or 'connected'} · {unit}")
+            self.conn_var.set(
+                f"{credentials.username or 'connected'} · token expires in {unit}")
             self.conn_pill.configure(style="Ok.Pill.TLabel")
-            self.login_btn.configure(text="Switch user")
+            self.login_btn.configure(text="Change login")
         elif credentials.can_refresh:
             self.conn_var.set(f"{credentials.username} · token expired")
             self.conn_pill.configure(style="Warn.Pill.TLabel")
@@ -788,12 +1058,23 @@ class App:
         self.root.after(1000, self._tick_clock)
 
     def _login(self):
-        host = self.host_var.get().strip() or DEFAULT_HOST
-        self.client.host = host
-        dialog = LoginDialog(self.root, self.theme, self.client, host=host)
-        if dialog.show():
+        host = self._active_host() or DEFAULT_HOST
+        previous_host = self.client.host
+        login_client = IncucyteClient(host, store=self.store)
+        dialog = LoginDialog(
+            self.root, self.theme, login_client, host=host)
+        credentials = dialog.show()
+        if credentials:
+            previous_client, self.client = self.client, login_client
+            previous_client.close()
+            self._refresh_device_choices(credentials.host)
+            if credentials.host != previous_host:
+                self._clear_device_context()
             self._update_connection()
-            self.say(f"Signed in as {self.client.username} on {host}.", "success")
+            self._save_state()
+            self.say(
+                f"Signed in as {self.client.username} on "
+                f"{self._device_label(credentials)}.", "success")
             self._refresh_vessels()
 
     def _prompt_login(self):
@@ -803,14 +1084,22 @@ class App:
             self._login()
 
     def _logout(self):
+        forgotten_host = self.client.host
         self.client.logout()
-        self.vessels = []
-        self._populate_vessels()
+        credentials = self.store.load()
+        self.client = IncucyteClient(
+            credentials.host or DEFAULT_HOST,
+            store=self.store, credentials=credentials)
+        self._refresh_device_choices(self.client.host)
+        self._clear_device_context()
         self._update_connection()
-        self.say("Saved login removed.", "warn")
+        self._save_state()
+        self.say(f"Saved login removed for {forgotten_host}.", "warn")
+        if credentials.token_valid or credentials.can_refresh:
+            self._refresh_vessels()
 
     def _probe(self):
-        self.client.host = self.host_var.get().strip() or DEFAULT_HOST
+        self.client.host = self._active_host() or DEFAULT_HOST
         self._run_worker(self._probe_worker)
 
     def _probe_worker(self):
@@ -910,7 +1199,7 @@ class App:
     # ==================================================================
 
     def _refresh_vessels(self):
-        self.client.host = self.host_var.get().strip() or DEFAULT_HOST
+        self.client.host = self._active_host() or DEFAULT_HOST
         if not (self.client.credentials.token_valid
                 or self.client.credentials.can_refresh):
             self.say("Sign in before listing vessels.", "warn")
@@ -981,11 +1270,26 @@ class App:
             "channels": (vessel.channel_summary or "").lower(),
         }.get(column, vessel.id)
 
+    def _set_initial_vessel_sort(self):
+        """Start with the vessels scanned most recently at the top."""
+        self._sort_column = "last"
+        self._sort_reverse = True
+
+    def _update_vessel_headings(self):
+        """Show which headings sort and the active sort direction."""
+        for column, label in self._vessel_heading_labels.items():
+            if column == self._sort_column:
+                marker = "↓" if self._sort_reverse else "↑"
+            else:
+                marker = "↕"
+            self.vessel_tree.heading(column, text=f"{label} {marker}")
+
     def _sort_vessels(self, column):
         if self._sort_column == column:
             self._sort_reverse = not self._sort_reverse
         else:
             self._sort_column, self._sort_reverse = column, False
+        self._update_vessel_headings()
         self._populate_vessels()
 
     def _selected_vessel_ids(self):
@@ -1006,10 +1310,16 @@ class App:
     def _on_vessel_select(self, _event=None):
         ids = self._selected_vessel_ids()
         if not ids:
+            self.active_vessel = None
+            self._set_wells_expanded(False)
+            self._refresh_summary()
             return
         vessel = self._vessel(ids[0])
         if vessel is None:
+            self.active_vessel = None
+            self._set_wells_expanded(False)
             return
+        self._set_wells_expanded(True)
         self.active_vessel = vessel.id
         self.plate.configure_plate(
             vessel.rows, vessel.cols,
@@ -1025,16 +1335,17 @@ class App:
 
     def _sync_channel_checks(self, vessel):
         """Name the channel boxes after the vessel, and grey out unused ones."""
-        for number, check in self.channel_checks.items():
+        for number, variable in self.channel_vars.items():
             label = vessel.channel_labels.get(number, str(number))
             if number != PHASE:
                 label = f"{label} (Color {1 if number == COLOR1 else 2})"
             available = (not vessel.active_channels) or (
                 number in vessel.active_channels)
-            check.configure(text=label,
-                            state="normal" if available else "disabled")
+            self._configure_live(
+                self.channel_checks.get(number), text=label,
+                state="normal" if available else "disabled")
             if not available:
-                self.channel_vars[number].set(False)
+                variable.set(False)
 
     def _load_scanned_wells(self, vessel):
         """Ask the last scan which wells actually hold images."""
@@ -1095,13 +1406,10 @@ class App:
 
     def _on_layout_change(self):
         layout = self.layout_var.get()
-        stacked = layout != "separate"
-        if stacked:
-            self.green_lut_var.set(False)
-        self.green_lut_check.configure(state="disabled" if stacked else "normal")
         # Only a time stack is ever rewritten to gain a frame; the per-scan
         # layouts write one file per moment and simply skip the ones they have.
-        self.append_check.configure(
+        self._configure_live(
+            self.append_check,
             state="normal" if "time" in layout else "disabled")
         self._refresh_summary()
 
@@ -1111,6 +1419,10 @@ class App:
             (self.start_var.get(), self.custom_date_entry, self.custom_date_var),
             (self.end_var.get(), self.custom_end_entry, self.custom_end_var),
         ):
+            if entry is None:
+                if choice == CUSTOM and not variable.get():
+                    variable.set(date.today().isoformat())
+                continue
             if choice == CUSTOM:
                 entry.pack(side="left", padx=(theme_mod.PAD_S, 0))
                 if not variable.get():
@@ -1156,7 +1468,7 @@ class App:
         self.summary_var.set(
             f"{len(ids)} vessel{'s' if len(ids) != 1 else ''} · "
             f"{wells_total} well{'s' if wells_total != 1 else ''} · "
-            f"{' + '.join(names)}\n{LAYOUT_DESCRIPTIONS[layout]}")
+            f"{' + '.join(names)}")
 
         per_scan_layout = layout in ("separate", "channel_stack")
         count = wells_total * (len(channels) if layout in ("separate", "time_stack")
@@ -1174,7 +1486,8 @@ class App:
             background=_processing_value(self.background_var.get())).recipe
         if recipe.is_active:
             estimate += f" Pixels: {recipe.describe()}."
-        self.estimate_var.set(estimate + " Press Preview for the exact count.")
+        self.estimate_var.set(
+            estimate + " Use Preview download for the exact count.")
 
         example_channels = "-".join(
             n.lower().replace(" ", "-") for n in names) or "phase"
@@ -1243,7 +1556,6 @@ class App:
             layout=resolve_layout(self.layout_var.get()),
             start_from=start_from,
             end_at=end_at,
-            green_lut=bool(self.green_lut_var.get()),
             calibrate=bool(self.calibrate_var.get()),
             unmix=_processing_value(self.unmix_var.get()),
             background=_processing_value(self.background_var.get()),
@@ -1251,16 +1563,66 @@ class App:
             interval_minutes=int(self.interval_var.get() or 10),
             batch_frames=int(self.batch_frames_var.get() or 0),
             batch_after=self.batch_after_var.get().strip(),
-            host=self.host_var.get().strip() or DEFAULT_HOST,
+            host=self._active_host() or DEFAULT_HOST,
             write_manifest=bool(self.manifest_var.get()),
             append_stacks=bool(self.append_var.get()),
         )
+
+    def _export_values(self):
+        """Snapshot modal settings so Cancel can put every value back."""
+        names = (
+            "output_var", "layout_var", "start_var", "custom_date_var",
+            "end_var", "custom_end_var", "workers_var", "interval_var",
+            "batch_frames_var", "batch_after_var",
+            "append_var", "manifest_var", "calibrate_var", "unmix_var",
+            "background_var",
+        )
+        values = {name: getattr(self, name).get() for name in names}
+        values["channels"] = {
+            number: variable.get()
+            for number, variable in self.channel_vars.items()
+        }
+        return values
+
+    def _restore_export_values(self, values):
+        channels = values.get("channels", {})
+        for name, value in values.items():
+            if name != "channels":
+                getattr(self, name).set(value)
+        for number, value in channels.items():
+            self.channel_vars[number].set(value)
+        self._on_layout_change()
+        self._on_window_change()
+
+    def _request_export_options(self, action):
+        """Show the action-specific settings checkpoint and return its options."""
+        prompt = EXPORT_PROMPTS[action]
+        previous = self._export_values()
+        dialog = ExportSettingsDialog(
+            self.root, self.theme,
+            title=prompt["title"],
+            mode_label=prompt["mode_label"],
+            description=prompt["description"],
+            note=prompt["note"],
+            confirm_text=prompt["confirm_text"],
+            build_form=lambda body: self._build_export_form(
+                body, prompt["sections"]),
+            validate=lambda parent: self._validate(parent=parent),
+            tone=prompt["tone"],
+            minimum_size=prompt["minimum_size"])
+        try:
+            options = dialog.show()
+        finally:
+            self._release_export_widgets()
+        if options is None:
+            self._restore_export_values(previous)
+        return options
 
     def _apply_options(self, options):
         if options.output:
             self.output_var.set(options.output)
         if options.host:
-            self.host_var.set(options.host)
+            self._refresh_device_choices(options.host)
         selected = options.channel_set
         for number, var in self.channel_vars.items():
             var.set(True if selected is None else number in selected)
@@ -1269,7 +1631,6 @@ class App:
         self.interval_var.set(options.interval_minutes)
         self.batch_frames_var.set(options.batch_frames)
         self.batch_after_var.set(options.batch_after)
-        self.green_lut_var.set(options.green_lut)
         self.calibrate_var.set(options.calibrate)
         self.unmix_var.set(options.unmix or PROCESSING_OFF)
         self.background_var.set(options.background or PROCESSING_OFF)
@@ -1308,13 +1669,14 @@ class App:
         choice_var.set(CUSTOM)
         custom_var.set(str(value))
 
-    def _validate(self):
+    def _validate(self, parent=None):
+        parent = parent or self.root
         try:
             options = self._current_options()
         except ValueError as exc:
             # A free-text field (the custom date, or the batch delay) holds
             # something that is not a time at all.
-            messagebox.showwarning("Not ready", str(exc), parent=self.root)
+            messagebox.showwarning("Not ready", str(exc), parent=parent)
             return None
         problems = options.validate()
         if not (self.client.credentials.token_valid
@@ -1322,7 +1684,7 @@ class App:
             problems.insert(0, "Not signed in.")
         if problems:
             messagebox.showwarning("Not ready", "\n".join(problems),
-                                   parent=self.root)
+                                   parent=parent)
             return None
         self._remember_output(options.output)
         self._save_state()
@@ -1359,7 +1721,7 @@ class App:
                 f"PyIncucyte - {event.percent}% ({event.done:,}/{event.total:,})")
 
     def _preview(self):
-        options = self._validate()
+        options = self._request_export_options("expected")
         if options:
             self._run_worker(self._plan_worker, options, False)
 
@@ -1398,8 +1760,12 @@ class App:
             self.say(f"Vessel {vessel_id} has no scan holding images.", "warn")
             return
         scan = scans[0]
+        # One channel fills one physical plate grid.  The viewer fetches another
+        # channel or Z-stack image lazily when its selector changes.
+        available_channels = (scan.channels or scan.vessel.active_channels)
+        initial_channel = preferred_preview_channel(channels, available_channels)
         result = self.client.preview(
-            scan, wells=wells, channels=channels or None,
+            scan, wells=wells, channels=[initial_channel],
             max_images=PREVIEW_MAX_IMAGES, progress=self._progress,
             cancel=self.cancel_event, **(recipe or {}))
         if self.cancel_event.is_set():
@@ -1513,7 +1879,7 @@ class App:
         TimelineWindow(self.root, self.theme, result)
 
     def _download(self):
-        options = self._validate()
+        options = self._request_export_options("download")
         if options:
             self._run_worker(self._plan_worker, options, True)
 
@@ -1567,19 +1933,70 @@ class App:
             self.say(f"Reused {result.cache.hits:,} cached source images "
                      f"instead of re-downloading them.", "muted")
 
-    # -- watch ----------------------------------------------------------
+    # -- scheduled download --------------------------------------------
 
-    def _start_watch(self):
-        if self.watcher and self.watcher.is_running:
-            self.say("Already watching.", "warn")
+    def _schedule_download(self):
+        options = self._request_export_options("schedule")
+        if not options:
             return
-        options = self._validate()
+        vessel_part = "-".join(str(one) for one in options.vessels) or "vessels"
+        choice = ScheduleDialog(
+            self.root, self.theme, f"vessel {vessel_part}").show()
+        if choice:
+            self._run_worker(self._schedule_worker, options, choice)
+
+    def _schedule_worker(self, options, choice):
+        """Register through the CLI, in a console when Windows must ask.
+
+        A schedule that survives a reboot needs the account's credential, and
+        Windows asks for it itself, on a console - which a windowed launch does
+        not have. So this is the second place in the app that opens one, for
+        exactly the reason the sign-in dialog does: there is no box to type it
+        into here, and there must not be.
+        """
+        self._post(self.status.set_message, "Creating scheduled download...")
+        argv = [*options.cli_args("schedule"),
+                "--name", choice["name"], "--every", choice["every"]]
+        if not choice["logged_out"]:
+            argv.append("--at-logon")
+        if choice["wake"]:
+            argv.append("--wake")
+        if choice["replace"]:
+            argv.append("--replace")
+
+        if choice["logged_out"]:
+            self.say("Windows is asking for your credential in a window of "
+                     "its own, so this can download while nobody is logged "
+                     "in.", "muted")
+            done = subprocess.run(
+                schedule_mod.self_command(argv, console=True), check=False,
+                creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0))
+            if done.returncode != 0:
+                raise IncucyteError(
+                    "Windows did not create the schedule. The prompt was "
+                    "cancelled, or the credential was not accepted.")
+        else:
+            cli_mod.cmd_schedule(cli_mod.parse_args(argv[1:]))
+        self.say(f"Scheduled {schedule_mod.task_name(choice['name'])} - "
+                 f"{choice['cadence'].lower()}.", "success")
+        self.say("Windows runs one synchronization each time. PyIncucyte does "
+                 "not need to stay open"
+                 + (", and nobody needs to be logged in."
+                    if choice["logged_out"] else "."), "muted")
+
+    # -- continuous sync ------------------------------------------------
+
+    def _start_sync(self):
+        if self.watcher and self.watcher.is_running:
+            self.say("Continuous sync is already running.", "warn")
+            return
+        options = self._request_export_options("sync")
         if not options:
             return
         self.cancel_event.clear()
         self._set_busy(True)
-        self.watch_btn.configure(state="disabled")
-        self.say(f"Watching for new scans every {options.interval_minutes} "
+        self.sync_btn.configure(state="disabled")
+        self.say(f"Synchronizing new scans every {options.interval_minutes} "
                  f"minutes; new images go to {options.output}.", "success")
         if options.batches:
             self.say(f"Holding new frames until {options.batch_description}.",
@@ -1658,9 +2075,9 @@ class App:
     # files, presets, misc
     # ==================================================================
 
-    def _browse_output(self):
+    def _browse_output(self, parent=None):
         folder = filedialog.askdirectory(
-            title="Choose the output folder", parent=self.root,
+            title="Choose the output folder", parent=parent or self.root,
             initialdir=self.output_var.get() or str(Path.home()))
         if folder:
             self.output_var.set(folder)
@@ -1673,7 +2090,7 @@ class App:
             self.recent_outputs.remove(folder)
         self.recent_outputs.insert(0, folder)
         self.recent_outputs = self.recent_outputs[:8]
-        self.output_combo.configure(values=self.recent_outputs)
+        self._configure_live(self.output_combo, values=self.recent_outputs)
 
     def _open_output_folder(self):
         folder = self.output_var.get().strip()
@@ -1697,7 +2114,16 @@ class App:
             "watch" if self.watcher and self.watcher.is_running else "download")
         self.root.clipboard_clear()
         self.root.clipboard_append(command)
-        self.say(f"Copied to clipboard: {command}", "muted")
+        self.say("Copied command-line interface command to the clipboard.",
+                 "muted")
+
+    def _copy_python_code(self):
+        options = self._current_options()
+        code = options.python_code(
+            "watch" if self.watcher and self.watcher.is_running else "download")
+        self.root.clipboard_clear()
+        self.root.clipboard_append(code)
+        self.say("Copied Python code to the clipboard.", "muted")
 
     def _save_preset(self):
         path = filedialog.asksaveasfilename(
@@ -1720,6 +2146,8 @@ class App:
             messagebox.showerror("Bad preset", str(exc), parent=self.root)
             return
         self._apply_options(options)
+        if options.host and options.host != self.client.host:
+            self._switch_device()
         self.say(f"Loaded preset {Path(path).name}", "success")
 
     def _save_log(self):
@@ -1730,8 +2158,11 @@ class App:
             Path(path).write_text(self.log.contents(), encoding="utf-8")
             self.say(f"Log saved to {path}", "success")
 
-    def _toggle_dark(self):
-        """Swap palettes and repaint the widgets ttk styles cannot reach."""
+    def _apply_dark_mode(self):
+        """Apply the shared header/menu choice and repaint custom widgets."""
+        requested = bool(self.dark_mode_var.get())
+        if requested == self.theme.dark:
+            return
         self.theme.toggle_dark()
         self.root.configure(background=self.theme["bg"])
         self.plate.apply_theme(self.theme)
@@ -1787,7 +2218,6 @@ class App:
                 "layout": None,
                 "hyperstack": bool(state.get("hyperstack")),
                 "time_stack": bool(state.get("time_stack")),
-                "green_lut": bool(state.get("green_phase")),
                 "workers": state.get("max_workers", 4),
                 "interval_minutes": state.get("interval", 10),
                 "start_from": start_from,
@@ -1805,7 +2235,7 @@ class App:
                 pass
         self.recent_outputs = [p for p in state.get("recent_outputs", [])
                                if isinstance(p, str)]
-        self.output_combo.configure(values=self.recent_outputs)
+        self._configure_live(self.output_combo, values=self.recent_outputs)
 
         options_data = state.get("options")
         if options_data:
@@ -1825,8 +2255,7 @@ class App:
                 continue
 
         if state.get("host"):
-            self.host_var.set(state["host"])
-            self.client.host = state["host"]
+            self._refresh_device_choices(state["host"])
 
     def _save_state(self):
         try:
@@ -1844,7 +2273,7 @@ class App:
             "version": __version__,
             "geometry": geometry,
             "dark": self.theme.dark,
-            "host": self.host_var.get().strip(),
+            "host": self._active_host(),
             "recent_outputs": self.recent_outputs,
             "options": options,
             "wells": wells,

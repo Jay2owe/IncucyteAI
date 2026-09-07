@@ -1,0 +1,55 @@
+<svg xmlns="http://www.w3.org/2000/svg" font-family="Segoe UI, Helvetica, Arial, sans-serif" width="968" height="420" viewBox="-14 -14 968 420" role="img" aria-label="Diagram: PullResult contains OutputFiles, each containing ChannelRefs."><defs>
+<marker id="ar" markerWidth="8" markerHeight="8" refX="7" refY="3.2" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0 L7.5,3.2 L0,6.4 Z" fill="#B2BCCB"/></marker>
+<marker id="ar-inc" markerWidth="8" markerHeight="8" refX="7" refY="3.2" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0 L7.5,3.2 L0,6.4 Z" fill="#2C6597"/></marker>
+<marker id="ar-lv" markerWidth="8" markerHeight="8" refX="7" refY="3.2" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0 L7.5,3.2 L0,6.4 Z" fill="#8A5E12"/></marker>
+<marker id="ar-stop" markerWidth="8" markerHeight="8" refX="7" refY="3.2" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0 L7.5,3.2 L0,6.4 Z" fill="#A32F27"/></marker>
+<pattern id="px" width="8" height="8" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><line x1="0" y1="0" x2="0" y2="8" stroke="#B2BCCB" stroke-width="1"/></pattern>
+</defs><rect x="-14" y="-14" width="968" height="420" fill="#FFFFFF"/>
+
+          <rect x="12" y="14" width="916" height="358" rx="5" fill="#FFFFFF" stroke="#B2BCCB" stroke-width="1"></rect>
+          <text x="28" y="38" font-size="13" font-family="Consolas, Menlo, monospace" fill="#151A21" font-weight="600">PullResult</text>
+          <text x="118" y="38" fill="#79849A" font-size="10.5px">·  .ok  .paths  .nbytes  .duration_seconds  .cancelled</text>
+
+          <rect x="28" y="52" width="212" height="30" rx="2" fill="#EAEEF4" stroke="#D8DEE7" stroke-width="1"></rect>
+          <text x="40" y="72" font-size="10.5" font-family="Consolas, Menlo, monospace" fill="#4C5769">experiment: "ois7041"</text>
+          <rect x="250" y="52" width="212" height="30" rx="2" fill="#EAEEF4" stroke="#D8DEE7" stroke-width="1"></rect>
+          <text x="262" y="72" font-size="10.5" font-family="Consolas, Menlo, monospace" fill="#4C5769">status: "complete"</text>
+          <rect x="472" y="52" width="212" height="30" rx="2" fill="#EAEEF4" stroke="#D8DEE7" stroke-width="1"></rect>
+          <text x="484" y="72" font-size="10.5" font-family="Consolas, Menlo, monospace" fill="#4C5769">started_at / finished_at</text>
+          <rect x="694" y="52" width="218" height="30" rx="2" fill="#EAEEF4" stroke="#D8DEE7" stroke-width="1"></rect>
+          <text x="706" y="72" font-size="10.5" font-family="Consolas, Menlo, monospace" fill="#4C5769">errors: ()   skipped: ()</text>
+
+          <!-- files -->
+          <rect x="28" y="96" width="884" height="206" rx="4" fill="#EAEEF4" stroke="#D8DEE7" stroke-width="1"></rect>
+          <text x="44" y="118" font-size="12" font-family="Consolas, Menlo, monospace" fill="#151A21" font-weight="600">files: tuple[OutputFile]</text>
+          <text x="228" y="118" fill="#79849A" font-size="10.5px">one per field of view, or per channel if the layout splits them</text>
+
+          <rect x="44" y="132" width="852" height="154" rx="4" fill="#FFFFFF" stroke="#B2BCCB" stroke-width="1"></rect>
+          <text x="60" y="153" font-size="11.5" font-family="Consolas, Menlo, monospace" fill="#151A21" font-weight="600">OutputFile</text>
+          <text x="140" y="153" fill="#79849A" font-size="10.5px">— one written stack, described in pipeline terms</text>
+
+          <rect x="60" y="166" width="200" height="28" rx="2" fill="#EAEEF4" stroke="#D8DEE7" stroke-width="1"></rect>
+          <text x="70" y="185" font-size="10" font-family="Consolas, Menlo, monospace" fill="#4C5769">axes: "TZCYX"</text>
+          <rect x="268" y="166" width="212" height="28" rx="2" fill="#EAEEF4" stroke="#D8DEE7" stroke-width="1"></rect>
+          <text x="278" y="185" font-size="10" font-family="Consolas, Menlo, monospace" fill="#4C5769">shape: (111,1,4,512,512)</text>
+          <rect x="488" y="166" width="196" height="28" rx="2" fill="#EAEEF4" stroke="#D8DEE7" stroke-width="1"></rect>
+          <text x="498" y="185" font-size="10" font-family="Consolas, Menlo, monospace" fill="#4C5769">interval_s: 1812.0</text>
+          <rect x="692" y="166" width="188" height="28" rx="2" fill="#F8E6E4" stroke="#A32F27" stroke-width="1"></rect>
+          <text x="702" y="185" font-size="10" font-family="Consolas, Menlo, monospace" fill="#A32F27" font-weight="600">complete: True|False|None</text>
+
+          <!-- channel refs -->
+          <rect x="60" y="204" width="820" height="70" rx="3" fill="#DFE5EE" stroke="#B2BCCB" stroke-width="1"></rect>
+          <text x="74" y="224" font-size="11" font-family="Consolas, Menlo, monospace" fill="#151A21" font-weight="600">channel_refs: tuple[ChannelRef]</text>
+          <text x="290" y="224" fill="#79849A" font-size="10.5px">one per PLANE of this file, index counted from 1</text>
+
+          <rect x="74" y="234" width="392" height="28" rx="2" fill="#FFFFFF" stroke="#B2BCCB" stroke-width="1"></rect>
+          <text x="84" y="253" font-size="10" font-family="Consolas, Menlo, monospace" fill="#4C5769">index=1  name="BioLuminescence"  source="vsi"</text>
+          <rect x="474" y="234" width="392" height="28" rx="2" fill="#FFFFFF" stroke="#B2BCCB" stroke-width="1"></rect>
+          <text x="484" y="253" font-size="10" font-family="Consolas, Menlo, monospace" fill="#4C5769">index=2  name="GFP"  source="vsi"  source_index=2</text>
+
+          <!-- positions -->
+          <rect x="28" y="316" width="884" height="42" rx="3" fill="#EAEEF4" stroke="#D8DEE7" stroke-width="1"></rect>
+          <text x="44" y="336" font-size="11.5" font-family="Consolas, Menlo, monospace" fill="#151A21" font-weight="600">positions: tuple[PullResult]</text>
+          <text x="240" y="336" fill="#79849A" font-size="10.5px">the same object again, one per field of view — a multi-position run nests</text>
+          <text x="44" y="351" fill="#79849A" font-size="10.5px">a cancelled pull still carries the positions that finished; they did finish, the pull did not</text>
+        </svg>
