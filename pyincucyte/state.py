@@ -24,6 +24,29 @@ STATE_FILENAME = ".pyincucyte-state.json"
 DEFAULT_FLUSH_INTERVAL = 2.0
 
 
+def _is_inside(target, root):
+    """Is the recorded path ``target`` under the resolved folder ``root``?
+
+    Both sides are resolved. Resolving one and not the other is how a carry-over
+    silently found nothing: a ledger written through a short 8.3 name, a mapped
+    drive or a symlink records a path that names the same file by a different
+    spelling, and the answer was "not in this folder" - so an install that had
+    already downloaded everything downloaded it all again and said nothing.
+
+    ``relative_to`` rather than a string prefix, because ``out`` prefixes
+    ``outsider`` and that would carry another folder's entries into this one.
+    """
+    try:
+        here = Path(target).resolve()
+    except OSError:
+        here = Path(target)
+    try:
+        here.relative_to(root)
+    except ValueError:
+        return False
+    return True
+
+
 class StateStore:
     """A resume ledger of already-downloaded outputs.
 
@@ -84,13 +107,13 @@ class StateStore:
         if not entries:
             return
         try:
-            root = str(Path(output_dir).resolve()).lower()
+            root = Path(output_dir).resolve()
         except OSError:
             return
         carried = {}
         for key, info in entries.items():
             target = info.get("file") if isinstance(info, dict) else None
-            if target and str(Path(target)).lower().startswith(root):
+            if target and _is_inside(target, root):
                 carried[key] = info
         if carried:
             self.data["downloaded"].update(carried)

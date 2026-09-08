@@ -11,7 +11,6 @@ import importlib.util
 import os
 import re
 import sys
-import tomllib
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -24,8 +23,21 @@ from pyincucyte.errors import HostNotSetError
 
 ROOT = Path(__file__).resolve().parent.parent
 
+# `tomllib` is 3.11+ and `requires-python` says >=3.10, so importing it at the
+# top of this file did not fail these two tests - it killed COLLECTION, and the
+# whole suite reported one error and ran nothing on 3.10. It is read where it
+# is used, and the two tests that need it skip without it; the rest of the file
+# is about the layout and the entry points and needs no TOML at all.
+try:                                    # 3.11+
+    import tomllib
+except ModuleNotFoundError:             # pragma: no cover - 3.10
+    tomllib = None
+
+NEEDS_TOML = unittest.skipIf(tomllib is None, "reading pyproject.toml is 3.11+")
+
 
 class LayoutTests(unittest.TestCase):
+    @NEEDS_TOML
     def test_the_distribution_and_the_package_agree_on_the_version(self):
         with open(ROOT / "pyproject.toml", "rb") as handle:
             project = tomllib.load(handle)["project"]
@@ -36,6 +48,7 @@ class LayoutTests(unittest.TestCase):
         stray = {"py_incucyte_gui", "incucyte_downloader.py", "incucyte_gui.py"}
         self.assertEqual(stray & {p.name for p in ROOT.iterdir()}, set())
 
+    @NEEDS_TOML
     def test_both_console_scripts_point_into_the_package(self):
         with open(ROOT / "pyproject.toml", "rb") as handle:
             scripts = tomllib.load(handle)["project"]["scripts"]
