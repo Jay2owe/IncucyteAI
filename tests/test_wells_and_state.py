@@ -115,6 +115,46 @@ class StateStoreTests(unittest.TestCase):
         self.assertIn("mine", store.entries)
         self.assertNotIn("elsewhere", store.entries)
 
+    def test_a_carry_over_matches_the_same_file_spelled_another_way(self):
+        """One folder, two spellings, and the ledger must know they are one.
+
+        A recorded path can name the same file through a short 8.3 name, a
+        mapped drive, a symlink or simply an unresolved `..`. Resolving the
+        folder and not the recorded path made the answer "not in this folder",
+        so an install that had already downloaded everything downloaded it all
+        again - the exact thing this ledger exists to stop, failing silently.
+        """
+        output = self.tmp / "out"
+        output.mkdir()
+        roundabout = output / "sub" / ".." / "VID38_A1_1.tif"
+        (output / "sub").mkdir()
+        original_state_file = engine.STATE_FILE
+        engine.STATE_FILE = self.tmp / "global.json"
+        try:
+            engine.STATE_FILE.write_text(json.dumps({"downloaded": {
+                "mine": {"file": str(roundabout)},
+            }}))
+            store = StateStore.for_output(output, scope="auto")
+        finally:
+            engine.STATE_FILE = original_state_file
+        self.assertIn("mine", store.entries)
+
+    def test_a_carry_over_does_not_take_the_next_folder_along(self):
+        """`out` is a prefix of `outsider`, and a string comparison said yes."""
+        output = self.tmp / "out"
+        output.mkdir()
+        (self.tmp / "outsider").mkdir()
+        original_state_file = engine.STATE_FILE
+        engine.STATE_FILE = self.tmp / "global.json"
+        try:
+            engine.STATE_FILE.write_text(json.dumps({"downloaded": {
+                "next door": {"file": str(self.tmp / "outsider" / "x.tif")},
+            }}))
+            store = StateStore.for_output(output, scope="auto")
+        finally:
+            engine.STATE_FILE = original_state_file
+        self.assertNotIn("next door", store.entries)
+
     def test_pruning_forgets_files_that_have_been_deleted(self):
         store = StateStore(self.tmp / "ledger.json")
         present = self.tmp / "present.tif"
