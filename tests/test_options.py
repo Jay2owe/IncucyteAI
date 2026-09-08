@@ -34,15 +34,6 @@ class LayoutTests(unittest.TestCase):
 
 
 class OptionTests(unittest.TestCase):
-    def test_stacked_layouts_refuse_the_display_lut(self):
-        options = ExportOptions(output="o", vessels=[1], layout="time_stack",
-                                green_lut=True)
-        self.assertFalse(options.green_lut)
-
-    def test_separate_layout_keeps_the_lut_choice(self):
-        options = ExportOptions(output="o", vessels=[1], green_lut=True)
-        self.assertTrue(options.green_lut)
-
     def test_bad_specs_fail_at_construction_not_mid_download(self):
         with self.assertRaises(ValueError):
             ExportOptions(output="o", vessels=[1], channels="ultraviolet")
@@ -106,11 +97,10 @@ class SerialisationTests(unittest.TestCase):
         options = ExportOptions.from_dict({
             "output": "o", "vessels": [1],
             "hyperstack": True, "time_stack": True,
-            "green_phase": True, "max_workers": 6,
+            "max_workers": 6,
         })
         self.assertEqual(options.layout, "time_channel_stack")
         self.assertEqual(options.workers, 6)
-        self.assertFalse(options.green_lut)      # stacked layout wins
 
 
 class CommandLineMirrorTests(unittest.TestCase):
@@ -135,6 +125,8 @@ class CommandLineMirrorTests(unittest.TestCase):
     def test_paths_with_spaces_are_quoted(self):
         options = ExportOptions(output="C:/My Data/run 1", vessels=[1])
         self.assertIn('"C:/My Data/run 1"', options.cli_command())
+        self.assertIn("C:/My Data/run 1", options.cli_args())
+        self.assertNotIn('"C:/My Data/run 1"', options.cli_args())
 
     def test_watch_command_carries_the_interval(self):
         options = ExportOptions(output="out", vessels=[1], interval_minutes=20)
@@ -151,6 +143,39 @@ class CommandLineMirrorTests(unittest.TestCase):
         # Chunking is a watch idea: a one-shot download has nothing to wait for.
         options = ExportOptions(output="out", vessels=[1], batch_frames=50)
         self.assertNotIn("--batch-frames", options.cli_command("download"))
+
+
+class PythonMirrorTests(unittest.TestCase):
+    def test_python_code_reconstructs_the_exact_download_recipe(self):
+        options = ExportOptions(
+            output=r"C:\My Data\run 1", vessels=[38], wells="A1-B3",
+            wells_by_vessel={"38": "A1-B3"}, channels="phase,green",
+            layout="time_stack", start_from="first", end_at="+48h",
+            workers=8, host="10.0.0.1", calibrate=True)
+
+        code = options.python_code()
+        compile(code, "<copied PyIncucyte Python>", "exec")
+        setup = code.split("\n\nwith IncucyteClient", 1)[0]
+        namespace = {}
+        exec(setup, namespace)
+
+        self.assertEqual(namespace["options"], options)
+        self.assertIn("plan = incucyte.plan(options)", code)
+        self.assertIn("result = incucyte.download(plan)", code)
+
+    def test_watch_python_code_runs_a_continuous_watcher(self):
+        options = ExportOptions(
+            output="out", vessels=[1], interval_minutes=20,
+            batch_frames=50, batch_after="7d")
+
+        code = options.python_code("watch")
+
+        compile(code, "<copied PyIncucyte Sync Python>", "exec")
+        self.assertIn("watcher = incucyte.watch(", code)
+        self.assertIn("watcher.run_forever()", code)
+        self.assertIn("interval_minutes=20", code)
+        self.assertIn("batch_frames=50", code)
+        self.assertIn("batch_after='7d'", code)
 
 
 class BatchTests(unittest.TestCase):

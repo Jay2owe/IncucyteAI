@@ -1,0 +1,36 @@
+<svg xmlns="http://www.w3.org/2000/svg" font-family="Segoe UI, Helvetica, Arial, sans-serif" width="988" height="278" viewBox="-14 -14 988 278" role="img" aria-label="Byte layout: new planes are written where the directory was, a fresh directory follows, and the header pointer is repointed last."><defs>
+<marker id="ar" markerWidth="8" markerHeight="8" refX="7" refY="3.2" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0 L7.5,3.2 L0,6.4 Z" fill="#B2BCCB"/></marker>
+<marker id="ar-inc" markerWidth="8" markerHeight="8" refX="7" refY="3.2" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0 L7.5,3.2 L0,6.4 Z" fill="#2C6597"/></marker>
+<marker id="ar-lv" markerWidth="8" markerHeight="8" refX="7" refY="3.2" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0 L7.5,3.2 L0,6.4 Z" fill="#8A5E12"/></marker>
+<marker id="ar-stop" markerWidth="8" markerHeight="8" refX="7" refY="3.2" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0 L7.5,3.2 L0,6.4 Z" fill="#A32F27"/></marker>
+<pattern id="px" width="8" height="8" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><line x1="0" y1="0" x2="0" y2="8" stroke="#B2BCCB" stroke-width="1"/></pattern>
+</defs><rect x="-14" y="-14" width="988" height="278" fill="#FFFFFF"/>
+
+          <text x="40" y="32" fill="#79849A" font-size="9.5px" letter-spacing=".9px">before — 40 timepoints on disk</text>
+          <rect x="40" y="44" width="92" height="46" rx="2" fill="#E4EDF6" stroke="#2C6597" stroke-width="1"></rect>
+          <text x="54" y="72" font-size="11" font-family="Consolas, Menlo, monospace" fill="#2C6597" font-weight="600">header</text>
+          <rect x="136" y="44" width="560" height="46" rx="2" fill="#EAEEF4" stroke="#D8DEE7" stroke-width="1"></rect>
+          <rect x="136" y="44" width="560" height="46" rx="2" fill="url(#px)" opacity="0.5"></rect>
+          <text x="360" y="72" font-size="11" font-family="Consolas, Menlo, monospace" fill="#4C5769">pixel data · 40 timepoints</text>
+          <rect x="700" y="44" width="118" height="46" rx="2" fill="#DFE5EE" stroke="#B2BCCB" stroke-width="1"></rect>
+          <text x="716" y="72" font-size="11" font-family="Consolas, Menlo, monospace" fill="#151A21">directory</text>
+
+          <text x="40" y="126" fill="#79849A" font-size="9.5px" letter-spacing=".9px">after — four more, and nothing already written has moved</text>
+          <line x1="700" y1="136" x2="818" y2="136" stroke="#B2BCCB" stroke-width="1.4" fill="none" stroke-dasharray="4 3"></line>
+          <text x="700" y="132" font-size="9.5" fill="#79849A">the old directory was here</text>
+
+          <rect x="40" y="144" width="92" height="46" rx="2" fill="#E4EDF6" stroke="#2C6597" stroke-width="1"></rect>
+          <text x="54" y="172" font-size="11" font-family="Consolas, Menlo, monospace" fill="#2C6597" font-weight="600">header</text>
+          <rect x="53" y="144" width="10" height="46" fill="#F8E6E4" stroke="#A32F27" stroke-width="1"></rect>
+          <rect x="136" y="144" width="560" height="46" rx="2" fill="#EAEEF4" stroke="#D8DEE7" stroke-width="1"></rect>
+          <rect x="136" y="144" width="560" height="46" rx="2" fill="url(#px)" opacity="0.5"></rect>
+          <text x="360" y="172" font-size="11" font-family="Consolas, Menlo, monospace" fill="#4C5769">pixel data · 40 timepoints — untouched</text>
+          <rect x="700" y="144" width="110" height="46" rx="2" fill="#F5EEDD" stroke="#8A5E12" stroke-width="1"></rect>
+          <text x="722" y="172" font-size="11" font-family="Consolas, Menlo, monospace" fill="#8A5E12" font-weight="600">+ 4 new</text>
+          <rect x="814" y="144" width="118" height="46" rx="2" fill="#DFE5EE" stroke="#B2BCCB" stroke-width="1"></rect>
+          <text x="830" y="172" font-size="11" font-family="Consolas, Menlo, monospace" fill="#151A21">directory</text>
+
+          <path d="M58,192 V214 H814 V198" marker-end="url(#ar-stop)" stroke="#A32F27" stroke-width="1.4" fill="none"></path>
+          <text x="152" y="232" font-size="10.5" font-family="Consolas, Menlo, monospace" fill="#A32F27" font-weight="600">the four-byte pointer at offset 4 is repointed LAST — that write is the commit</text>
+          <text x="616" y="232" font-size="10.5" fill="#79849A">until it lands, the file still describes its old 40 frames</text>
+        </svg>

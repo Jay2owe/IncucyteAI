@@ -52,6 +52,23 @@ def _as_event(callback):
     return callback if callback is not None else threading.Event()
 
 
+def _target_options(target, options, out, kwargs):
+    """Apply PyLV200-style target/out shorthand to an Incucyte recipe."""
+    kwargs = dict(kwargs)
+    if isinstance(target, (ExportOptions, dict)) and options is None:
+        options, target = target, None
+    if target is not None:
+        key = "vessels" if isinstance(target, (list, tuple, set)) else "vessel"
+        if "vessel" in kwargs or "vessels" in kwargs:
+            raise TypeError("Give the vessel as target or keyword, not both")
+        if key == "vessel":
+            target = getattr(target, "id", target)
+        kwargs[key] = target
+    if out is not None:
+        kwargs["output"] = str(out)
+    return options, kwargs
+
+
 def _call(callback, event):
     if callback:
         try:
@@ -66,10 +83,12 @@ class IncucyteClient:
     def __init__(self, host=None, *, store=None, credentials=None,
                  timeout=None, logger=None):
         self.store = store or ConfigStore()
-        self._credentials = credentials or self.store.load()
-        if host:
-            self._credentials.host = host
-        self.host = self._credentials.host or engine.DEFAULT_HOST
+        self._credentials = credentials or self.store.load(host)
+        if host and self._credentials.host != host:
+            # A token belongs to one instrument. Never carry it across merely
+            # because a caller supplied a different address.
+            self._credentials = Credentials(host=host)
+        self.host = host or self._credentials.host or engine.DEFAULT_HOST
         self.log = logger or log
         self._vessels = None
         self._preview_cache = None
@@ -86,14 +105,15 @@ class IncucyteClient:
     def from_saved(cls, host=None, *, store=None):
         """Open a client from the saved login. Raises if there isn't one."""
         store = store or ConfigStore()
-        credentials = store.require()
-        return cls(host or credentials.host, store=store, credentials=credentials)
+        credentials = store.require(host)
+        return cls(credentials.host, store=store, credentials=credentials)
 
     @classmethod
-    def connect(cls, host, username, password, *, store=None, save=True):
+    def connect(cls, host, username, password, *, store=None, save=True,
+                device_name=""):
         """Log in with a plaintext password and return a ready client."""
         client = cls(host, store=store)
-        client.login(username, password, save=save)
+        client.login(username, password, save=save, device_name=device_name)
         return client
 
     # -- authentication ---------------------------------------------------
@@ -114,10 +134,15 @@ class IncucyteClient:
     def username(self):
         return self._credentials.username
 
-    def login(self, username, password, *, save=True):
+    @property
+    def device_name(self):
+        return self._credentials.device_name
+
+    def login(self, username, password, *, save=True, device_name=None):
         """Encrypt the password with the vendor assembly, then authenticate."""
         encrypted = engine.encrypt_password(password)
-        return self.login_encrypted(username, encrypted, save=save)
+        return self.login_encrypted(
+            username, encrypted, save=save, device_name=device_name)
 
     def require_host(self):
         """Return the instrument's address, or explain how to set one.
@@ -134,12 +159,16 @@ class IncucyteClient:
                 "save it.")
         return host
 
-    def login_encrypted(self, username, encrypted_password, *, save=True):
+    def login_encrypted(self, username, encrypted_password, *, save=True,
+                        device_name=None):
         """Authenticate with an already-encrypted password."""
         token, expires_in = engine.get_token(self.require_host(), username,
                                              encrypted_password)
         credentials = Credentials(
-            host=self.host, username=username,
+            host=self.host,
+            device_name=(self._credentials.device_name
+                         if device_name is None else str(device_name).strip()),
+            username=username,
             encrypted_password=encrypted_password,
             login_time=datetime.now().isoformat(),
         ).with_token(token, expires_in)
@@ -166,8 +195,8 @@ class IncucyteClient:
             return self._credentials.token
 
     def logout(self):
-        """Forget the saved login."""
-        self.store.clear()
+        """Forget this device's saved login."""
+        self.store.clear(self.host)
         self._credentials = Credentials(host=self.host)
         self._vessels = None
         self._user_id = None
@@ -1302,7 +1331,7 @@ class IncucyteClient:
                 engine.download_collected_scan_items(
                     self.host, token, plan.items, state=state_dict,
                     max_workers=options.workers,
-                    green_phase=options.green_lut, hyperstack=hyperstack,
+                    hyperstack=hyperstack,
                     progress_callback=on_written, error_callback=on_error,
                     stop_event=cancel, cache=cache)
         finally:
@@ -1337,6 +1366,18 @@ class IncucyteClient:
         return self.download(plan, progress=progress, cancel=cancel,
                              on_file=on_file, complete=complete)
 
+    def pull(self, target=None, options=None, *, out=None, progress=None,
+             cancel=None, on_file=None, complete=None, **kwargs):
+        """Pull one vessel using the same target/out spelling as PyLV200.
+
+        ``fetch`` remains the original PyIncucyte spelling. This additive
+        wrapper lets a pipeline call either instrument with ``pull(target,
+        out=...)`` while both still execute the same download engine.
+        """
+        options, kwargs = _target_options(target, options, out, kwargs)
+        return self.fetch(options, progress=progress, cancel=cancel,
+                          on_file=on_file, complete=complete, **kwargs)
+
     # -- watching ---------------------------------------------------------
 
     def watch(self, options=None, *, on_result=None, on_file=None,
@@ -1367,6 +1408,57 @@ class IncucyteClient:
         if start:
             watcher.start()
         return watcher
+
+    def watch_once(self, target=None, options=None, *, out=None, flush=False,
+                   **kwargs):
+        """Poll once without leaving a thread or process resident.
+
+        The output folder's resume ledger is created by :meth:`plan`, exactly
+        as it is for a long-running watcher. A held chunk returns ``None``;
+        otherwise the result is a :class:`DownloadResult`.
+        """
+        options, kwargs = _target_options(target, options, out, kwargs)
+        watcher = self.watch(options, start=False, **kwargs)
+        return watcher.flush() if flush else watcher.poll_once()
+
+    # -- downloading while nothing is running ----------------------------
+
+    def schedule(self, options=None, *, name=None, every="1h",
+                 logged_out=True, account=None, wake=False, replace=False,
+                 **settings):
+        """Ask Windows to keep downloading while nothing is open.
+
+        The Python spelling of ``pyincucyte schedule``. It hands Task
+        Scheduler a `schedule.Job` - this recipe - and the Job renders itself
+        into the one-pass ``watch --once`` command line Windows starts, after
+        making the recipe safe for a task that begins in system32. Building
+        that argv here is what made this method a wrapper over the command
+        line rather than a peer of it.
+
+        Nothing about a held chunk is written down, and nothing needs to be:
+        ``batch_after`` runs from each frame's own acquisition time and
+        ``batch_frames`` counts the instrument against the ledger, so the poll
+        that runs after a reboot decides exactly what the poll before it would
+        have decided.
+        """
+        from . import schedule as schedule_mod
+
+        job = schedule_mod.Job(options or ExportOptions())
+        every, modifier = schedule_mod.cadence_of(every)
+        return schedule_mod.register(
+            job, name=name or job.label(), every=every, modifier=modifier,
+            logged_out=logged_out, account=account, wake=wake,
+            replace=replace, **settings)
+
+    def schedules(self):
+        """Every scheduled download on this machine, and how each is doing."""
+        from . import schedule as schedule_mod
+        return schedule_mod.tasks()
+
+    def unschedule(self, name):
+        """Delete one scheduled download by name."""
+        from . import schedule as schedule_mod
+        return schedule_mod.remove(name)
 
     # -- lifecycle --------------------------------------------------------
 
@@ -1517,7 +1609,7 @@ def _median_gap(scan_times):
 
     The median rather than the mean: an instrument that paused overnight leaves
     one enormous gap, and a mean over it describes no cadence the run ever
-    used.  PySCNSlice derives it the same way, so the two agree whenever both
+    used.  Auto-Organotypic derives it the same way, so the two agree whenever both
     do the arithmetic.
     """
     stamps = []

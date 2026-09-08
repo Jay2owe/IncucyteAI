@@ -7,11 +7,15 @@ download would do before it runs.
 """
 
 import argparse
+import contextlib
 import getpass
+import io
 import json
 import logging
 import re
+import subprocess
 import sys
+import traceback
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
@@ -23,9 +27,11 @@ from .config import ConfigStore
 from .errors import IncucyteError, NotLoggedInError
 from .manifest import MANIFEST_FILENAME, load_manifest
 from .models import (
-    LAYOUT_DESCRIPTIONS, LAYOUTS, human_bytes, layout_from_flags, resolve_layout,
+    LAYOUT_DESCRIPTIONS, LAYOUTS, human_bytes, json_clean, layout_from_flags,
+    resolve_layout,
 )
 from .preview import DEFAULT_MAX_IMAGES, DEFAULT_SIZE
+from . import schedule
 from .timeline import DEFAULT_TIMELINE_SIZE
 from .processing import BACKGROUND_HELP, UNMIX_HELP, Unmixing
 from .options import (
@@ -39,6 +45,18 @@ log = logging.getLogger("pyincucyte.cli")
 #: MOMENT_HELP: a frame count has no meaning without a scan list.
 WHEN_HELP = ("YYYY-MM-DD, YYYY-MM-DD HH:MM, or a relative offset "
              "like -48h / +3d")
+
+#: Exit code for a poll that wrote nothing.  Distinct from 0 ("a chunk landed")
+#: and 2 ("it failed"), because a scheduled task treats all three differently
+#: and only 0 should start whatever runs next.  The same three numbers pylv200
+#: uses, so somebody who has scheduled one package does not have to relearn the
+#: other.  Only ``watch --once`` returns it; every other command keeps this
+#: package's existing convention, where 1 is argparse's and 2 is a failure.
+NOTHING_WRITTEN = 1
+
+# Mutable so tests and embedded callers can switch modes without rebinding a
+# name captured by output helpers.
+_JSON = [False]
 
 
 # ---------------------------------------------------------------------------
@@ -55,11 +73,21 @@ def literal(text):
 
 
 def emit(text=""):
-    print(text)
+    print(text, file=sys.stderr if _JSON[0] else sys.stdout)
 
 
 def emit_json(payload):
-    print(json.dumps(payload, indent=2, default=str))
+    print(json.dumps(json_clean(payload), indent=2, allow_nan=False))
+
+
+def emit_error(kind, message, command=""):
+    """Emit one stable machine error while preserving a human diagnostic."""
+    message = str(message).strip()
+    print(f"error: {message}", file=sys.stderr)
+    if _JSON[0]:
+        emit_json({"ok": False,
+                   "error": {"type": str(kind), "message": message},
+                   "command": str(command or "")})
 
 
 def print_table(rows, headers):
@@ -183,8 +211,6 @@ def options_from_args(args, *, require_output=True):
     elif getattr(args, "hyperstack", False) or getattr(args, "time_stack", False):
         changes["layout"] = layout_from_flags(args.hyperstack, args.time_stack)
 
-    if getattr(args, "green_phase", None) is not None:
-        changes["green_lut"] = bool(args.green_phase)
     if getattr(args, "calibrate", None) is not None:
         changes["calibrate"] = bool(args.calibrate)
     if getattr(args, "unmix", None):
@@ -281,7 +307,7 @@ def cmd_login(args):
     username = args.username or input("Username: ")
     password = args.password or getpass.getpass("Password: ")
     emit("Encrypting password...")
-    credentials = client.login(username, password)
+    credentials = client.login(username, password, device_name=args.name)
     hours = credentials.token_seconds_left / 3600
     emit(f"Logged in as {username} on {client.host}.")
     emit(f"Token valid for {hours:.1f} hours. Saved to {client.store.path}")
@@ -291,7 +317,7 @@ def cmd_login(args):
 def cmd_logout(args):
     client = make_client(args)
     client.logout()
-    emit("Saved login removed.")
+    emit(f"Saved login removed for {client.host}.")
     return 0
 
 
@@ -621,14 +647,18 @@ def cmd_watch(args):
     emit(f"  Output:   {options.output}")
     emit(f"  Layout:   {options.layout} - {LAYOUT_DESCRIPTIONS[options.layout]}")
     emit(f"  Interval: every {options.interval_minutes} minutes")
+    once = getattr(args, "once", False)
     if options.batches:
         emit(f"  Batch:    hold new frames until {options.batch_description}")
         delay = options.batch_delay
-        if delay and delay >= timedelta(days=1) and options.interval_minutes < 30:
-            # Every poll re-checks the whole window, chunk due or not.
+        if (not once and delay and delay >= timedelta(days=1)
+                and options.interval_minutes < 30):
+            # Every poll re-checks the whole window, chunk due or not.  Under
+            # --once the cadence belongs to whatever schedules this rather than
+            # to --interval, so the advice is about a number nobody can act on.
             emit(f"            (a chunk this long is happier with -i 60 than "
                  f"-i {options.interval_minutes})")
-    emit("  Press Ctrl+C to stop\n")
+    emit("  One poll, then stop\n" if once else "  Press Ctrl+C to stop\n")
 
     progress = ConsoleProgress(not args.quiet)
     last_held = [None]
@@ -653,6 +683,9 @@ def cmd_watch(args):
 
     watcher = client.watch(options, on_result=on_result, on_error=on_error,
                            on_hold=on_hold, progress=progress, start=False)
+    if once:
+        return _watch_once(watcher, progress, json_mode=args.json)
+
     try:
         watcher.run_forever()
     except KeyboardInterrupt:
@@ -664,6 +697,158 @@ def cmd_watch(args):
             emit("  Those frames are still on the instrument. Collect them "
                  "now with:")
             emit(f"    {options.cli_command('download')}")
+    return 0
+
+
+def _watch_once(watcher, progress, json_mode=False):
+    """One poll, and an exit code a scheduled task can branch on.
+
+    ``poll_once`` raises where pylv200's ``poll`` returns: it has no internal
+    try/except because ``run_forever`` is what catches for it.  Catching here
+    rather than changing that keeps ``run_forever``'s contract - and without it
+    the first unreachable poll would be a traceback and Python's own exit 1,
+    which is the code that means "nothing was written".
+    """
+    try:
+        result = watcher.poll_once()
+    except (IncucyteError, OSError, ValueError) as exc:
+        progress._clear()
+        emit_error(type(exc).__name__, exc, "watch")
+        return 2
+    progress._clear()
+    if result is None:
+        # A held chunk, and nothing was written for it - deliberately, because
+        # a file or a ledger entry here would make the next poll treat those
+        # frames as already collected.
+        if json_mode:
+            emit_json({"ok": True, "status": "held", "written": 0,
+                       "waiting": watcher.pending_frames})
+        else:
+            emit(f"  {watcher.hold_description}.")
+        return NOTHING_WRITTEN
+    if not result.files:
+        if json_mode:
+            emit_json(result.to_dict())
+        else:
+            emit("  Nothing new on the instrument.")
+        return NOTHING_WRITTEN
+    if json_mode:
+        emit_json(result.to_dict())
+    else:
+        emit(result.summary())
+    return 0
+
+
+def _schedulable(options):
+    """The recipe as a scheduled task can safely carry it.
+
+    One line, because the rule belongs to the schedule rather than to the
+    command line: it used to live here, so a schedule made from Python skipped
+    it and could register a task writing into system32.
+    """
+    return schedule.Job(options).recipe()
+
+
+def _schedule_rows(found):
+    """One row per scheduled download, with what Windows last made of it."""
+    meanings = {"0": "wrote something", "1": "nothing was due",
+                "2": "could not reach the instrument",
+                # Windows' own two, in the decimal schtasks prints them in:
+                # 0x41301 and 0x41303. They are most of what a listing shows,
+                # so bare numbers make the column unreadable exactly when it is
+                # being read.
+                "267009": "running now", "267011": "has not run yet"}
+    return [[one["task"], one.get("status", ""), one.get("next_run", ""),
+             one.get("last_run", ""),
+             meanings.get(str(one.get("last_result") or "").strip(),
+                          one.get("last_result", ""))]
+            for one in found]
+
+
+def cmd_schedule(args):
+    """Hand one `watch --once` to Windows, so nothing has to stay open.
+
+    `watch` downloads while a process runs. This is the same job with none:
+    Windows starts one poll, it decides whether a chunk is due, and it exits.
+    Nothing is held between firings and nothing needs to be - `batch_after`
+    runs from each frame's own acquisition time and `batch_frames` counts the
+    instrument against the ledger, so the poll after a reboot decides exactly
+    what the poll before it would have decided.
+    """
+    if args.list:
+        found = schedule.tasks()
+        if args.json:
+            emit_json({"schedules": found})
+        elif found:
+            print_table(_schedule_rows(found),
+                        ["schedule", "state", "next run", "last run",
+                         "last result"])
+        else:
+            emit("  Nothing is scheduled.")
+        return 0 if found else NOTHING_WRITTEN
+
+    if args.remove:
+        removed = schedule.remove(args.remove)
+        if args.json:
+            emit_json({"removed": removed})
+        else:
+            emit("  Removed " + removed + ".")
+        return 0
+
+    # The recipe, not a command line built here. `Job.argv` is the one place a
+    # recipe becomes `pyincucyte watch ... --once`, so this verb and
+    # `IncucyteClient.schedule` cannot schedule two different things.
+    job = schedule.Job(options_from_args(args))
+    every, modifier = schedule.cadence_of(args.every)
+    logged_out = not args.at_logon
+    argv = job.argv()
+    name = args.name or job.label()
+    settings = dict(every=every, modifier=modifier, logged_out=logged_out,
+                    account=args.account, wake=bool(args.wake),
+                    start_after=args.start_after, replace=bool(args.replace))
+
+    if args.dry_run:
+        # `plan` is the one place the settings are split between the two
+        # builders, so a dry run cannot compose something a real run would
+        # refuse - which is exactly what a dry run is for.
+        intended = schedule.plan(job, name=name, **settings)
+        if args.json:
+            emit_json({"task": intended["task"],
+                       "would_run": subprocess.list2cmdline(argv),
+                       "runs": intended["runs"],
+                       "command": intended["command"],
+                       "definition": intended["definition"]})
+        else:
+            emit("  Would create " + intended["task"])
+            emit("  Every %s: %s" % (args.every,
+                                     subprocess.list2cmdline(argv)))
+            emit("  " + schedule.render(intended["command"]))
+        return 0
+
+    if logged_out:
+        # Said before Windows asks, or the prompt arrives with no explanation
+        # of whose credential it wants or why a download needs one at all.
+        emit("  Windows will ask for the credential of %s, so this can "
+             "download while nobody is logged in."
+             % (args.account or schedule.default_account()))
+        emit("  It goes straight to Windows. PyIncucyte never sees it and "
+             "never stores it.")
+
+    made = schedule.register(job, name=name, **settings)
+    if args.run_now:
+        schedule.run_now(name)
+    if args.json:
+        emit_json({**made, "every": args.every,
+                   "would_run": subprocess.list2cmdline(argv)})
+    else:
+        emit("  Created " + made["task"])
+        emit("  Every %s: %s" % (args.every, subprocess.list2cmdline(argv)))
+        emit("  Runs " + ("whether anyone is logged in or not" if logged_out
+                          else "only while you are logged on"))
+        emit("  Verified: " + ", ".join(
+            "%s=%s" % (k, v) for k, v in sorted(made["settings"].items())))
+        if args.run_now:
+            emit("  Fired once now.")
     return 0
 
 
@@ -873,10 +1058,6 @@ def add_selection_args(parser, *, watch=False):
     parser.add_argument("--scan-time", "-t", dest="scan_time",
                         help="Only scan times containing this text")
     parser.add_argument("--workers", type=int, help="Parallel workers (default 4)")
-    parser.add_argument("--green-lut", action="store_true", dest="green_phase",
-                        default=None, help="Apply a green LUT to Phase images")
-    parser.add_argument("--no-green-lut", action="store_false", dest="green_phase",
-                        help="Keep Phase images as the device returns them")
     parser.add_argument("--calibrate", action="store_true", default=None,
                         help="Write fluorescence in calibrated units (GCU/RCU) "
                              "as 32-bit float, using the device's own Scale "
@@ -913,6 +1094,11 @@ def add_selection_args(parser, *, watch=False):
                             help=f"...or until the oldest waiting frame is "
                                  f"this old: {SPAN_HELP}. Given both, "
                                  f"whichever comes first wins")
+        parser.add_argument("--once", action="store_true",
+                            help="Poll once and stop, for a scheduled task. "
+                                 "Exit 0 if a chunk landed, 1 if nothing was "
+                                 "written (still holding, or nothing new), "
+                                 "2 if the instrument could not be reached")
 
 
 # argparse treats anything starting with "-" as an option, so
@@ -979,8 +1165,9 @@ def build_parser():
     p_login = sub.add_parser("login", help="Log in and save credentials")
     p_login.add_argument("--username", "-u")
     p_login.add_argument("--password", "-p")
+    p_login.add_argument("--name", help="Friendly name for this device")
 
-    sub.add_parser("logout", help="Forget the saved login")
+    sub.add_parser("logout", help="Forget the selected device's saved login")
     sub.add_parser("gui", help="Open the desktop app")
     sub.add_parser("vessels", help="List vessels")
     p_status = sub.add_parser(
@@ -1141,6 +1328,42 @@ def build_parser():
     p_watch = sub.add_parser("watch", help="Poll and download new scans forever")
     add_selection_args(p_watch, watch=True)
 
+    p_schedule = sub.add_parser(
+        "schedule",
+        help="Ask Windows to keep downloading, with nothing left open")
+    add_selection_args(p_schedule, watch=True)
+    p_schedule.add_argument("--name", metavar="NAME",
+                            help="What to call the schedule "
+                                 "(default: the vessels)")
+    p_schedule.add_argument("--every", metavar="PERIOD", default="1h",
+                            help="How often Windows should check: 10m, 1h, "
+                                 "6h, 1d (default: %(default)s)")
+    p_schedule.add_argument("--at-logon", action="store_true",
+                            help="Run only while somebody is logged on, and "
+                                 "ask for no credential. The default keeps "
+                                 "running on a rebooted, locked machine.")
+    p_schedule.add_argument("--account", metavar="USER",
+                            help="The Windows account to run as "
+                                 "(default: this user)")
+    p_schedule.add_argument("--start-after", metavar="PERIOD", default=None,
+                            help="Put the first check off this long - '7d' to "
+                                 "leave a week of acquisition alone before "
+                                 "anything is downloaded")
+    p_schedule.add_argument("--wake", action="store_true",
+                            help="Wake a sleeping computer for each check")
+    p_schedule.add_argument("--replace", action="store_true",
+                            help="Overwrite a schedule with this name")
+    p_schedule.add_argument("--run-now", action="store_true",
+                            help="Fire it once as soon as it is created")
+    p_schedule.add_argument("--dry-run", action="store_true",
+                            help="Show the task that would be created, and "
+                                 "create nothing")
+    p_schedule.add_argument("--list", action="store_true",
+                            help="What is already scheduled, and how each one "
+                                 "is doing")
+    p_schedule.add_argument("--remove", metavar="NAME",
+                            help="Delete one scheduled download")
+
     p_manifest = sub.add_parser("manifest", help="Summarise a download manifest")
     p_manifest.add_argument("path", help="Manifest file or output folder")
 
@@ -1156,7 +1379,8 @@ COMMANDS = {
     "find": cmd_find, "preview": cmd_preview, "timeline": cmd_timeline,
     "protocol": cmd_protocol,
     "preview-probe": cmd_preview_probe,
-    "download": cmd_download, "watch": cmd_watch, "status": cmd_status,
+    "download": cmd_download, "watch": cmd_watch, "schedule": cmd_schedule,
+    "status": cmd_status,
     "scan-now": cmd_scan_now, "unmix": cmd_unmix,
     "manifest": cmd_manifest, "preset": cmd_preset,
 }
@@ -1176,7 +1400,34 @@ def configure_logging(args):
 
 
 def main(argv=None):
-    args = parse_args(argv)
+    argv = list(sys.argv[1:] if argv is None else argv)
+    _JSON[0] = "--json" in argv
+    command = next((token for token in argv if token in COMMANDS), "")
+    if _JSON[0]:
+        parsed_error = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(parsed_error):
+                args = parse_args(argv)
+        except SystemExit as exc:
+            if exc.code:
+                detail = parsed_error.getvalue().strip()
+                message = detail.splitlines()[-1] if detail else "invalid command line"
+                prefix = "pyincucyte: error: "
+                if detail:
+                    print(detail, file=sys.stderr)
+                emit_json({
+                    "ok": False,
+                    "error": {
+                        "type": "UsageError",
+                        "message": (message[len(prefix):]
+                                    if message.startswith(prefix) else message),
+                    },
+                    "command": command,
+                })
+            raise
+    else:
+        args = parse_args(argv)
+    _JSON[0] = bool(getattr(args, "json", False))
     if not args.command:
         build_parser().print_help()
         return 0
@@ -1184,13 +1435,23 @@ def main(argv=None):
     try:
         return COMMANDS[args.command](args) or 0
     except KeyboardInterrupt:
-        emit("\nStopped.")
+        emit_error("KeyboardInterrupt", "Stopped.", args.command)
         return 130
     except IncucyteError as exc:
-        emit(f"error: {exc}")
+        emit_error(type(exc).__name__, exc, args.command)
         return 2
     except (ValueError, OSError) as exc:
-        emit(f"error: {exc}")
+        emit_error(type(exc).__name__, exc, args.command)
+        return 2
+    except Exception as exc:                          # noqa: BLE001
+        # An unexpected traceback would otherwise exit 1, which is
+        # NOTHING_WRITTEN - a completely normal poll. A scheduled task records
+        # only that number, so a schedule crashing on every firing and one
+        # with nothing to download would read the same in the one column
+        # anybody looks at. The traceback is still printed; only the code it
+        # leaves behind changes.
+        traceback.print_exc()
+        emit_error(type(exc).__name__, exc, args.command)
         return 2
 
 

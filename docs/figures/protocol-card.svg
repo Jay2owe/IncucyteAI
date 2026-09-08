@@ -1,0 +1,73 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="660" height="472" viewBox="0 0 660 472" font-family="Segoe UI, Inter, Helvetica Neue, Arial, DejaVu Sans, sans-serif">
+<title>38 - Cry1-GFP dLuc - acquisition protocol</title>
+<rect width="100%" height="100%" fill="#FFFFFF"/>
+<text x="22.0" y="38.0" font-size="16.0" fill="#16212E" text-anchor="start" font-weight="600">38 - Cry1-GFP dLuc</text>
+<text x="638.0" y="37.0" font-size="10.5" fill="#C62828" text-anchor="end">instrument acquiring</text>
+<g><circle cx="508.4" cy="33.0" r="4.5" fill="#C62828"/><title>the instrument reports Scanning - its status does not say which vessel</title></g>
+<rect x="22.0" y="52.0" width="616.0" height="267.0" rx="12.0" fill="#F1F4F8" stroke="#B9C4D0" stroke-width="1.00"/>
+<polyline points="41.2,62.3 40.3,63.2 39.5,64.2 39.0,65.4 38.6,66.7 38.5,68.0 38.6,69.3 39.0,70.6 39.5,71.8 40.3,72.8 41.2,73.7 42.2,74.5 43.4,75.0 44.7,75.4 46.0,75.5 47.3,75.4 48.6,75.0 49.8,74.5 50.8,73.7 51.7,72.8 52.5,71.8 53.0,70.6 53.4,69.3 53.5,68.0 53.4,66.7 53.0,65.4 52.5,64.2 51.7,63.2" fill="none" stroke="#0E7C86" stroke-width="1.80" stroke-linecap="round"/>
+<polygon points="49.8,61.5 54.3,61.0 49.1,65.4" fill="#0E7C86"/>
+<text x="64.0" y="73.0" font-size="12.0" fill="#16212E" text-anchor="start" font-weight="600">Time loop</text>
+<text x="146.0" y="73.0" font-size="11.0" fill="#657588" text-anchor="start">168 scans requested   -   60.0 min achieved</text>
+<rect x="38.0" y="84.0" width="584.0" height="9.0" rx="4.5" fill="#DFE5EC"/>
+<g><rect x="38.0" y="84.0" width="170.3" height="9.0" rx="4.5" fill="#0E7C86"/><title>49 of 168 timepoints acquired (29%),  2.0 days so far of 7.0 days</title></g>
+<text x="38.0" y="108.0" font-size="10.5" fill="#657588" text-anchor="start">49 of 168 timepoints acquired (29%),  2.0 days so far of 7.0 days</text>
+<rect x="38.0" y="134.0" width="584.0" height="169.0" rx="10.0" fill="#FFFFFF" stroke="#D5DCE5" stroke-width="1.00"/>
+<text x="54.0" y="155.0" font-size="12.0" fill="#16212E" text-anchor="start" font-weight="600">All wells (24)</text>
+<text x="175.8" y="155.0" font-size="10.5" fill="#657588" text-anchor="start">24-well Sarstedt   1 site each   A1,  A2,  A3,  A4,  A5,  A6,  +18 more</text>
+<g><rect x="54.0" y="166.0" width="9.0" height="9.0" rx="2.0" fill="#0E7C86"/><title>A1</title></g>
+<g><rect x="67.0" y="166.0" width="9.0" height="9.0" rx="2.0" fill="#0E7C86"/><title>A2</title></g>
+<g><rect x="80.0" y="166.0" width="9.0" height="9.0" rx="2.0" fill="#0E7C86"/><title>A3</title></g>
+<g><rect x="93.0" y="166.0" width="9.0" height="9.0" rx="2.0" fill="#0E7C86"/><title>A4</title></g>
+<g><rect x="106.0" y="166.0" width="9.0" height="9.0" rx="2.0" fill="#0E7C86"/><title>A5</title></g>
+<g><rect x="119.0" y="166.0" width="9.0" height="9.0" rx="2.0" fill="#0E7C86"/><title>A6</title></g>
+<g><rect x="132.0" y="166.0" width="9.0" height="9.0" rx="2.0" fill="#0E7C86"/><title>B1</title></g>
+<g><rect x="145.0" y="166.0" width="9.0" height="9.0" rx="2.0" fill="#0E7C86"/><title>B2</title></g>
+<g><rect x="158.0" y="166.0" width="9.0" height="9.0" rx="2.0" fill="#0E7C86"/><title>B3</title></g>
+<g><rect x="171.0" y="166.0" width="9.0" height="9.0" rx="2.0" fill="#0E7C86"/><title>B4</title></g>
+<g><rect x="184.0" y="166.0" width="9.0" height="9.0" rx="2.0" fill="#0E7C86"/><title>B5</title></g>
+<g><rect x="197.0" y="166.0" width="9.0" height="9.0" rx="2.0" fill="#0E7C86"/><title>B6</title></g>
+<g><rect x="210.0" y="166.0" width="9.0" height="9.0" rx="2.0" fill="#0E7C86"/><title>C1</title></g>
+<g><rect x="223.0" y="166.0" width="9.0" height="9.0" rx="2.0" fill="#0E7C86"/><title>C2</title></g>
+<g><rect x="236.0" y="166.0" width="9.0" height="9.0" rx="2.0" fill="#0E7C86"/><title>C3</title></g>
+<g><rect x="249.0" y="166.0" width="9.0" height="9.0" rx="2.0" fill="#0E7C86"/><title>C4</title></g>
+<g><rect x="262.0" y="166.0" width="9.0" height="9.0" rx="2.0" fill="#0E7C86"/><title>C5</title></g>
+<g><rect x="275.0" y="166.0" width="9.0" height="9.0" rx="2.0" fill="#0E7C86"/><title>C6</title></g>
+<g><rect x="288.0" y="166.0" width="9.0" height="9.0" rx="2.0" fill="#0E7C86"/><title>D1</title></g>
+<g><rect x="301.0" y="166.0" width="9.0" height="9.0" rx="2.0" fill="#0E7C86"/><title>D2</title></g>
+<g><rect x="314.0" y="166.0" width="9.0" height="9.0" rx="2.0" fill="#0E7C86"/><title>D3</title></g>
+<g><rect x="327.0" y="166.0" width="9.0" height="9.0" rx="2.0" fill="#0E7C86"/><title>D4</title></g>
+<g><rect x="340.0" y="166.0" width="9.0" height="9.0" rx="2.0" fill="#0E7C86"/><title>D5</title></g>
+<g><rect x="353.0" y="166.0" width="9.0" height="9.0" rx="2.0" fill="#0E7C86"/><title>D6</title></g>
+<g><rect x="68.0" y="187.0" width="152.0" height="100.0" rx="9.0" fill="#FFFFFF" stroke="#D5DCE5" stroke-width="1.00"/><title>Phase  |  name vessel</title></g>
+<rect x="68.0" y="187.0" width="5.0" height="100.0" rx="2.5" fill="#8A94A6"/>
+<circle cx="88.0" cy="211.0" r="6.5" fill="#8A94A6"/>
+<text x="102.0" y="215.0" font-size="12.0" fill="#16212E" text-anchor="start" font-weight="600">Phase</text>
+<text x="84.0" y="237.0" font-size="10.0" fill="#657588" text-anchor="start">transmitted light</text>
+<g><rect x="254.0" y="187.0" width="152.0" height="100.0" rx="9.0" fill="#FFFFFF" stroke="#D5DCE5" stroke-width="1.00"/><title>Green  |  120 ms  |  stare 180 ms  |  524 nm GCU  |  name vessel</title></g>
+<rect x="254.0" y="187.0" width="5.0" height="100.0" rx="2.5" fill="#2E9E4F"/>
+<circle cx="274.0" cy="211.0" r="6.5" fill="#2E9E4F"/>
+<text x="288.0" y="215.0" font-size="12.0" fill="#16212E" text-anchor="start" font-weight="600">Green</text>
+<text x="270.0" y="237.0" font-size="11.0" fill="#16212E" text-anchor="start">120 ms</text>
+<text x="270.0" y="253.0" font-size="10.0" fill="#657588" text-anchor="start">stare 180 ms</text>
+<text x="270.0" y="269.0" font-size="10.0" fill="#657588" text-anchor="start">524 nm GCU</text>
+<line x1="220.0" y1="237.0" x2="247.0" y2="237.0" stroke="#B9C4D0" stroke-width="1.40" stroke-linecap="round"/>
+<polygon points="253.0,237.0 245.0,232.5 245.0,241.5" fill="#B9C4D0"/>
+<g><rect x="440.0" y="187.0" width="152.0" height="100.0" rx="9.0" fill="#FFFFFF" stroke="#D5DCE5" stroke-width="1.00"/><title>Red  |  400 ms  |  stare 180 ms  |  635 nm RCU  |  name vessel</title></g>
+<rect x="440.0" y="187.0" width="5.0" height="100.0" rx="2.5" fill="#C6413F"/>
+<circle cx="460.0" cy="211.0" r="6.5" fill="#C6413F"/>
+<text x="474.0" y="215.0" font-size="12.0" fill="#16212E" text-anchor="start" font-weight="600">Red</text>
+<text x="456.0" y="237.0" font-size="11.0" fill="#16212E" text-anchor="start">400 ms</text>
+<text x="456.0" y="253.0" font-size="10.0" fill="#657588" text-anchor="start">stare 180 ms</text>
+<text x="456.0" y="269.0" font-size="10.0" fill="#657588" text-anchor="start">635 nm RCU</text>
+<line x1="406.0" y1="237.0" x2="433.0" y2="237.0" stroke="#B9C4D0" stroke-width="1.40" stroke-linecap="round"/>
+<polygon points="439.0,237.0 431.0,232.5 431.0,241.5" fill="#B9C4D0"/>
+<text x="22.0" y="341.0" font-size="10.5" fill="#657588" text-anchor="start">S3/SX1 G/R Optical Module · 4x objective · 2.824 um/pixel · tray 1 of 3 · started 2026-03-01 09:00 ·</text>
+<text x="22.0" y="356.5" font-size="10.5" fill="#657588" text-anchor="start">instrument scanning</text>
+<text x="22.0" y="372.0" font-size="9.5" fill="#657588" text-anchor="start">channel names read from the vessel record · exposures and optics from GetScanVessel · wells and sites from the scan</text>
+<text x="22.0" y="386.5" font-size="9.5" fill="#657588" text-anchor="start">pattern · achieved interval is the median gap between scan times · progress counted from the device's scan times ·</text>
+<text x="22.0" y="401.0" font-size="9.5" fill="#657588" text-anchor="start">acquiring state read from the device status</text>
+<text x="22.0" y="415.5" font-size="9.5" fill="#B26A00" text-anchor="start">** scan times are device-wide, so this cadence is the tray's - it is this plate's too unless the tray is running</text>
+<text x="36.0" y="429.5" font-size="9.5" fill="#B26A00" text-anchor="start">more than one schedule</text>
+<text x="22.0" y="443.5" font-size="9.5" fill="#B26A00" text-anchor="start">** the instrument is scanning, but its status does not say which vessel - this may be another plate on the tray</text>
+</svg>

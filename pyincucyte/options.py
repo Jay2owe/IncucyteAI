@@ -7,9 +7,11 @@ line, and the config an automated pipeline commits next to its analysis code.
 
 import json
 import re
+import subprocess
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
+from pprint import pformat
 
 from . import channels as ch
 from . import wells as wl
@@ -196,7 +198,6 @@ class ExportOptions:
     start_from: str = START_TODAY
     end_at: str = None
     scan_filter: str = None
-    green_lut: bool = False
     # Preprocessing, all off by default: the device sends raw pixels and that
     # is what a measurement pipeline should get unless it asks otherwise.
     calibrate: bool = False        # raw counts -> calibrated units, 32-bit float
@@ -232,11 +233,6 @@ class ExportOptions:
         self.batch_after = _as_span_text(self.batch_after)
         self.wells_by_vessel = {
             str(k): v for k, v in (self.wells_by_vessel or {}).items()}
-        if self.layout != "separate":
-            # Stacked outputs are written straight from the raw payloads; a
-            # display LUT would corrupt the pixel values downstream analysis
-            # depends on.
-            self.green_lut = False
         # Validate the specs now so a bad preset fails at load, not mid-download.
         ch.parse_channels(self.channels)
         wl.parse_wells(self.wells)
@@ -524,7 +520,6 @@ class ExportOptions:
             "start_from": self.start_from,
             "end_at": self.end_at,
             "scan_filter": self.scan_filter,
-            "green_lut": self.green_lut,
             "calibrate": self.calibrate,
             "background": self.background,
             "unmix": self.unmix,
@@ -552,9 +547,6 @@ class ExportOptions:
         if "end_date" in data and "end_at" not in data:
             data["end_at"] = data.pop("end_date")
         data.pop("end_date", None)
-        if "green_phase" in data and "green_lut" not in data:
-            data["green_lut"] = data.pop("green_phase")
-        data.pop("green_phase", None)
         if "max_workers" in data and "workers" not in data:
             data["workers"] = data.pop("max_workers")
         data.pop("max_workers", None)
@@ -590,9 +582,9 @@ class ExportOptions:
         args.append(command)
         for vessel_id in self.vessels:
             args += ["-v", str(vessel_id)]
-        args += ["-o", _quote(self.output or "OUTPUT_FOLDER")]
+        args += ["-o", self.output or "OUTPUT_FOLDER"]
         if self.wells and self.wells != "all":
-            args += ["-w", _quote(self.wells)]
+            args += ["-w", self.wells]
         for vessel_id, spec in sorted(self.wells_by_vessel.items()):
             if spec and spec != self.wells:
                 args += ["--vessel-wells", f"{vessel_id}:{spec}"]
@@ -601,19 +593,17 @@ class ExportOptions:
         if self.layout != "separate":
             args += ["--layout", self.layout]
         if self.start_from != START_TODAY:
-            args += ["--start-from", _quote(self.start_from)]
+            args += ["--start-from", self.start_from]
         if self.end_at and self.end_at != END_NOW:
-            args += ["--end-at", _quote(self.end_at)]
+            args += ["--end-at", self.end_at]
         if self.scan_filter:
-            args += ["--scan-time", _quote(self.scan_filter)]
-        if self.green_lut:
-            args.append("--green-lut")
+            args += ["--scan-time", self.scan_filter]
         if self.calibrate:
             args.append("--calibrate")
         if self.unmix:
-            args += ["--unmix", _quote(self.unmix)]
+            args += ["--unmix", self.unmix]
         if self.background:
-            args += ["--background", _quote(self.background)]
+            args += ["--background", self.background]
         if self.workers != 4:
             args += ["--workers", str(self.workers)]
         if command == "watch":
@@ -632,7 +622,63 @@ class ExportOptions:
 
     def cli_command(self, command="download"):
         """Return the CLI equivalent as one copy-pasteable string."""
-        return " ".join(self.cli_args(command))
+        return subprocess.list2cmdline(self.cli_args(command))
+
+    def python_code(self, command="download"):
+        """Return a readable Python program that reproduces this recipe."""
+        if command not in ("download", "watch"):
+            raise ValueError("Python code supports 'download' or 'watch'")
+
+        values = self.to_dict()
+        defaults = type(self)().to_dict()
+        ignored = {"preset_version", "processing"}
+        if command == "download":
+            # These only control polling and chunking; including them in a
+            # one-shot download would imply they affect that operation.
+            ignored.update({"interval_minutes", "batch_frames", "batch_after"})
+        changed = [
+            (name, value) for name, value in values.items()
+            if name not in ignored and value != defaults.get(name)
+        ]
+
+        if changed:
+            arguments = []
+            for name, value in changed:
+                rendered = pformat(value, width=72, sort_dicts=False)
+                rendered = rendered.replace("\n", "\n    ")
+                arguments.append(f"    {name}={rendered},")
+            option_lines = ["options = ExportOptions(", *arguments, ")"]
+        else:
+            option_lines = ["options = ExportOptions()"]
+
+        lines = [
+            "from pyincucyte import ExportOptions, IncucyteClient",
+            "",
+            *option_lines,
+            "",
+            "with IncucyteClient.from_saved(options.host) as incucyte:",
+        ]
+        if command == "watch":
+            lines.extend([
+                "    watcher = incucyte.watch(",
+                "        options,",
+                "        on_result=lambda result: print(result.summary()),",
+                "        start=False,",
+                "    )",
+                "    try:",
+                "        watcher.run_forever()",
+                "    except KeyboardInterrupt:",
+                "        watcher.stop()",
+            ])
+        else:
+            lines.extend([
+                "    plan = incucyte.plan(options)",
+                "    print(plan.summary())",
+                "    result = incucyte.download(plan)",
+                "",
+                "print(result.summary())",
+            ])
+        return "\n".join(lines)
 
     def describe(self, vessel_labels=None, channel_labels=None):
         """Return a few short lines describing this recipe for a UI panel."""
@@ -645,11 +691,6 @@ class ExportOptions:
             f"Layout: {self.layout}",
             f"From: {self.start_from} to {self.end_at or END_NOW}",
         ]
-
-
-def _quote(value):
-    value = str(value)
-    return f'"{value}"' if " " in value else value
 
 
 __all__ = ["ExportOptions", "PRESET_VERSION", "START_FIRST", "START_TODAY",

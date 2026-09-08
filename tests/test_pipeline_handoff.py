@@ -1,6 +1,6 @@
 """The fields the SCN pipeline's next stage reads out of the manifest.
 
-PySCNSlice reads a folder of stacks plus ``pyincucyte-manifest.json`` and
+Auto-Organotypic reads a folder of stacks plus ``pyincucyte-manifest.json`` and
 outlines the suprachiasmatic nucleus in each.  Everything tested here exists so
 that step does not have to guess: which plane is the red channel, whether the
 file has stopped growing, how fast the run was sampled and how big a pixel is.
@@ -263,7 +263,7 @@ class SeparateLayoutTests(HandoffTestCase):
     """Item 5: leave layout="separate" exactly as it is.
 
     It writes one YX TIFF per well per channel per timepoint, which the SCN
-    step would treat as thousands of recordings.  Refusing it is PySCNSlice's
+    step would treat as thousands of recordings.  Refusing it is Auto-Organotypic's
     job, and ``axes: "YX"`` is the field that lets it - so that field is what
     this guards.  No warning belongs here.
     """

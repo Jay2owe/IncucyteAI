@@ -1,11 +1,17 @@
 """Command line parsing, including every flag the old script accepted."""
 
+import json
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
+from io import StringIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest import mock
 
 from pyincucyte import ExportOptions
+from pyincucyte import cli
 from pyincucyte.cli import options_from_args, parse_args
+from pyincucyte.errors import IncucyteError
 
 
 def parse(argv):
@@ -27,6 +33,12 @@ class LegacyFlagTests(unittest.TestCase):
         self.assertEqual(options.start_from, "first")
         self.assertEqual(options.layout, "separate")
 
+    def test_login_accepts_a_friendly_device_name(self):
+        args = parse(["--host", "10.0.0.2", "login", "--name", "Upstairs"])
+
+        self.assertEqual(args.host, "10.0.0.2")
+        self.assertEqual(args.name, "Upstairs")
+
     def test_hyperstack_and_time_stack_flags_map_onto_layouts(self):
         self.assertEqual(
             resolve(["download", "-v", "1", "-o", "o", "--hyperstack"]).layout,
@@ -38,12 +50,6 @@ class LegacyFlagTests(unittest.TestCase):
             resolve(["download", "-v", "1", "-o", "o",
                      "--hyperstack", "--time-stack"]).layout,
             "time_channel_stack")
-
-    def test_green_lut_can_be_switched_both_ways(self):
-        self.assertTrue(
-            resolve(["download", "-v", "1", "-o", "o", "--green-lut"]).green_lut)
-        self.assertFalse(
-            resolve(["download", "-v", "1", "-o", "o", "--no-green-lut"]).green_lut)
 
     def test_date_is_shorthand_for_a_single_day(self):
         options = resolve(["download", "-v", "1", "-o", "o",
@@ -167,6 +173,36 @@ class NegativeValueTests(unittest.TestCase):
         args = parse(["download", "-v", "1", "-o", "o", "--dry-run"])
         self.assertTrue(args.dry_run)
         self.assertIsNone(args.start_from)
+
+
+class JsonAutomationTests(unittest.TestCase):
+    def test_runtime_errors_are_machine_readable(self):
+        def unavailable(_args):
+            raise IncucyteError("instrument is offline")
+
+        stdout, stderr = StringIO(), StringIO()
+        with mock.patch.dict(cli.COMMANDS, {"probe": unavailable}), \
+                redirect_stdout(stdout), redirect_stderr(stderr):
+            code = cli.main(["--json", "probe"])
+
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(code, 2)
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["error"]["type"], "IncucyteError")
+        self.assertEqual(payload["command"], "probe")
+        self.assertIn("offline", stderr.getvalue())
+
+    def test_usage_errors_are_machine_readable_and_still_exit_two(self):
+        stdout, stderr = StringIO(), StringIO()
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            with self.assertRaises(SystemExit) as raised:
+                cli.main(["--json", "download", "--not-an-option"])
+
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(raised.exception.code, 2)
+        self.assertEqual(payload["error"]["type"], "UsageError")
+        self.assertEqual(payload["command"], "download")
+        self.assertIn("unrecognized arguments", stderr.getvalue())
 
 
 class ValidationTests(unittest.TestCase):
